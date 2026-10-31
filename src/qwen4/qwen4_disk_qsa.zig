@@ -298,6 +298,86 @@ pub fn linkInheritedQsa(self: *DiskTier, d: ChunkDonor, id: u64) bool {
     return true;
 }
 
+test "byte-identical hybrid checkpoints on branches hard-link with fewer filesystem bytes and restore after restart" {
+    try mlx.requireGpu();
+    const io = testing.io;
+    const s = mlx.gpuStream();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0, .float32);
+    var a: [600]u32 = undefined;
+    for (&a, 0..) |*t, i| t.* = @intCast(i + 11);
+    var b = a;
+    b[550] = 700_001;
+    var c = a;
+    c[500] = 700_002;
+
+    var src = buildHybridEntries(s, 100, 500);
+    defer freeHybridEntries(&src);
+    src[2].aux_state = makeArange(s, &.{ 1, 512, 4 }, 700);
+    src[2].qsa_pooled = makeArange(s, &.{ 1, 128, 4 }, 800);
+    src[2].qsa_ratio = 4;
+    src[2].qsa_hist_rows = 512;
+    var cp = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
+    defer cp.deinit(testing.allocator);
+
+    var baseline_ssm: u64 = 0;
+    var optimized_ssm: u64 = 0;
+    for ([_]bool{ false, true }) |dedup| {
+        const fp = if (dedup) "ssm-dedup-on" else "ssm-dedup-off";
+        var tier = try DiskTier.init(testing.allocator, io, base, fp, 0, 128);
+        tier.ssm_file_dedup = dedup;
+        tier.enableBackgroundWriter();
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &a, false, &.{cp}, s);
+        tier.drainWriter(); // only a landed file may be linked
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &b, false, &.{cp}, s);
+        tier.drainWriter();
+        const written = tier.stats.snapshot().written[@backingInt(write_stats.Kind.ssm)];
+        if (dedup) optimized_ssm = written else baseline_ssm = written;
+        try testing.expect(tier.writer.?.peakBytes() <= tier.writer_permit_bytes);
+        try testing.expectEqual(@as(usize, 2), tier.entryCount());
+
+        // Different QSA aux at the same position must write its own SSM file.
+        var other = buildHybridEntries(s, 100, 500);
+        defer freeHybridEntries(&other);
+        other[2].aux_state = makeArange(s, &.{ 1, 512, 4 }, 900);
+        other[2].qsa_pooled = makeArange(s, &.{ 1, 128, 4 }, 900);
+        other[2].qsa_ratio = 4;
+        other[2].qsa_hist_rows = 512;
+        var mismatch = try transformer_mod.captureSsmCheckpoint(testing.allocator, &other, 512, s);
+        defer mismatch.deinit(testing.allocator);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &c, false, &.{mismatch}, s);
+        tier.drainWriter();
+        try testing.expect(tier.stats.snapshot().written[@backingInt(write_stats.Kind.ssm)] > written);
+        tier.deinit();
+
+        var restarted = try DiskTier.init(testing.allocator, io, base, fp, 0, 128);
+        defer restarted.deinit();
+        const idx = for (restarted.entries.items, 0..) |*e, i| {
+            if (std.mem.eql(u32, e.tokens, &b)) break i;
+        } else return error.TestExpectedBranch;
+        var restored_kv = try KVCache.init(testing.allocator, 3);
+        defer restored_kv.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectEqual(@as(u32, 512), try restarted.restoreIntoHybrid(&restored_kv, &dst, idx, 512, s));
+        try testing.expectEqual(try cacheValueAt(&cache, 0, 500, 3, s), try cacheValueAt(&restored_kv, 0, 500, 3, s));
+        try testing.expectEqual(@as(f32, 100), ssmArrVal(dst[0].conv_state, 0, s));
+        try testing.expectEqual(@as(f32, 800), ssmArrVal(dst[2].qsa_pooled, 0, s));
+    }
+    try testing.expect(baseline_ssm > 0);
+    try testing.expect(optimized_ssm > 0);
+    try testing.expect(optimized_ssm < baseline_ssm);
+}
+
 test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
     // GatedDeltaNet + a conv-only layer (null ssm_state) + plain
     // attention (uninitialized) in one entry: the null-state layer shapes

@@ -616,6 +616,8 @@ pub fn clearResolvedPrefixCacheMem() void {
 /// of recomputed, LRU-evicted to the budget. Unnamed, the ask is the 20 GB ceiling and the tier is on;
 /// `prefixCacheDiskForLoad` sizes the real budget per model (the Swift app's Settings toggle passes the flag).
 pub var prefix_cache_disk_bytes: u64 = disk_placement.DEFAULT_DISK_CAP;
+/// Opt-in exact-file reuse of Qwen SSM checkpoints across branched disk records.
+pub var prefix_cache_ssm_dedup: bool = false;
 /// Set by `--prefix-cache-disk`: the operator's number is the budget as given.
 pub var prefix_cache_disk_explicit = false;
 

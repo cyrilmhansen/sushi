@@ -59,6 +59,7 @@ const model = @import("model.zig");
 const io_util = @import("io_util.zig");
 const disk_writer = @import("kv_disk_writer.zig");
 const write_stats = @import("disk_write_stats.zig");
+const file_dedup = @import("disk_file_dedup.zig");
 pub const Origin = write_stats.Origin;
 const log = @import("log.zig");
 const disk_placement = @import("disk_placement.zig");
@@ -399,6 +400,9 @@ pub const DiskTier = struct {
     cp_thin: transformer_mod.ThinPolicy = .oldest,
     /// How many checkpoint positions one entry may keep on disk; the default is the previous cap.
     ssm_max_per_entry: usize = SSM_DISK_MAX_PER_ENTRY_LEGACY,
+    /// Opt-in byte-exact hard-link reuse of landed checkpoint files across entries.
+    /// Only armed for the Qwen hybrid tier by model_load; no tensor state is retained.
+    ssm_file_dedup: bool = false,
     /// Set by an arch whose restore points carry rows that grow with the prompt; null stores every point whole.
     grown: ?GrownSpec = null,
     /// Bytes this commit's checkpoint files may take: nonzero only while one conversation alone outgrows
@@ -2716,7 +2720,7 @@ pub const DiskTier = struct {
     /// Write (or, with the writer, stage) one safetensors file at `path`, which it takes.
     /// Returns the file's byte size.
     pub fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
-        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, kind, s);
+        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, kind, s, false);
         const size = self.saveSync(path, list, meta) catch |err| {
             self.stats.recordFailed(dataLen(list));
             return err;
@@ -2839,7 +2843,7 @@ pub const DiskTier = struct {
         src: usize = 0,
         off: usize = 0,
 
-        fn fill(self: *ByteStream, dst: []u8) !void {
+        pub fn fill(self: *ByteStream, dst: []u8) !void {
             var at: usize = 0;
             while (at < dst.len) {
                 const piece: []const u8 = if (self.src == 0) self.head else blk: {
@@ -2865,11 +2869,11 @@ pub const DiskTier = struct {
 
     /// Stage one materialized file through the writer: one blob, or `Writer.partBytes` parts
     /// when larger, each allocated only once the permit has room for it. Takes `path`.
-    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
+    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream, materialized: bool) !u64 {
         var path_owned: ?[]u8 = path;
         defer if (path_owned) |p| self.allocator.free(p);
         // The readback stays here (mlx arrays are inference-thread-owned); only bytes cross.
-        try materializeContiguous(tensors, s);
+        if (!materialized) try materializeContiguous(tensors, s);
         const head = try self.encodeHeader(tensors, meta);
         defer self.allocator.free(head);
         const total = head.len + dataLen(tensors);
@@ -3207,10 +3211,10 @@ pub const DiskTier = struct {
                 continue; // share exhausted — persist on a later flush
             }
             const k = if (self.grown != null) try self.growSegments(dir_rel, cp, divs, span, &grown, s) else 0;
-            const sz = try self.writePoint(dir_rel, cp, s, k, span);
-            self.point_bytes_written += sz;
-            written_bytes.* += sz;
-            try pairs.append(self.allocator, .{ .pos = p, .bytes = sz });
+            const point = try self.writePoint(dir_rel, cp, s, k, span, id);
+            self.point_bytes_written += point.written;
+            written_bytes.* += point.written;
+            try pairs.append(self.allocator, .{ .pos = p, .bytes = point.size });
         }
         // Bytes the segments took count against the flush like the points'.
         for (grown.items[old_grown.len..]) |b| written_bytes.* += b;
@@ -3242,11 +3246,13 @@ pub const DiskTier = struct {
         cp: *const transformer_mod.SSMCheckpoint,
         s: mlx.mlx_stream,
     ) !u64 {
-        return self.writePoint(dir_rel, cp, s, 0, 0);
+        return (try self.writePoint(dir_rel, cp, s, 0, 0, null)).size;
     }
 
     /// `writeSsmFile` for a point that leans on the entry's first `grown_k` row segments (`span` tokens each):
     /// its growing arrays keep only the rows past them, and `grown` in the metadata names the count.
+    const PointWrite = struct { size: u64, written: u64 };
+
     fn writePoint(
         self: *DiskTier,
         dir_rel: []const u8,
@@ -3254,7 +3260,8 @@ pub const DiskTier = struct {
         s: mlx.mlx_stream,
         grown_k: u32,
         span: u32,
-    ) !u64 {
+        new_id: ?u64,
+    ) !PointWrite {
         const divs: []const u32 = if (self.grown) |g| g.divs else &.{};
         var list = std.ArrayList(NamedTensor).empty;
         defer self.freeNamed(&list);
@@ -3338,7 +3345,35 @@ pub const DiskTier = struct {
         }
 
         const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
-        return self.saveNamed(path, list.items, meta.items, .ssm, s);
+        var path_owned: ?[]u8 = path;
+        defer if (path_owned) |p| self.allocator.free(p);
+        // The existing writer permit still owns every staged byte. Compare against an immutable,
+        // landed file before staging; exact bytes include the point's QSA aux and metadata.
+        // A pooled bank split into qsa.safetensors follows its own existing persistence path.
+        // A miss follows the original writer path. Grown checkpoints depend on separate segments.
+        if (self.ssm_file_dedup and new_id != null and grown_k == 0 and self.writer != null) {
+            try materializeContiguous(list.items, s);
+            const head = try self.encodeHeader(list.items, meta.items);
+            defer self.allocator.free(head);
+            const total = head.len + dataLen(list.items);
+            for (self.entries.items) |*e| {
+                if (e.poisoned or e.id == new_id.?) continue;
+                const at = std.mem.indexOfScalar(u32, e.ssm_positions, @intCast(cp.pos)) orelse continue;
+                if (e.ssm_bytes[at] != total) continue;
+                const donor = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, e.id, cp.pos });
+                defer self.allocator.free(donor);
+                if (!self.chunkLanded(donor, e.ssm_bytes[at])) continue;
+                var stream: ByteStream = .{ .head = head, .tensors = list.items };
+                if (file_dedup.linkIfEqual(self.io, donor, path, &stream, total) catch false) {
+                    return .{ .size = total, .written = 0 };
+                }
+            }
+            path_owned = null;
+            return .{ .size = try self.stageSafetensors(self.writer.?, path, list.items, meta.items, .ssm, s, true), .written = total };
+        }
+        path_owned = null;
+        const size = try self.saveNamed(path, list.items, meta.items, .ssm, s);
+        return .{ .size = size, .written = size };
     }
 
     pub const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false };

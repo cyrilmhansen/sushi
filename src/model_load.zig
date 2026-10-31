@@ -128,6 +128,7 @@ pub const LoadParams = struct {
     /// 0 disables persistence. Attached per model at load for pure-attention
     /// archs; entries live under `~/.sushi/kv-cache/<fingerprint>`.
     prefix_cache_disk_bytes: u64 = 0,
+    prefix_cache_ssm_dedup: bool = false,
     /// Sizes the SSD budget for this model and logs the `Allocating` line (`server.prefixCacheDiskForLoad`);
     /// takes the cache directory. Null = `prefix_cache_disk_bytes` as given (tests).
     prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget = null,
@@ -2493,6 +2494,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             break :attach;
         };
         disk_tier.?.operator_cap = plan.cap;
+        disk_tier.?.ssm_file_dedup = params.prefix_cache_ssm_dedup and params.config.longCtxGated();
+        if (params.prefix_cache_ssm_dedup and !disk_tier.?.ssm_file_dedup)
+            log.warn("[disk-cache] --prefix-cache-ssm-dedup is inactive for this architecture\n", .{});
     }
     params.config.prefix_cache_disk_declined = params.prefix_cache_disk_bytes > 0 and disk_tier == null;
     const disk_prefix_cache = disk_tier != null;

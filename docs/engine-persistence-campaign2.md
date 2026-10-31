@@ -1,6 +1,6 @@
-# Persistence campaign 2: byte attribution before a cadence change
+# Persistence campaign 2: byte attribution and byte-exact checkpoint reuse
 
-This experiment branches from `0352b5d7`. It changes accounting only. The live
+The instrumentation baseline branches from `0352b5d7`. Its change was accounting only. The live
 pi-2 window (191 minutes, 107 successful requests, 434,050 computed tokens) wrote
 28.81 GiB: SSM 15.67 GiB, QSA 5.71 GiB, KV 5.27 GiB, spec 2.16 GiB. These
 rounded kind totals sum to 28.81 GiB; metadata and rounding account for any
@@ -67,14 +67,33 @@ can prove cumulative eligibility, branch isolation, QSA/MTP restoration and
 zero extra retained tensor state. Thresholds 1024/4096/16384 cannot be
 estimated from request counts: no restorable-token gaps were measured.
 
+## Opt-in engine experiment after the instrumentation baseline
+
+`--prefix-cache-ssm-dedup` tries the narrower H3 case. A Qwen checkpoint newly
+needed by a branch is compared byte for byte with a **landed** checkpoint file
+at the same position in another record. Equality covers every byte of that
+checkpoint file, including its QSA auxiliary tensors and header; the tier then
+hard-links it. The separate QSA history file keeps its existing write and link rules.
+The old serialization path runs on mismatch, pending writer work, missing or
+partial donor files, and hard-link failure. The manifest remains the commit
+point, and disk budget billing stays at baseline logical file sizes. No tensor
+or pending snapshot is retained for deduplication. A fixed 40 KiB stack buffer
+compares one donor at a time; the writer permit is unchanged.
+
+This does not throttle completion or promise a cumulative token interval.
+Skipping a completion that adds a prompt-end or thought checkpoint would lose
+that restore point on restart, while keeping its pending record across turns
+would exceed the cache memory contract. Byte-identical branch checkpoints are
+the currently proven candidate for avoiding a file write without changing that
+contract. The exact eligible fraction and latency cost remain for operator A/B.
+
 ## Operator A/B procedure
 
 The user performs all live runs and model/server control. Build each candidate
 into its own isolated prefix; do not overwrite `zig-out/bin/sushi`. Each window
 uses the same production-equivalent model, KV8, GDN16, MTP policy, 220k context,
 2048 prefill chunk, cache budgets, prompts and temperature. For a future
-policy-enabled build, vary only `--prefix-cache-persist-min-tokens` among
-0/1024/4096/16384. Give every run a separate `SUSHI_PREFIX_CACHE_DIR`, and
+candidate, vary only the presence of `--prefix-cache-ssm-dedup`. Give each run a separate `SUSHI_PREFIX_CACHE_DIR`, and
 compare warm windows after the same warm-up so cold cache creation does not
 masquerade as policy cost.
 
@@ -83,9 +102,9 @@ candidate's production-equivalent launch shape is:
 
 ```bash
 cd "${SUSHI_CHECKOUT:?set checkout}"
-SUSHI_PREFIX_CACHE_DIR="/tmp/sushi-campaign2-cache-n0" \
+SUSHI_PREFIX_CACHE_DIR="/tmp/sushi-campaign2-cache-baseline" \
 DYLD_LIBRARY_PATH="$PWD/lib/mlx/lib" \
-/tmp/sushi-campaign2-candidate/bin/sushi --serve --host 127.0.0.1 \
+/tmp/sushi-campaign2-ssm-dedup/bin/sushi --serve --host 127.0.0.1 \
   --port "${SUSHI_PORT:-12345}" --model "${SUSHI_MODEL:?set model path}" \
   --mtp --no-vision --kv-quant 8 --max-resident-models 1 --timeout 900 \
   --mtp-greedy-tail --prefix-cache-mem 1GB --mtp-min-depth 1 \
@@ -94,28 +113,27 @@ DYLD_LIBRARY_PATH="$PWD/lib/mlx/lib" \
   --prefix-cache-disk 20GB --prefix-cache-entries 4 --temp 1 --metrics
 ```
 
-Use a fresh cache directory suffix and the validated future flag for each
-other arm. The present candidate has no persistence-threshold flag; it serves
-only the baseline policy with better byte attribution. The command is for the
-operator to run later, never part of automated validation.
+For the optimized arm, use `/tmp/sushi-campaign2-cache-dedup` and append
+`--prefix-cache-ssm-dedup` to the same command. The operator starts each arm
+only after taking the live server down by their own procedure. This document
+does not authorize an automated server restart.
 
 ```bash
 cd "${SUSHI_CHECKOUT:?set checkout}"
 shasum -a 256 zig-out/bin/sushi
-./.zig-toolchain/zig build -Doptimize=ReleaseFast --prefix /tmp/sushi-campaign2-candidate
-shasum -a 256 zig-out/bin/sushi /tmp/sushi-campaign2-candidate/bin/sushi
+./.zig-toolchain/zig build -Doptimize=ReleaseFast --prefix /tmp/sushi-campaign2-ssm-dedup
+shasum -a 256 zig-out/bin/sushi /tmp/sushi-campaign2-ssm-dedup/bin/sushi
 
 # Run these around each operator-controlled Pi session against its server URL:
-scripts/measure-persistence.sh --url "${SUSHI_URL:?set URL}" --dir /tmp/sushi-campaign2-reports start pi-n0
+scripts/measure-persistence.sh --url "${SUSHI_URL:?set URL}" --dir /tmp/sushi-campaign2-reports start pi-baseline
 # ... operator runs the fixed conversation ...
-scripts/measure-persistence.sh --url "$SUSHI_URL" --dir /tmp/sushi-campaign2-reports stop pi-n0
-scripts/measure-persistence.sh --dir /tmp/sushi-campaign2-reports report pi-n0
-jq '.bytes.by_origin_kind, .bytes.by_kind, .serializations, .durations.stages' /tmp/sushi-campaign2-reports/pi-n0/report.json
+scripts/measure-persistence.sh --url "$SUSHI_URL" --dir /tmp/sushi-campaign2-reports stop pi-baseline
+scripts/measure-persistence.sh --dir /tmp/sushi-campaign2-reports report pi-baseline
+jq '.bytes.by_origin_kind, .bytes.by_kind, .serializations, .durations.stages' /tmp/sushi-campaign2-reports/pi-baseline/report.json
 ```
 
-Repeat the `start`, `stop`, `report` and `jq` commands with session names
-`pi-n1024`, `pi-n4096`, `pi-n16384` only after a validated flag exists and the
-operator has started the corresponding isolated configuration. Record cache
+Repeat the `start`, `stop`, `report` and `jq` commands with session name
+`pi-dedup` after the operator has started the optimized configuration. Record cache
 hits, post-restart restorable tokens, TTFT, throughput, resident cache bytes,
 MLX/host peak and writer staging peak beside the byte report. Neither the
 script nor this experiment starts, stops or reconfigures the live server.

@@ -280,6 +280,16 @@ reply every turn. A thinking request with tools now takes one more point mid-dec
 <a id="checkpoints-on-ssd"></a>
 ### Qwen's GDN checkpoints live on the SSD
 
+`--prefix-cache-ssm-dedup` is an opt-in Qwen-only file reuse experiment. When a
+new branch would serialize an SSM checkpoint, the tier compares its complete
+safetensors byte stream with a landed checkpoint at the same position in another
+record. An exact match is hard-linked; any mismatch, missing file, queued write
+or link failure uses the existing serialization path. The comparison includes
+GDN, QSA auxiliary tensors and file metadata. It retains no tensor or snapshot
+between requests and does not change the checkpoint grid, writer permit, RAM
+retention or restore format. The comparison reads the donor on the inference
+thread, so latency must be checked in an operator A/B run before production use.
+
 Qwen takes GLM's mechanism ([glm5-prefix-cache](glm5-prefix-cache.md#glm)): `SSMCheckpoint.release` keeps a position and
 frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but the newest once its file left the writer.
 

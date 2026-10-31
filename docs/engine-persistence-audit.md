@@ -73,6 +73,17 @@ and spill costs, including bytes in partial appends.
 
 ## Feasible policy boundary
 
+Campaign 2 now includes `--prefix-cache-ssm-dedup`, a narrower opt-in write
+reduction that does not defer a completion. It compares a newly serialized Qwen
+checkpoint byte for byte with a landed checkpoint file at the same position in
+another entry, then hard-links only an exact match. QSA bank files retain their
+existing independent persistence and restore checks. A miss follows the
+existing writer. Disk budget accounting still charges the same logical file
+size as the baseline, so reuse and eviction thresholds are unchanged. No
+checkpoint or pending snapshot is held for a future request. The donor read
+occurs on the inference thread; live latency and eligible fraction are not yet
+measured.
+
 The least invasive candidate is to defer only when existing budgeted RAM state
 already preserves normal reuse, before `capturePendingDisk`. There must be a
 confirmed matching SSD recovery anchor, and a cumulative token difference from
