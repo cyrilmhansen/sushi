@@ -249,7 +249,9 @@ pub const Writer = struct {
         if (!self.overPermitLocked(n)) return;
         const sw = io_util.Stopwatch.init(self.io);
         while (self.overPermitLocked(n)) self.done.waitUncancelable(self.io, &self.mutex);
-        self.waited_ns += sw.read();
+        const ns = sw.read();
+        self.waited_ns += ns;
+        if (self.stats) |st| st.recordWait(ns, self.operation);
     }
 
     fn overPermitLocked(self: *const Writer, n: usize) bool {
@@ -479,6 +481,7 @@ pub const Writer = struct {
             self.mutex.unlock(self.io);
 
             var dropped = false;
+            const fs_start = std.Io.Timestamp.now(self.io, .boot);
             if (broken or blob.epoch != live_epoch) {
                 dropped = true;
             } else if (inject) {
@@ -490,6 +493,12 @@ pub const Writer = struct {
                 self.noteFailure(blob.path, @errorName(err));
                 dropped = true;
             }
+            // Filesystem time of THIS blob, attributed to its receipt when it landed. Fence drops
+            // and injected failures wrote nothing, so they are not writer time.
+            const fs_ns: u64 = blk: {
+                const d = fs_start.untilNow(self.io, .boot).nanoseconds;
+                break :blk if (d > 0) @intCast(d) else 0;
+            };
             if (dropped and blob.part != .whole) unlinkTmp(blob.path);
 
             self.mutex.lockUncancelable(self.io);
@@ -500,6 +509,7 @@ pub const Writer = struct {
                 self.files_dropped += 1;
                 self.noteFailed(blob.bytes.len, blob.operation);
             } else {
+                if (self.stats) |st| st.recordWriterBusy(fs_ns, blob.operation);
                 if (blob.part == .whole or blob.part == .last) self.files_written += 1;
                 self.bytes_written += blob.bytes.len;
                 self.noteWritten(blob.kind, blob.bytes.len, blob.operation);
@@ -548,7 +558,7 @@ fn writePart(path: []const u8, bytes: []const u8, part: Part) !void {
             const n = std.c.write(fd, bytes.ptr + off, bytes.len - off);
             if (n < 0) {
                 const e = std.c._errno().*;
-                if (e == @intFromEnum(std.c.E.INTR) or e == @intFromEnum(std.c.E.AGAIN)) continue;
+                if (e == @backingInt(std.c.E.INTR) or e == @backingInt(std.c.E.AGAIN)) continue;
                 return error.WriteFailed;
             }
             if (n == 0) return error.WriteFailed;
@@ -828,14 +838,58 @@ test "kv_disk_writer: landed bytes count under their kind, a rewrite counts its 
     }
     w.drain();
     const s = stats.snapshot();
-    try testing.expectEqual(@as(u64, 4000), s.written[@intFromEnum(StatKind.kv)]);
-    try testing.expectEqual(@as(u64, 300), s.written[@intFromEnum(StatKind.ssm)]);
-    try testing.expectEqual(@as(u64, 460), s.written[@intFromEnum(StatKind.qsa)]);
-    try testing.expectEqual(@as(u64, 90), s.written[@intFromEnum(StatKind.spec)]);
-    try testing.expectEqual(@as(u64, 70), s.written[@intFromEnum(StatKind.ring)]);
-    try testing.expectEqual(@as(u64, 11), s.written[@intFromEnum(StatKind.meta)]);
+    try testing.expectEqual(@as(u64, 4000), s.written[@backingInt(StatKind.kv)]);
+    try testing.expectEqual(@as(u64, 300), s.written[@backingInt(StatKind.ssm)]);
+    try testing.expectEqual(@as(u64, 460), s.written[@backingInt(StatKind.qsa)]);
+    try testing.expectEqual(@as(u64, 90), s.written[@backingInt(StatKind.spec)]);
+    try testing.expectEqual(@as(u64, 70), s.written[@backingInt(StatKind.ring)]);
+    try testing.expectEqual(@as(u64, 11), s.written[@backingInt(StatKind.meta)]);
     try testing.expectEqual(@as(u64, 0), s.failed);
     try testing.expectEqual(w.bytes_written, s.totalWritten());
+}
+
+test "kv_disk_writer: landed writes time the writer, and a permit wait times the receipt" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    var stats: write_stats.Stats = .{};
+    var w = Writer.init(testing.allocator, std.testing.io);
+    w.stats = &stats;
+    w.permit_bytes = 8 * 1024;
+    try w.start();
+    defer w.deinit();
+    const op = stats.beginOperation(std.testing.io, .request_complete).?;
+    w.operation = op;
+    w.setPaused(true);
+    const a = try stagedBlob(root, "a", 8 * 1024);
+    w.submit(a.path, a.bytes, .kv);
+    // The permit is full and the writer paused: the second submit must wait for room, and only a
+    // delayed unpause can release it, so the wait is deterministic and belongs to this receipt.
+    const Unpause = struct {
+        fn run(wr: *Writer) void {
+            std.Io.sleep(std.testing.io, .fromMilliseconds(30), .real) catch {};
+            wr.setPaused(false);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Unpause.run, .{&w});
+    const b = try stagedBlob(root, "b", 8 * 1024);
+    w.submit(b.path, b.bytes, .kv);
+    t.join();
+    w.operation = null;
+    op.finish(.complete);
+    w.drain();
+    const snap = stats.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), snap.operations.landed);
+    try std.testing.expectEqual(@as(u64, 1), snap.origins[@backingInt(write_stats.Origin.request_complete)]);
+    try std.testing.expect(snap.writer_busy_ns > 0);
+    try std.testing.expect(snap.writer_wait_ns > 0);
+    var n: u64 = 0;
+    for (snap.stages[@backingInt(write_stats.Stage.writer)].buckets) |c| n += c;
+    try testing.expectEqual(@as(u64, 1), n);
+    try testing.expect(snap.stages[@backingInt(write_stats.Stage.writer)].sum_ns > 0);
+    try testing.expect(snap.stages[@backingInt(write_stats.Stage.wait)].sum_ns > 0);
+    try testing.expect(snap.stages[@backingInt(write_stats.Stage.e2e)].sum_ns >= snap.stages[@backingInt(write_stats.Stage.inference)].sum_ns);
 }
 
 test "kv_disk_writer: one receipt spans queued pieces and fencing cannot complete it" {
@@ -849,7 +903,7 @@ test "kv_disk_writer: one receipt spans queued pieces and fencing cannot complet
     try w.start();
     defer w.deinit();
     w.setPaused(true);
-    const op = stats.beginOperation().?;
+    const op = stats.beginOperation(std.testing.io, .other).?;
     w.operation = op;
     for ([_]Part{ .first, .last }) |part| {
         const b = try stagedBlob(root, "chunk", 256);
@@ -864,7 +918,7 @@ test "kv_disk_writer: one receipt spans queued pieces and fencing cannot complet
     try testing.expectEqual(@as(u64, 512), stats.snapshot().operations.bytes);
 
     w.setPaused(true);
-    const fenced = stats.beginOperation().?;
+    const fenced = stats.beginOperation(std.testing.io, .other).?;
     w.operation = fenced;
     const b = try stagedBlob(root, "fenced", 64);
     w.submit(b.path, b.bytes, .meta);
@@ -929,7 +983,7 @@ test "kv_disk_writer: a file staged in parts counts the parts that landed, a bro
         w.submitPart(b.path, b.bytes, part, .kv);
     }
     w.drain();
-    try testing.expectEqual(@as(u64, 3072), stats.snapshot().written[@intFromEnum(StatKind.kv)]);
+    try testing.expectEqual(@as(u64, 3072), stats.snapshot().written[@backingInt(StatKind.kv)]);
 
     w.injectFailure("c000001", .write);
     for (parts) |part| {
@@ -938,6 +992,6 @@ test "kv_disk_writer: a file staged in parts counts the parts that landed, a bro
     }
     w.drain();
     const s = stats.snapshot();
-    try testing.expectEqual(@as(u64, 3072), s.written[@intFromEnum(StatKind.kv)]);
+    try testing.expectEqual(@as(u64, 3072), s.written[@backingInt(StatKind.kv)]);
     try testing.expectEqual(@as(u64, 1536), s.failed);
 }

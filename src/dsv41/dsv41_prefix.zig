@@ -215,7 +215,7 @@ pub fn markRows(cache: *transformer.KVCache) !void {
     transformer.resetKVEntry(e);
     // A slot's cache takes the engine's KV scheme whatever the pack says, and a quantized entry owns six buffers.
     const slots = [_]*mlx.mlx_array{ &e.keys, &e.values, &e.keys_scales, &e.keys_biases, &e.values_scales, &e.values_biases };
-    for (slots[0 .. if (cache.config.scheme == .off) 2 else 6]) |slot| {
+    for (slots[0..if (cache.config.scheme == .off) 2 else 6]) |slot| {
         _ = mlx.mlx_array_free(slot.*);
         slot.* = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_zeros(slot, &[_]c_int{ 1, 1, @intCast(n), 1 }, 4, .uint8, mlx.gpuStream()));
@@ -348,7 +348,10 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
     };
     const staged_before = self.disk.?.point_bytes_written;
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
-    self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s);
+    // `held` already names the caller's phase to the log; the origin counter uses the same split:
+    // a mid-request decode restore point is not a prefill write-through.
+    const origin: kv_disk_cache.Origin = if (std.mem.eql(u8, held, "decode")) .decode_point else .prefill_write_through;
+    self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s, origin);
     const bytes = self.disk.?.point_bytes_written - staged_before;
     for (cps) |*cp| cp.release();
     // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.

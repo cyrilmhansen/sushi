@@ -467,22 +467,45 @@ They count what the filesystem accepted, never what was submitted, and run from 
   under `prefix_cache_writes`: the same outcomes, `bytes`, finite `byte_bounds` and **non-cumulative** `byte_buckets`
   (the last bucket is infinity). A multi-piece 2 GiB append is one observation. Standalone restore-time metadata
   rewrites remain in the existing byte totals but are not append operations.
+- **Persistence origin**: `sushi:prefix_cache_persist_origin_total{origin=...}` counts every append ATTEMPT at begin,
+  origins `prefill_write_through`, `decode_point` (a DeepSeek mid-request restore point), `request_complete`
+  (the post-finish flush), `idle_spill`, `decline_spill` and `other`; `/metrics.json` carries the same map as `origins`.
+  The sum of origins is the count of begun operations, so it is at least landed+noop+partial+failed (receipt overflow
+  adds to `untracked` but every attempt also names its origin).
+- **Persistence timing**: `sushi:prefix_cache_serialization_duration_us` is a histogram per landed append with a
+  `stage` label — `inference` (readback + serialization + synchronous writes + permit waits, the time the inference
+  thread actually spent), `wait` (the part of that blocked on the writer's host-byte permit), `writer` (writer-thread
+  filesystem time of this operation's blobs) and `e2e` (begin to the last piece landing, queueing included — a
+  wall-clock latency, NEVER time blocking inference). `inference` contains `wait`; without a writer thread the
+  filesystem time is synchronous and shows in `inference`, not in `writer`. Only landed appends get stage observations
+  (same rule as the byte histogram). `/metrics.json` carries them as `serialization.durations`: `bounds_us` plus,
+  per stage, **non-cumulative** `buckets` and the exact `sum_ns`. Two process counters cover ALL work, landed or not:
+  `sushi:prefix_cache_writer_busy_ns_total` (writer-thread fs time of landed blobs) and
+  `sushi:prefix_cache_writer_wait_ns_total` (inference time blocked on permits, including waits outside a receipt).
+  Percentiles from these histograms must be taken from cumulative buckets; the measurement tool diffs bucket arrays.
 - `landed` means the logical append returned complete and every associated write finished without a reported error;
   it does **not** certify hybrid restoration or power-loss durability. No-op appends have no histogram observation.
   Failed/partial operations' landed bytes remain in the existing per-kind totals. As with those totals, an individual
   failed syscall may have written an unknown partial payload; this is not a block-device or NAND-wear measurement.
 - Tracking uses 64 fixed receipts per tier and one receipt pointer per already-budgeted writer blob. Receipts hold
-  scalar counters, never tensor handles or token sequences. Overflow increments `untracked` without waiting,
-  changing writes, or allocating another receipt; per-kind byte totals still include those operations. Writer
+  scalar counters, never tensor handles or token sequences; the timing spans ride in the SAME receipts (three scalars
+  and the boot-clock start), so instrumentation adds zero retained cache RAM. Overflow increments `untracked` without
+  waiting, changing writes, or allocating another receipt; per-kind byte totals still include those operations, and
+  their waits and writer time still reach the two process totals, but they miss the stage histograms. Writer
   permits, cache budgets, checkpoint ownership and persistence policy are unchanged.
 - `/props settings.prefix_cache` adds `serialization_landed`, `serialization_bytes`, `writer_staged_bytes` and
   `writer_staged_peak_bytes`, sampled at the existing cache-publication points (not per decode token). These are
   per-tier figures; the writer peak measures staging, not total process memory.
 - This is an instrumentation foundation. Confirmed hybrid recovery cursors, token intervals and token-based
-  persistence throttling are not implemented. See the [ownership audit](engine-persistence-audit.md).
-- Guards: `disk_write_stats.zig` (accounting and both renderings), `kv_disk_writer.zig` (`landed bytes count under their
-  kind`, `a failed, dropped or fenced blob`, `a file staged in parts`), `DiskTier write counters:` in `kv_disk_cache.zig`
-  and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache write counters` in `metrics.zig`.
+  persistence throttling are not implemented; bytes per newly DURABLE token and write amplification stay withheld
+  until a restorability counter exists (see below and the [measurements](engine-persistence-measurements.md)).
+  See the [ownership audit](engine-persistence-audit.md).
+- Guards: `disk_write_stats.zig` (accounting, both renderings, `timing receipts`, `timing receipts chain into the
+  parent`), `kv_disk_writer.zig` (`landed bytes count under their kind`, `a failed, dropped or fenced blob`,
+  `a file staged in parts`, `landed writes time the writer, and a permit wait times the receipt`),
+  `DiskTier write counters:` in `kv_disk_cache.zig`
+  and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache write counters` in `metrics.zig`,
+  `tests/test_measure_persistence.sh` for the tool's use of every field.
 
 ## SSD-first
 

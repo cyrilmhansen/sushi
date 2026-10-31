@@ -31,7 +31,11 @@ readable diff. Raw bodies stay verbatim at `<dir>/<session>/{start,stop}/{metric
 Exit status: `0` a usable report, `1` a window whose write counters were never measurable, `2` a refused
 comparison or a bad argument.
 
-## A session measurement
+## A session measurement (stage A — the current production baseline)
+
+The served binary carries the per-kind byte counters, the failed-byte counter and the append OUTCOME counters with
+their size histogram. It does NOT yet carry the timing stages, origins or writer totals — those exist only in a
+candidate build (stage B). Nothing here starts, stops or steers a server; the tool issues two `GET`s.
 
 ```bash
 # immediately before the Pi session, against the server that will serve it
@@ -43,6 +47,83 @@ scripts/measure-persistence.sh start pi-baseline
 scripts/measure-persistence.sh stop pi-baseline
 scripts/measure-persistence.sh report pi-baseline
 ```
+
+`report.json` keeps every raw delta the table was built from, so analysis can go past the printed rows:
+
+```bash
+R=~/.sushi/runs/persistence/pi-baseline/report.json
+jq '.bytes.by_kind, .bytes.mb_per_min, .serializations, .histogram' "$R"
+jq '.durations.stages | with_entries(select(.value != null and .value.n? > 0))' "$R"   # empty on stage A
+jq '.origins, .writer' "$R"                                                            # empty on stage A
+```
+
+## Stage B — the candidate instrumentation build
+
+Build the candidate WITHOUT touching the production binary: an isolated install prefix, checksum first and after.
+
+```bash
+cd "${SUSHI_CHECKOUT:?set this to your sushi checkout}"   # e.g. export SUSHI_CHECKOUT="$HOME/src/sushi"
+shasum -a 256 zig-out/bin/sushi | tee /tmp/prod-sushi.sha256        # record the production checksum
+.zig-toolchain/zig build -Doptimize=ReleaseFast -p /tmp/sushi-candidate-prefix install
+shasum -a 256 /tmp/sushi-candidate-prefix/bin/sushi                  # the candidate's own stamp — record it beside the git commit
+shasum -a 256 -c /tmp/prod-sushi.sha256                              # zig-out/bin/sushi must be unchanged
+DYLD_LIBRARY_PATH="$PWD/lib/mlx/lib" /tmp/sushi-candidate-prefix/bin/sushi --help | head   # CLI check only; loads no model
+```
+
+Then — ONLY if you, the operator, choose to run the candidate as a server; nothing in this repository does it for
+you, and the tool itself never starts, stops or configures anything:
+
+1. Stop the running server by your normal means (its supervisor or its own Ctrl-C).
+2. Relaunch the SAME model with the SAME flags (`--kv-quant`, `--max-chunk`, cache budgets, effort, MTP policy) and
+   `--metrics`, from the candidate binary. Keep the SAME `--prefix-cache-root` if you want the warm cache to carry
+   over; give the candidate its OWN root if you want to measure two independent caches — and then know that a fresh
+   root writes everything once from cold, so bytes-per-token is NOT comparable to a warm-cache window. Record which.
+3. Run the same workload you ran in stage A, for a similar wall-clock length.
+4. Measure the window and compare the two reports:
+
+```bash
+scripts/measure-persistence.sh start pi-candidate
+# … the same session …
+scripts/measure-persistence.sh stop pi-candidate
+scripts/measure-persistence.sh report pi-candidate
+```
+
+5. Restore the environment by hand the same way: stop the candidate, relaunch the production binary with the
+   original flags.
+
+A report never spans addresses: it refuses two snapshots from different `--url`s and refuses a build, model,
+architecture or KV-scheme change INSIDE one window, so stage A and stage B are two windows read side by side,
+never one diff.
+
+## Stage C — reading the two windows together
+
+| question | stage A (production) | stage B (candidate) |
+|---|---|---|
+| how much did the cache write, by kind, per minute | rows 2–3 | rows 2–3 |
+| how big are the appends (mean/P50/P95 bytes) | row 7 | row 7 |
+| how long does persisting cost the inference thread | — (unmeasured) | row 8 `inference` and `wait` |
+| how long does the filesystem take, and how far behind does completion trail | — (unmeasured) | row 8 `writer` and `e2e` |
+| who triggers persistence | — (unmeasured) | row 6 origins |
+| bytes per newly processed token | row 5, relative only | row 5, relative only |
+| bytes per newly DURABLE token, write amplification, token intervals | withheld everywhere until a restorability counter exists | withheld everywhere until a restorability counter exists |
+
+Useful diffs across the two reports:
+
+```bash
+A=~/.sushi/runs/persistence/pi-baseline/report.json
+B=~/.sushi/runs/persistence/pi-candidate/report.json
+jq -n --slurpfile a "$A" --slurpfile b "$B" '
+  "MB/min: \($a[0].bytes.mb_per_min) -> \($b[0].bytes.mb_per_min)",
+  "B/token processed: \($a[0].per_token.processed) -> \($b[0].per_token.processed)",
+  "landed: \($a[0].serializations.landed) -> \($b[0].serializations.landed)"'
+jq '.durations.stages | map_values({n, mean_us, p50, p95})' "$B"    # timing is candidate-only; A has nulls
+jq '.origins' "$B"                                                  # candidate-only attempt mix by origin
+```
+
+The percentage of write traffic spent on state REWRITES (sidecars, re-indexed meta, QSA history extensions) cannot
+be computed from either build yet: the per-kind totals count a rewrite exactly like a first write, and telling them
+apart needs the same recovery-cursor bookkeeping as the durable-token metric
+([audit](engine-persistence-audit.md#durable-token-attribution-blocked-documented)).
 
 ## Production against a candidate build
 
@@ -76,7 +157,7 @@ Give both windows the same workload and roughly the same length, and run the can
 | 5 | bytes per token | PROCESSED counts every landed byte over every token computed here; DURABLE counts only tokens a restore can resume from |
 | 6 | serializations | landed, no-op, partial, failed, untracked append operations, landed bytes, and this model's tier totals from `/props` |
 | 7 | landed append size | mean from the delta sum over the delta count; P50/P95 from bucket DELTAS |
-| 8 | persistence duration, token intervals | only once those counters exist; until then the row says so |
+| 8 | persistence timing | landed appends get four stage histograms — `inference` (readback + serialization + sync writes + waits, on the inference thread), `wait` (permit waits inside that), `writer` (writer-thread filesystem time), `e2e` (begin to last piece landed, queueing included — NOT inference-blocking time); mean/P50/P95 from bucket deltas. Writer-busy and wait totals cover all work. Token intervals still print `unavailable` |
 | 9 | write amplification | bytes per newly restorable token, and only with a durable-token metric |
 
 Percentiles are never a subtraction of two snapshots' percentiles. Each is named as its own bucket upper
@@ -93,8 +174,9 @@ Valid now, on the landed-append counters in `disk_write_stats.zig`:
 
 - bytes written in the window by kind, and the rate;
 - failed and dropped write bytes;
-- landed / no-op / partial / failed / untracked append counts and landed bytes;
-- the size distribution of landed appends;
+- landed / no-op / partial / failed / untracked append counts and landed bytes, and their mean/P50/P95 size;
+- since the timing milestone, for builds that serve them (stage B): the four duration stages per landed append,
+  persist attempts by origin, and the writer-busy / permit-wait totals.
 - bytes per newly processed token, as a RELATIVE comparison between two windows that ran the same
   workload on the same model, KV scheme and build.
 
@@ -105,7 +187,9 @@ Not valid yet, and withheld rather than estimated:
   recurrent checkpoint and the QSA coverage each have their own rule
   ([audit](engine-persistence-audit.md#landed-data-and-restoration)) — and `server.diskBytesPerToken` is
   a budget estimate, not a theoretical serialization denominator, so neither may be used as the denominator.
-- persistence duration and effective token intervals (row 8): no such metric exists in a served build.
+- effective token intervals between successive recoverable states (row 8's last line): the same missing
+  restorability counter; see
+  [the blocker](engine-persistence-audit.md#durable-token-attribution-blocked-documented).
 
 The tool looks for a counter named `*durable_tokens_total` or `*restorable_tokens_total`; when one
 appears in both snapshots, rows 5 and 9 fill in and `report.json` records the key it used under

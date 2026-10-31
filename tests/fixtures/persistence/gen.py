@@ -16,6 +16,16 @@ import os
 import sys
 
 BOUNDS = [4096, 65536, 1048576, 4194304, 16777216, 67108864, 268435456, 1073741824, 2147483648, 4294967296]
+DBOUNDS = [10, 100, 1000, 10000, 100000, 1000000, 10000000, 60000000, 600000000]
+
+
+def durations(inference, inf_sum, wait, wait_sum, writer, wr_sum, e2e, e2e_sum):
+    """The four landed-append timing histograms, one dict per stage (non-cumulative buckets)."""
+    return {"bounds_us": DBOUNDS,
+            "inference": {"buckets": inference, "sum_ns": inf_sum},
+            "wait": {"buckets": wait, "sum_ns": wait_sum},
+            "writer": {"buckets": writer, "sum_ns": wr_sum},
+            "e2e": {"buckets": e2e, "sum_ns": e2e_sum}}
 
 
 def metrics(counters, writes, gauges=None):
@@ -69,6 +79,9 @@ def main(root):
     #     tokens         200000 forwarded + 5000 generated = 205000 newly processed
     #     serializations landed 56, noop 3, partial 2, failed 1, untracked 0
     #     buckets        [5,10,30,5,5,0,0,0,0,0,1] -> P50 "<= 1.0 MiB", P95 "<= 16.0 MiB"
+    #     origins        attempts: prefill +20, decode +2, complete +28, idle +6, decline +2, other +4
+    #     durations      every stage deltas to 56 landed appends; the byte-diff case is built so a
+    #                    subtraction of the two snapshots' percentiles would lie for these too
     start_counters = {"prompt_tokens_total": 1000, "prefill_tokens_total": 1000,
                       "prefix_cache_tokens_total": 0, "generation_tokens_total": 500,
                       "requests_success_total": 4, "requests_cancelled_total": 0,
@@ -77,18 +90,34 @@ def main(root):
     stop_counters = dict(start_counters, prompt_tokens_total=201000, prefill_tokens_total=201000,
                          prefix_cache_tokens_total=4000, generation_tokens_total=50500,
                          requests_success_total=20, prefix_cache_hits_total=14)
+    origins_start = {"prefill_write_through": 4, "decode_point": 0, "request_complete": 6,
+                     "idle_spill": 2, "decline_spill": 1, "other": 1}
+    origins_stop = {"prefill_write_through": 24, "decode_point": 2, "request_complete": 34,
+                    "idle_spill": 8, "decline_spill": 3, "other": 5}
     start_writes = {"written_bytes": {"kv": 10485760, "ssm": 2097152, "qsa": 1048576,
                                       "spec": 524288, "ring": 262144, "meta": 131072},
                     "failed_bytes": 4096,
+                    "origins": origins_start,
+                    "writer_busy_ns": 300000000, "writer_wait_ns": 60000000,
                     "serialization": {"landed": 12, "noop": 3, "partial": 1, "failed": 2, "untracked": 0,
                                       "bytes": 20000000, "byte_bounds": BOUNDS,
-                                      "byte_buckets": [2, 3, 4, 2, 1, 0, 0, 0, 0, 0, 0]}}
+                                      "byte_buckets": [2, 3, 4, 2, 1, 0, 0, 0, 0, 0, 0],
+                                      "durations": durations([2, 3, 4, 1, 0, 0, 0, 0, 0, 0], 9000000,
+                                                             [3, 4, 2, 1, 0, 0, 0, 0, 0, 0], 500000,
+                                                             [1, 8, 16, 4, 0, 0, 0, 0, 0, 0], 20000000,
+                                                             [0, 2, 10, 20, 4, 0, 0, 0, 0, 0], 40000000)}}
     stop_writes = {"written_bytes": {"kv": 62914560, "ssm": 8388608, "qsa": 3145728,
                                      "spec": 1048576, "ring": 262144, "meta": 262144},
                    "failed_bytes": 8192,
+                   "origins": origins_stop,
+                   "writer_busy_ns": 800000000, "writer_wait_ns": 95000000,
                    "serialization": {"landed": 68, "noop": 6, "partial": 3, "failed": 3, "untracked": 0,
                                      "bytes": 132000000, "byte_bounds": BOUNDS,
-                                     "byte_buckets": [7, 13, 34, 7, 6, 0, 0, 0, 0, 0, 1]}}
+                                     "byte_buckets": [7, 13, 34, 7, 6, 0, 0, 0, 0, 0, 1],
+                                     "durations": durations([8, 23, 29, 5, 1, 0, 0, 0, 0, 0], 65000000,
+                                                            [53, 10, 2, 1, 0, 0, 0, 0, 0, 0], 30500000,
+                                                            [31, 28, 22, 4, 0, 0, 0, 0, 0, 0], 48000000,
+                                                            [0, 7, 30, 45, 10, 0, 0, 0, 0, 0], 296000000)}}
     tier_start = {"disk_written_bytes": 14745600, "serialization_landed": 12, "serialization_bytes": 20000000,
                   "writer_staged_bytes": 0, "writer_staged_peak_bytes": 33554432}
     tier_stop = {"disk_written_bytes": 76218368, "serialization_landed": 68, "serialization_bytes": 132000000,
@@ -129,6 +158,13 @@ def main(root):
     shifted = dict(stop_writes, serialization=dict(stop_writes["serialization"], byte_bounds=BOUNDS[1:]))
     write(root, "boundschange", "start", metrics(start_counters, start_writes), props(prefix_cache=tier_start))
     write(root, "boundschange", "stop", metrics(stop_counters, shifted), props(prefix_cache=tier_stop))
+
+    # --- stagebounds: the DURATION histogram's bounds moved inside the window (a rebuild with a
+    #     different stage grid). The byte histogram is untouched, so only the timings are un-diffable.
+    shifted_stages = dict(stop_writes, serialization=dict(
+        stop_writes["serialization"], durations=dict(stop_writes["serialization"]["durations"], bounds_us=DBOUNDS[1:])))
+    write(root, "stagebounds", "start", metrics(start_counters, start_writes), props(prefix_cache=tier_start))
+    write(root, "stagebounds", "stop", metrics(stop_counters, shifted_stages), props(prefix_cache=tier_stop))
 
     # --- chunkchange: the capture grid changed inside the window (a restart with a different
     #     --max-chunk), so the checkpoint cadence differs between the two halves. Same identity, so

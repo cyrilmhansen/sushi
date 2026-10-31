@@ -3080,6 +3080,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trans
         cps,
         if (hc.ram_enabled) WRITE_THROUGH_FLUSH_BOUND_BYTES else std.math.maxInt(u64),
         s,
+        .prefill_write_through,
     );
 }
 
@@ -5667,7 +5668,6 @@ test "a shutdown drain ends a queued request with an error, a client disconnect 
     destroyAbandoned(take.abandoned);
 }
 
-
 test "decode share: the default is 0.25 and reaches /props" {
     const saved = prefill_interleave_cached;
     defer prefill_interleave_cached = saved;
@@ -5733,8 +5733,6 @@ test "decode share: ticks to the budget, keeps one tick at zero, stops when deco
     try testing.expectEqual(@as(u32, 0), none.calls);
 }
 
-
-
 test "decode share: 0.25 owes a third of the chunk time in ticks" {
     const ms = std.time.ns_per_ms;
     var f = FakeDecodeTicks{ .left = 1000, .ns = 10 * ms };
@@ -5746,7 +5744,10 @@ test "decode share: 0.25 owes a third of the chunk time in ticks" {
 test "decode share: the kill switch disables the effective share" {
     const saved_share = prefill_decode_share;
     const saved_interleave = prefill_interleave_cached;
-    defer { prefill_decode_share = saved_share; prefill_interleave_cached = saved_interleave; }
+    defer {
+        prefill_decode_share = saved_share;
+        prefill_interleave_cached = saved_interleave;
+    }
     prefill_decode_share = 0.5;
     prefill_interleave_cached = false;
     try testing.expectEqual(@as(f32, 0), prefillDecodeShare());
@@ -5754,7 +5755,6 @@ test "decode share: the kill switch disables the effective share" {
     try testing.expectEqual(@as(f32, 0.5), prefillDecodeShare());
     try testing.expectEqual(std.math.maxInt(u64), decodeShareBudgetNs(std.math.maxInt(u64), 0.9));
 }
-
 
 test "decode share: cancelled prefill stops its hosted ticks before touching the scheduler" {
     var cancelled = std.atomic.Value(bool).init(true);

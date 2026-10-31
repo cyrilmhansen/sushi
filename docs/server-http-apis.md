@@ -273,9 +273,14 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   the same sequence-locked publish as `disk_used_bytes`), so an unload and reload restarts it while the process total keeps it.
   Logical append completion and size are exposed separately as `sushi:prefix_cache_serialization_operations_total`
   and `sushi:prefix_cache_serialization_bytes` (histogram), and as `prefix_cache_writes.serialization` in JSON.
-  `landed` certifies filesystem completion, not hybrid restorability. `/props settings.prefix_cache` also carries
+  `landed` certifies filesystem completion, not hybrid restorability. Attempts also carry an origin
+  (`sushi:prefix_cache_persist_origin_total{origin=...}`, JSON `origins`) and landed appends four duration stages
+  (`sushi:prefix_cache_serialization_duration_us{stage="inference|wait|writer|e2e"}`, JSON
+  `serialization.durations` with `bounds_us`, non-cumulative `buckets` and exact `sum_ns`), plus process totals
+  `sushi:prefix_cache_writer_busy_ns_total` and `sushi:prefix_cache_writer_wait_ns_total`; `e2e` is wall-clock to
+  async completion, not inference-blocking time. `/props settings.prefix_cache` also carries
   `serialization_landed`, `serialization_bytes`, `writer_staged_bytes` and `writer_staged_peak_bytes`; see the linked
-  write-counter documentation for bucket semantics and bounded tracking overflow.
+  write-counter documentation for bucket semantics, stage meanings and bounded tracking overflow.
 - `/metrics.json` ends with `"sessions"`, one row per live request (phases `prefill` and `decode`, cap 32; published
   by the inference thread under `queue_mu`, copied by the reader under the same lock — there is no separate
   `/requests` route): `model`, `request_id` (submit sequence; stable across polls of one request, never reused),

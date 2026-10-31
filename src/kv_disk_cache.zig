@@ -59,6 +59,7 @@ const model = @import("model.zig");
 const io_util = @import("io_util.zig");
 const disk_writer = @import("kv_disk_writer.zig");
 const write_stats = @import("disk_write_stats.zig");
+pub const Origin = write_stats.Origin;
 const log = @import("log.zig");
 const disk_placement = @import("disk_placement.zig");
 
@@ -525,7 +526,6 @@ pub const DiskTier = struct {
         const w = self.writer orelse return 0;
         return w.pendingBytes();
     }
-
 
     /// Background write failures so far.
     pub fn writeErrors(self: *DiskTier) u64 {
@@ -1545,11 +1545,12 @@ pub const DiskTier = struct {
 
     /// How much of the entry one call writes: by default a piece per call with the writer
     /// finishing it, `whole` every piece now, `flush_bound` the write-through's one-chunk bound.
-    pub const CommitOpts = struct { whole: bool = false, flush_bound: ?u64 = null };
+    /// `origin` names the persistence path that began this operation, for the origin counter.
+    pub const CommitOpts = struct { whole: bool = false, flush_bound: ?u64 = null, origin: Origin = .other };
 
     /// The one commit entry point; the positional wrappers above and below forward to it.
     pub fn appendCommitWith(self: *DiskTier, p: CommitParams, s: mlx.mlx_stream, opts: CommitOpts) !PersistOutcome {
-        const receipt = self.stats.beginOperation();
+        const receipt = self.stats.beginOperation(self.io, opts.origin);
         self.stats.active = receipt;
         if (self.writer) |w| w.operation = receipt;
         var outcome: write_stats.Operation.Outcome = .failed;
@@ -7806,7 +7807,7 @@ test "DiskTier: a thought point past the prompt end is the newest point and surv
 }
 
 fn wroteKind(tier: *const DiskTier, kind: write_stats.Kind) u64 {
-    return tier.stats.snapshot().written[@intFromEnum(kind)];
+    return tier.stats.snapshot().written[@backingInt(kind)];
 }
 
 fn sumBytes(items: []const u64) u64 {
@@ -7846,10 +7847,10 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     const meta_json = fileSize(io, meta_path) orelse return error.TestUnexpectedResult;
     const cold = tier.stats.snapshot();
     const e = &tier.entries.items[0];
-    try testing.expectEqual(sumBytes(e.chunk_bytes), cold.written[@intFromEnum(write_stats.Kind.kv)]);
+    try testing.expectEqual(sumBytes(e.chunk_bytes), cold.written[@backingInt(write_stats.Kind.kv)]);
     try testing.expect(e.spec_bytes > 0);
-    try testing.expectEqual(e.spec_bytes, cold.written[@intFromEnum(write_stats.Kind.spec)]);
-    try testing.expect(cold.written[@intFromEnum(write_stats.Kind.meta)] >= @as(u64, 600 * 4) + meta_json);
+    try testing.expectEqual(e.spec_bytes, cold.written[@backingInt(write_stats.Kind.spec)]);
+    try testing.expect(cold.written[@backingInt(write_stats.Kind.meta)] >= @as(u64, 600 * 4) + meta_json);
     for ([_]write_stats.Kind{ .ssm, .qsa, .ring }) |k| try testing.expectEqual(@as(u64, 0), wroteKind(&tier, k));
     try testing.expectEqual(@as(u64, 0), cold.failed);
     try testing.expectEqual(@as(u64, 1), cold.operations.landed);
@@ -7860,6 +7861,7 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     tier.drainWriter();
     var repeated = cold;
     repeated.operations.noop += 1;
+    repeated.origins[@intFromEnum(write_stats.Origin.other)] += 1; // every attempt names its origin
     try testing.expectEqual(repeated, tier.stats.snapshot());
 
     // 600 -> 800 tokens: chunks 0-3 are whole on disk; chunk 4 (the old partial tail) is written again with chunks 5 and 6.
@@ -7869,8 +7871,8 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     const ext = tier.stats.snapshot();
     const grown = &tier.entries.items[0];
     try testing.expectEqual(@as(usize, 7), grown.chunk_bytes.len);
-    try testing.expectEqual(sumBytes(grown.chunk_bytes[4..]), ext.written[@intFromEnum(write_stats.Kind.kv)] - cold.written[@intFromEnum(write_stats.Kind.kv)]);
-    try testing.expectEqual(cold.written[@intFromEnum(write_stats.Kind.spec)], ext.written[@intFromEnum(write_stats.Kind.spec)]);
+    try testing.expectEqual(sumBytes(grown.chunk_bytes[4..]), ext.written[@backingInt(write_stats.Kind.kv)] - cold.written[@backingInt(write_stats.Kind.kv)]);
+    try testing.expectEqual(cold.written[@backingInt(write_stats.Kind.spec)], ext.written[@backingInt(write_stats.Kind.spec)]);
     try testing.expectEqual(@as(u64, 0), ext.failed);
     try testing.expectEqual(@as(u64, 2), ext.operations.landed);
     try testing.expectEqual(ext.totalWritten(), ext.operations.bytes);
@@ -7976,7 +7978,7 @@ test "DiskTier write counters: the synchronous manifest write counts meta on suc
     const path = try std.fmt.allocPrint(testing.allocator, "{s}/e5/meta.json", .{tier.root});
     defer testing.allocator.free(path);
     const landed = tier.stats.snapshot();
-    try testing.expectEqual(fileSize(io, path).?, landed.written[@intFromEnum(write_stats.Kind.meta)]);
+    try testing.expectEqual(fileSize(io, path).?, landed.written[@backingInt(write_stats.Kind.meta)]);
     try testing.expectEqual(missing_dir.failed, landed.failed);
 }
 
@@ -8215,7 +8217,7 @@ test "DiskTier: an extend writes the new tail of the token record, not the whole
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-tail", 0, 128);
     defer tier.deinit();
     _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
-    const kind = @intFromEnum(write_stats.Kind.meta);
+    const kind = @backingInt(write_stats.Kind.meta);
     const before = tier.stats.snapshot().written[kind];
     _ = try tier.appendCommit(cache.entries, 1200, cache.config, &tokens, false, null, s);
     const grown = tier.stats.snapshot().written[kind] - before;

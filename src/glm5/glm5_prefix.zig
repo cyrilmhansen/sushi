@@ -455,7 +455,7 @@ pub fn glmLenFor(self: *const pc.HotPrefixCache, cps: []const SSMCheckpoint, off
     // Beside an SSD tier the hot entry keeps only its newest checkpoints, so only those are priced.
     if (!disk and budget > 0 and newest > 0 and self.capturesLiveForDisk()) {
         var kept: u64 = 0;
-        for (byte_buf[cps.len -| checkpoint_hot_kept .. cps.len]) |b| kept += b;
+        for (byte_buf[cps.len -| checkpoint_hot_kept..cps.len]) |b| kept += b;
         if (@as(u64, newest) * row_bytes + kept + window_bytes <= budget) return newest;
     }
     return glmCommitLenFor(self.cp_thin, budget, disk, newest, row_bytes, window_bytes, pos_buf[0..cps.len], byte_buf[0..cps.len]);
@@ -585,7 +585,7 @@ pub fn commitGlmTiers(
 /// entry, so slicing them here reads the same buffers the commit captured.
 /// A GLM entry goes to disk as its MLA rows in the dense disk layout beside its KDA checkpoints.
 /// `whole` writes every piece now, writer or not (`DiskTier.appendCommitWhole`).
-pub fn persistGlm(d: *kv_disk_cache.DiskTier, rows: *const MlaRows, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, cps: ?[]SSMCheckpoint, dflash: ?kv_disk_cache.SpecCommit, whole: bool, s: mlx.mlx_stream) !kv_disk_cache.PersistOutcome {
+pub fn persistGlm(d: *kv_disk_cache.DiskTier, rows: *const MlaRows, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, cps: ?[]SSMCheckpoint, dflash: ?kv_disk_cache.SpecCommit, whole: bool, s: mlx.mlx_stream, origin: kv_disk_cache.Origin) !kv_disk_cache.PersistOutcome {
     const entries = try diskEntries(d.allocator, rows);
     defer freeDiskEntries(d.allocator, entries);
     const quant = diskQuant(rows.latent_bits);
@@ -599,7 +599,7 @@ pub fn persistGlm(d: *kv_disk_cache.DiskTier, rows: *const MlaRows, tokens: []co
         .dflash_snap = dflash,
         .vision_key = media.key,
         .media_start = media.start,
-    }, s, .{ .whole = whole });
+    }, s, .{ .whole = whole, .origin = origin });
 }
 
 /// GLM's prefill write-through: the rows through `request.offset` and the checkpoints so far go to the SSD tier
@@ -625,7 +625,7 @@ pub fn writeThroughGlm(
         return;
     };
     defer rows.deinit();
-    _ = persistGlm(d, &rows, prompt[0..len], has_tools, media, cps, null, false, s) catch |err| {
+    _ = persistGlm(d, &rows, prompt[0..len], has_tools, media, cps, null, false, s, .prefill_write_through) catch |err| {
         log.warn("  [disk-cache] GLM prefill write-through failed: {s}\n", .{@errorName(err)});
         return;
     };

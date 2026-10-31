@@ -820,7 +820,6 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
-
     /// The rows a restore will deliver, which is not the rows it matched: a hybrid restore is
     /// clamped to its highest SSM checkpoint at or below the match, so the lien test must weigh this.
     pub fn deliverableShare(cps: ?[]const SSMCheckpoint, hybrid: bool, shared: usize) usize {
@@ -2717,7 +2716,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = (if (glm) |rows| persistGlm(d, rows, tokens, has_tools, media, cps, null, false, mlx.gpuStream()) else d.appendCommitWith(.{
+        const outcome = (if (glm) |rows| persistGlm(d, rows, tokens, has_tools, media, cps, null, false, mlx.gpuStream(), .decline_spill) else d.appendCommitWith(.{
             .kv_entries = snap.entries,
             .step = snap.step,
             .config = snap.config,
@@ -2727,7 +2726,7 @@ pub const HotPrefixCache = struct {
             .ring = ringCommitOf(snap, ring_cps),
             .vision_key = media.key,
             .media_start = media.start,
-        }, mlx.gpuStream(), .{})) catch |err| {
+        }, mlx.gpuStream(), .{ .origin = .decline_spill })) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -2878,17 +2877,16 @@ pub const HotPrefixCache = struct {
             // Vision entries never spill: a token-only disk key is ambiguous.
             if (e.vision_key != 0) continue;
             const specs = entrySpecCommits(e);
-            const outcome = d.appendCommitWithSpec(
-                e.snapshot.entries,
-                e.snapshot.step,
-                e.snapshot.config,
-                e.tokens,
-                e.has_tools,
-                e.ssm_checkpoints,
-                specs.dflash,
-                specs.mtp,
-                s,
-            ) catch |err| {
+            const outcome = d.appendCommitWith(.{
+                .kv_entries = e.snapshot.entries,
+                .step = e.snapshot.step,
+                .config = e.snapshot.config,
+                .tokens = e.tokens,
+                .has_tools = e.has_tools,
+                .ssm_checkpoints = e.ssm_checkpoints,
+                .dflash_snap = specs.dflash,
+                .mtp_snap = specs.mtp,
+            }, s, .{ .origin = .idle_spill }) catch |err| {
                 log.warn("  [hot-cache] idle spill failed: {s} — entry stays resident\n", .{@errorName(err)});
                 continue;
             };
@@ -2990,6 +2988,7 @@ pub const HotPrefixCache = struct {
         cps: []SSMCheckpoint,
         flush_bound: u64,
         s: mlx.mlx_stream,
+        origin: kv_disk_cache.Origin,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
         // Below the tier's floor nothing is written yet, so no state may be freed.
@@ -3003,7 +3002,7 @@ pub const HotPrefixCache = struct {
             .ssm_checkpoints = if (cps.len > 0) cps else null,
             .vision_key = media.key,
             .media_start = media.start,
-        }, s, .{ .flush_bound = flush_bound }) catch |err| {
+        }, s, .{ .flush_bound = flush_bound, .origin = origin }) catch |err| {
             log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
         };
         if (floor) d.settleCheckpoints(d.last_store_id, cps);
@@ -3036,7 +3035,7 @@ pub const HotPrefixCache = struct {
             .head_pos_base = mm.head_pos_base,
             .head_marks = mm.head_marks.slice(),
         } else null;
-        _ = (if (pending.glm) |*rows| persistGlm(d, rows, pending.tokens, pending.has_tools, pending.media, pending.ssm_cps, p_dflash, true, s) else d.appendCommitWith(.{
+        _ = (if (pending.glm) |*rows| persistGlm(d, rows, pending.tokens, pending.has_tools, pending.media, pending.ssm_cps, p_dflash, true, s, .request_complete) else d.appendCommitWith(.{
             .kv_entries = pending.snapshot.entries,
             .step = pending.snapshot.step,
             .config = pending.snapshot.config,
@@ -3048,7 +3047,7 @@ pub const HotPrefixCache = struct {
             .ring = ringCommitOf(&pending.snapshot, pending.ring_cps),
             .vision_key = pending.media.key,
             .media_start = pending.media.start,
-        }, s, .{ .whole = true })) catch |err| {
+        }, s, .{ .whole = true, .origin = .request_complete })) catch |err| {
             log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
         };
     }
@@ -3125,7 +3124,7 @@ pub const HotPrefixCache = struct {
         const dflash_spec = specs.dflash;
         const mtp_spec = specs.mtp;
         if (newest.glm) |*rows| {
-            const done = persistGlm(d, rows, tokens, newest.has_tools, media, text.list, dflash_spec, false, s) catch |err| {
+            const done = persistGlm(d, rows, tokens, newest.has_tools, media, text.list, dflash_spec, false, s, .request_complete) catch |err| {
                 log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
                 return;
             };
@@ -3144,7 +3143,7 @@ pub const HotPrefixCache = struct {
             .ring = ringCommitOf(&newest.snapshot, newest.ring_cps),
             .vision_key = media.key,
             .media_start = media.start,
-        }, s, .{}) catch |err| {
+        }, s, .{ .origin = .request_complete }) catch |err| {
             log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -6432,8 +6431,6 @@ test "HotPrefixCache: with an SSD tier the RAM entry keeps only its newest two c
         }
     }
 }
-
-
 
 test "HotPrefixCache: a byte-budget trim never lands on a released checkpoint, which this entry cannot restore from" {
     const cps = [_]SSMCheckpoint{
@@ -10488,12 +10485,12 @@ test "the prefill write-through persists an image turn, keyed by the media it ha
     try testFillCache(&cache, s, 3, tokens.len);
 
     // The first chunk stops below the item: it holds no media row, so it claims none.
-    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..512], false, truncatedMediaKey(&.{}, k1, first_at, 512), &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..512], false, truncatedMediaKey(&.{}, k1, first_at, 512), &.{}, std.math.maxInt(u64), s, .prefill_write_through);
     try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
     try testing.expectEqual(@as(u64, 0), hc.disk.?.entries.items[0].vision_key);
 
     // A later chunk covers the item, so the record names the pixels its rows were computed under.
-    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..2048], false, truncatedMediaKey(&.{}, k1, first_at, 2048), &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(cache.entries, cache.config, tokens[0..2048], false, truncatedMediaKey(&.{}, k1, first_at, 2048), &.{}, std.math.maxInt(u64), s, .prefill_write_through);
     const e = &hc.disk.?.entries.items[0];
     try testing.expectEqual(@as(u64, k1), e.vision_key);
     try testing.expectEqual(@as(?u32, @intCast(first_at)), e.media_start);
@@ -10714,8 +10711,8 @@ test "a write-through under other pixels never extends the record that holds the
     try kv_disk_cache.fillCache(&rows_b, s, 3, tokens.len, 8, 5_000_000.0, .float32);
 
     // Image A's prefill stops after its first chunk (a disconnect); image B's request has the same ids.
-    hc.writeThroughHybrid(rows_a.entries, rows_a.config, tokens[0..1024], false, truncatedMediaKey(&.{}, ka, at, 1024), &.{}, std.math.maxInt(u64), s);
-    hc.writeThroughHybrid(rows_b.entries, rows_b.config, tokens[0..2048], false, truncatedMediaKey(&.{}, kb, at, 2048), &.{}, std.math.maxInt(u64), s);
+    hc.writeThroughHybrid(rows_a.entries, rows_a.config, tokens[0..1024], false, truncatedMediaKey(&.{}, ka, at, 1024), &.{}, std.math.maxInt(u64), s, .prefill_write_through);
+    hc.writeThroughHybrid(rows_b.entries, rows_b.config, tokens[0..2048], false, truncatedMediaKey(&.{}, kb, at, 2048), &.{}, std.math.maxInt(u64), s, .prefill_write_through);
     hc.disk.?.drainWriter();
 
     const chain = [_]MediaSpan{.{ .start = at, .key = kb }};

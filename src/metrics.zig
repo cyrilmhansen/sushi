@@ -974,7 +974,7 @@ test "ngram_warm_bytes is a zero-when-off gauge on both surfaces" {
 test "decode_serial_total carries one labelled series per serial reason, never ok" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.decode_serial_total[@intFromEnum(slot_admission.BatchVerdict.spec_active)].add(3);
+    m.decode_serial_total[@backingInt(slot_admission.BatchVerdict.spec_active)].add(3);
     m.batched_group_size.set(2);
 
     var buf: [64 * 1024]u8 = undefined;
@@ -1183,7 +1183,7 @@ test "both feeds carry the SSD prefix cache write counters, for every kind" {
     const testing = std.testing;
     write_stats.process.recordWritten(.ring, 1);
     write_stats.process.recordFailed(1);
-    const op = write_stats.process.beginOperation().?;
+    const op = write_stats.process.beginOperation(std.testing.io, .other).?;
     write_stats.process.recordWrittenFor(.meta, 5, op);
     op.finish(.complete);
     var m = Metrics.init();

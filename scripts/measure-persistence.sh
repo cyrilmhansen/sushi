@@ -6,7 +6,11 @@
 #   ./scripts/measure-persistence.sh [--dir DIR] [--json]    report SESSION
 #
 # `start` and `stop` each take one snapshot (timestamp, raw /metrics.json, raw /props, the derived
-# counters); `report` diffs the two and writes report.txt + report.json beside them.
+# counters); `report` diffs the two and writes report.txt + report.json beside them. The derived view
+# covers per-kind write bytes, failed bytes, append outcomes and their size histogram, persistence
+# origins, the four duration stages (inference, wait on the writer permit, writer filesystem, end to
+# end) and the writer busy/wait totals — whatever the served build actually carries; anything absent
+# stays absent in the diff, never a fabricated zero.
 #
 # The script is an HTTP reader and nothing else: two GETs per snapshot, never a POST/PUT/DELETE, no
 # inference request, no model load, no process control, no cache mutation, no polling loop, no
@@ -203,14 +207,21 @@ def flat($p): . as $o | reduce ($o|keys[]) as $k ({}; if num($o[$k]) then . + {(
 | ($p[0] | obj) as $pp
 | ($mm.prefix_cache_writes | obj) as $pw
 | ($pw.serialization | obj) as $ser
+| ($ser.durations | obj) as $dur
 | ($mm.counters | obj) as $ctr
 | ($pp.settings | obj) as $st
 | ($st.prefix_cache | obj) as $pc
+| (reduce ("inference", "wait", "writer", "e2e") as $s ({};
+    if (($dur[$s] | type) == "object") and (($dur[$s].buckets | type) == "array") and num($dur[$s].sum_ns)
+    then . + {($s): {buckets: $dur[$s].buckets, sum_ns: $dur[$s].sum_ns}} else . end)) as $stages
 | ({}
    | . + ($ctr | flat("counters."))
    | . + ($mm.gauges | obj | flat("gauges."))
    | . + ($pw.written_bytes | obj | flat("ssd_written_bytes."))
    | . + (if num($pw.failed_bytes) then {ssd_failed_bytes: $pw.failed_bytes} else {} end)
+   | . + ($pw.origins | obj | flat("origins."))
+   | . + (if num($pw.writer_busy_ns) then {writer_busy_ns: $pw.writer_busy_ns} else {} end)
+   | . + (if num($pw.writer_wait_ns) then {writer_wait_ns: $pw.writer_wait_ns} else {} end)
    | . + ($ser | flat("serialization."))
    | . + ($pc | flat("props_prefix_cache."))) as $n
 | ([ $n | keys[] | select(test("(durable|restorable)_tokens_total$")) ] | sort) as $durable
@@ -230,7 +241,8 @@ def flat($p): . as $o | reduce ($o|keys[]) as $k ({}; if num($o[$k]) then . + {(
      elif $ps == "200" then empty
      else "GET \($url)/props -> \($ps): cache capacity, per-tier totals and model/build identity are not captured." end),
     (if ($durable | length) == 0 then "No durable/restorable token counter (a counter named *durable_tokens_total or *restorable_tokens_total) exists here: bytes per newly durable token and write amplification cannot be computed." else "Durable-token counter present: \($durable | join(", "))." end),
-    (if (num($n["counters.persistence_duration_seconds"]) | not) and (num($n["gauges.persistence_last_token_interval"]) | not) then "Persistence duration and effective token-interval metrics are not implemented in this build: section 8 is skipped, never zeroed." else empty end)
+    (if ($ms == "200") and ($mbad == "0") and (($pw | length) > 0) and (($ser | length) > 0) and (($dur | length) == 0) then "/metrics.json serialization has no durations object: the persistence timing histograms are absent in this build, so section 8 stays unmeasured, never zeroed." else empty end),
+    (if ($ms == "200") and ($mbad == "0") and (($pw | length) > 0) and (($pw.origins | obj | length) == 0) then "prefix_cache_writes has no origins object: persist attempts by origin (write-through, request completion, idle spill, declined spill) are absent in this build." else empty end)
   ]) as $diag
 | { label: $label, url: $url, ts: $ts, iso: $iso,
     http: { metrics: $ms, props: $ps },
@@ -246,6 +258,8 @@ def flat($p): . as $o | reduce ($o|keys[]) as $k ({}; if num($o[$k]) then . + {(
     durable_keys: $durable,
     bounds: (if (($ser.byte_bounds | type) == "array") then $ser.byte_bounds else [] end),
     buckets: (if (($ser.byte_buckets | type) == "array") then $ser.byte_buckets else [] end),
+    stage_bounds: (if (($dur.bounds_us | type) == "array") then $dur.bounds_us else [] end),
+    stages: $stages,
     n: $n,
     diagnostics: $diag }
 JQ
@@ -274,7 +288,7 @@ def ident($i): if $i == null then $NA else (($i.model // $NA) | tostring) + "  a
 ($s[0]) as $a | ($b[0]) as $b0
 | def dd($k): if (num($a.n[$k]) and num($b0.n[$k])) then {k: $k, from: $a.n[$k], to: $b0.n[$k], delta: ($b0.n[$k] - $a.n[$k])} else null end;
   def delta($k): (dd($k)) as $r | if $r == null then null else $r.delta end;
-  def is_process($k): ($k | startswith("counters.")) or ($k | startswith("ssd_written_bytes.")) or ($k | startswith("serialization.")) or ($k == "ssd_failed_bytes");
+  def is_process($k): ($k | startswith("counters.")) or ($k | startswith("ssd_written_bytes.")) or ($k | startswith("serialization.")) or ($k | startswith("origins.")) or ($k == "ssd_failed_bytes") or ($k == "writer_busy_ns") or ($k == "writer_wait_ns");
   # a props_prefix_cache total that can only go up for this model's tier, so a decrease is the tier
   # reopening; used bytes, entry count, staging and the budgets are gauges or settings, not totals
   def is_tier($k): ($k | startswith("props_prefix_cache."))
@@ -286,8 +300,41 @@ def ident($i): if $i == null then $NA else (($i.model // $NA) | tostring) + "  a
       | if $i == null then $NA + " (no landed append in this window, or no histogram in this build)"
         elif $i < ($bounds | length) then ("<= " + hum($bounds[$i]) + " (bucket upper bound; the histogram has no finer resolution)")
         else ("> " + hum($bounds[($bounds | length) - 1]) + " (open-ended top bucket: only a lower bound is known)") end;
+  def stages: ["inference", "wait", "writer", "e2e"];
+  def origins: ["prefill_write_through", "decode_point", "request_complete", "idle_spill", "decline_spill", "other"];
+  def htime($us): if num($us) then
+        (if $us >= 1000000 then (s2($us / 1000000) + " s")
+         elif $us >= 1000 then (s2($us / 1000) + " ms")
+         else (($us | floor) | tostring) + " us" end)
+      else $NA end;
+  def plabelT($cum; $bounds; $p): pidx($cum; $bounds; $p) as $i
+      | if $i == null then $NA + " (no landed append in this window)"
+        elif $i < ($bounds | length) then ("<= " + htime($bounds[$i]) + " (bucket upper bound)")
+        else ("> " + htime($bounds[($bounds | length) - 1]) + " (open-ended top bucket: lower bound only)") end;
+  # one stage's histogram delta: null = absent from a snapshot, {err} = not diffable, else bucket
+  # deltas with mean and percentiles named as bucket upper bounds, like the byte histogram
+  def stagediff($st):
+      if ($a.stages[$st] == null) or ($b0.stages[$st] == null) then null
+      elif (($a.stages[$st].buckets | length) != ($b0.stages[$st].buckets | length)) then {err: "bucket counts differ between the snapshots"}
+      elif ($b0.stage_bounds | length) == 0 then {err: "no duration bounds recorded"}
+      else ([range(0; ($b0.stages[$st].buckets | length)) as $i | ($b0.stages[$st].buckets[$i] - $a.stages[$st].buckets[$i])]) as $bk
+      | if ([$bk[] | select(. < 0)] | length) > 0 then {err: "a bucket went backwards"}
+        else ($bk | add) as $n
+        | (($b0.stages[$st].sum_ns - $a.stages[$st].sum_ns) / 1000) as $sum_us
+        | [range(0; ($bk | length)) as $i | ($bk[0 : $i + 1] | add)] as $cum
+        | {buckets: $bk, n: $n, sum_us: $sum_us,
+           mean_us: (if $n > 0 then ($sum_us / $n) else null end),
+           p50: plabelT($cum; $b0.stage_bounds; 0.5), p95: plabelT($cum; $b0.stage_bounds; 0.95),
+           p50_bound: (if (pidx($cum; $b0.stage_bounds; 0.5) == null) then null else ($b0.stage_bounds[pidx($cum; $b0.stage_bounds; 0.5)] // "open") end),
+           p95_bound: (if (pidx($cum; $b0.stage_bounds; 0.95) == null) then null else ($b0.stage_bounds[pidx($cum; $b0.stage_bounds; 0.95)] // "open") end)}
+        end
+      end;
+  (reduce (stages[]) as $st ({}; . + {($st): stagediff($st)})) as $sd
+  | (reduce (origins[]) as $o ({}; . + {($o): delta("origins." + $o)})) as $od
+  | delta("writer_busy_ns") as $wbusy
+  | delta("writer_wait_ns") as $wwait
   # every decreasing key, split by what a decrease can mean
-  ([ $a.n | keys[] as $k | select(num($b0.n[$k])) | select($b0.n[$k] < $a.n[$k]) | {k:$k, from:$a.n[$k], to:$b0.n[$k]} ]) as $neg
+  | ([ $a.n | keys[] as $k | select(num($b0.n[$k])) | select($b0.n[$k] < $a.n[$k]) | {k:$k, from:$a.n[$k], to:$b0.n[$k]} ]) as $neg
   | ([ $neg[] | select(is_process(.k)) ]) as $resets
   | ([ $neg[] | select(is_tier(.k)) | .k ]) as $tier_bad
   | ([ $neg[] | select(is_budget(.k)) ]) as $budgets_back
@@ -305,6 +352,7 @@ def ident($i): if $i == null then $NA else (($i.model // $NA) | tostring) + "  a
        (if ($resets | length) > 0 then "a process counter went backwards, so the server restarted or reset inside the window: " + ($resets | map("\(.k) \(.from) -> \(.to)") | join("; ")) else empty end),
        (if $dur < 0 then "the stop snapshot (\($b0.iso)) precedes the start snapshot (\($a.iso)): the clock moved during the window" else empty end),
        (if (($a.buckets | length) > 0) and (($b0.buckets | length) > 0) and (($a.bounds != $b0.bounds) or (($a.buckets | length) != ($b0.buckets | length))) then "the serialization histogram bounds differ between the snapshots (\($a.buckets | length) vs \($b0.buckets | length) buckets): their buckets are not the same buckets" else empty end),
+       (if (($a.stage_bounds | length) > 0) and (($b0.stage_bounds | length) > 0) and ($a.stage_bounds != $b0.stage_bounds) then "the duration histogram bounds differ between the snapshots (\($a.stage_bounds | length) vs \($b0.stage_bounds | length) bounds): the timing buckets are not the same buckets" else empty end),
        (if (($a.identity.model != null) or ($a.identity.version != null)) != (($b0.identity.model != null) or ($b0.identity.version != null))
         then "one snapshot carries a /props identity and the other does not: a model change or reload inside the window would be invisible, so the comparison is refused" else empty end)
      ]) as $refusals
@@ -337,9 +385,6 @@ def ident($i): if $i == null then $NA else (($i.model // $NA) | tostring) + "  a
   | $b0.bounds as $bounds
   | (if ($ser.bytes != null) and ($hn != null) and ($hn > 0) then ($ser.bytes / $hn) else null end) as $mean
   # ---- rows that wait on instrumentation the served build does not have
-  | delta("counters.persistence_duration_seconds") as $persist_s
-  | (if (num($a.n["gauges.persistence_last_token_interval"]) and num($b0.n["gauges.persistence_last_token_interval"])) then {from:$a.n["gauges.persistence_last_token_interval"], to:$b0.n["gauges.persistence_last_token_interval"]} else null end) as $interval
-  # ---- write amplification needs a VERIFIED durable-token counter, never activity as a proxy
   | (if ($dkey != null) and ($durable != null) and ($durable > 0) and ($total != null) then ($total / $durable) else null end) as $amp
   | ([ (if (($a.identity.model == null) and ($a.identity.version == null)) and (($b0.identity.model == null) and ($b0.identity.version == null))
         then "neither snapshot carries a /props identity (no model loaded, or a metrics-only /props): a model change or reload inside the window cannot be seen here, only a counter reset can" else empty end) ]) as $idgap
@@ -400,6 +445,10 @@ def ident($i): if $i == null then $NA else (($i.model // $NA) | tostring) + "  a
          "   failed:     " + si($ser.failed),
          "   untracked:  " + si($ser.untracked) + (if ($ser.untracked != null) and ($ser.untracked > 0) then "   (the receipt pool was full: these bytes stay in the totals but miss the histogram)" else "" end),
          "   landed bytes: " + hum($ser.bytes),
+         "   begun by origin (attempts at begin; their sum is >= landed+noop+partial+failed):",
+         "     prefill-write-through " + si($od.prefill_write_through) + "  decode-point " + si($od.decode_point) + "  request-complete " + si($od.request_complete),
+         "     idle-spill " + si($od.idle_spill) + "  decline-spill " + si($od.decline_spill) + "  other " + si($od.other),
+         "   writer fs time (all landed blobs): " + (if $wbusy != null then htime($wbusy / 1000) else $NA + " (no writer-busy counter)" end) + ", inference waits on permits: " + (if $wwait != null then htime($wwait / 1000) else $NA + " (no wait counter)" end),
          "   this model's tier (props): landed " + si($tier_landed) + ", bytes " + hum($tier_bytes) + ", written since load " + hum($tier_written),
          "",
          "7. Landed append size (bucket DELTAS; a delta of two percentiles would be meaningless)",
@@ -411,10 +460,21 @@ def ident($i): if $i == null then $NA else (($i.model // $NA) | tostring) + "  a
      + (if $hist != null then [ "   bucket deltas (bounds " + ($bounds | map(tostring) | join(" ")) + " B): " + ($hist | map(tostring) | join(" ")) ]
         else [ "   bucket deltas: " + $NA + " (these snapshots carry no diffable histogram)" ] end)
      + [ "",
-         "8. Persistence duration and effective token intervals",
-         "   time spent persisting:  " + (if $persist_s != null then (s2($persist_s) + " s") else "unavailable: not implemented in this build" end),
-         "   effective token interval: " + (if $interval != null then (si($interval.from) + " -> " + si($interval.to) + " tokens") else "unavailable: not implemented in this build" end),
-         "",
+         "8. Persistence timing of landed appends (bucket DELTAS; subtracting two snapshots' percentiles would be meaningless)"
+       ]
+     + (stages | map(. as $st | $sd[$st] as $d
+         | if $d == null then [ "   " + pad($st; 10) + " " + $NA + " (no timing histogram in one or both snapshots: not implemented in this build)" ]
+           elif $d.err != null then [ "   " + pad($st; 10) + " " + $NA + " (" + $d.err + ")" ]
+           elif $d.n == 0 then [ "   " + pad($st; 10) + " no landed append in this window" ]
+           else [ "   " + pad($st; 10) + " n " + ($d.n | tostring) + "  mean " + htime($d.mean_us) + "  P50 " + $d.p50 + "  P95 " + $d.p95 ]
+           end) | add)
+     + [ "   inference = readback + serialization + sync writes + permit waits on the inference thread (contains wait);",
+         "   wait = inference blocked on the writer's host-byte permit; writer = writer-thread filesystem time;",
+         "   e2e = begin to the last piece landing, queueing included: wall-clock, NOT time blocking inference.",
+         "   without a writer thread the filesystem time is synchronous and shows up in inference, not in writer.",
+         "   effective token interval: unavailable until a verified durable-token metric exists (rows 5 and 9 say why)"
+       ]
+     + [ "",
          "9. Write amplification (bytes per newly restorable token)"
        ]
      + (if $amp != null then [ "   " + s2($amp) + " B/token over " + si($durable) + " newly durable tokens (source: " + $dkey + ")",
@@ -443,7 +503,10 @@ def ident($i): if $i == null then $NA else (($i.model // $NA) | tostring) + "  a
                  p50: plabel($cum;$bounds;0.5), p95: plabel($cum;$bounds;0.95),
                  p50_bucket: (if (pidx($cum;$bounds;0.5) == null) then null else ($bounds[pidx($cum;$bounds;0.5)] // "open") end),
                  p95_bucket: (if (pidx($cum;$bounds;0.95) == null) then null else ($bounds[pidx($cum;$bounds;0.95)] // "open") end) },
-    persistence: { duration_seconds: $persist_s, token_interval: $interval },
+    durations: { bounds_us: (if ($b0.stage_bounds | length) > 0 then $b0.stage_bounds else null end), stages: $sd },
+    origins: $od,
+    writer: { busy_ns: $wbusy, wait_ns: $wwait },
+    persistence: { token_interval: null, note: "effective token intervals need a verified durable-token metric" },
     write_amplification: (if $amp != null then r2($amp) else null end),
     refusals: $refusals, warnings: $warnings, diagnostics: $notes, lines: $lines }
 JQ

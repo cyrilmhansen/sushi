@@ -35,6 +35,14 @@
   },
   "prefix_cache_writes": {
     "failed_bytes": 4096,
+    "origins": {
+      "decline_spill": 1,
+      "decode_point": 0,
+      "idle_spill": 2,
+      "other": 1,
+      "prefill_write_through": 4,
+      "request_complete": 6
+    },
     "serialization": {
       "byte_bounds": [
         4096,
@@ -62,12 +70,87 @@
         0
       ],
       "bytes": 20000000,
+      "durations": {
+        "bounds_us": [
+          10,
+          100,
+          1000,
+          10000,
+          100000,
+          1000000,
+          10000000,
+          60000000,
+          600000000
+        ],
+        "e2e": {
+          "buckets": [
+            0,
+            2,
+            10,
+            20,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "sum_ns": 40000000
+        },
+        "inference": {
+          "buckets": [
+            2,
+            3,
+            4,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "sum_ns": 9000000
+        },
+        "wait": {
+          "buckets": [
+            3,
+            4,
+            2,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "sum_ns": 500000
+        },
+        "writer": {
+          "buckets": [
+            1,
+            8,
+            16,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "sum_ns": 20000000
+        }
+      },
       "failed": 2,
       "landed": 12,
       "noop": 3,
       "partial": 1,
       "untracked": 0
     },
+    "writer_busy_ns": 300000000,
+    "writer_wait_ns": 60000000,
     "written_bytes": {
       "kv": 10485760,
       "meta": 131072,

@@ -13,8 +13,8 @@
 #   3. a build without the write counters: every absent row says "not measured", never 0
 #   4. metrics disabled (/metrics.json 503), /props unavailable (404) and a 200 whose body is not JSON:
 #      explicit diagnostics naming the reason, with the raw body kept
-#   5. refused comparisons: counter reset, model change, histogram bounds change; a per-tier reopen is
-#      a warning, and a gauge going backwards is not a reset at all
+#   5. refused comparisons: counter reset, model change, histogram bounds change (bytes and
+#      durations); a per-tier reopen is a warning, and a gauge going backwards is not a reset at all
 #   6. safety: GETs only, no overwrite of an existing session, no report dir inside the SSD prefix
 #      cache root, and no file created inside that root
 #
@@ -37,7 +37,7 @@ for t in jq curl python3; do
 done
 [ -f "$TOOL" ] || { echo "FAIL $TOOL missing"; exit 1; }
 
-CASES="instrumented legacy durable reset modelchange boundschange tierreset chunkchange budgetchange"
+CASES="instrumented legacy durable reset modelchange boundschange stagebounds tierreset chunkchange budgetchange"
 
 TMP=$(mktemp -d)
 SRV=
@@ -123,13 +123,29 @@ has "$REPORT" "5 10 30 5 5 0 0 0 0 0 1"; check $? "histogram from bucket deltas,
 grep -qE "mean:[[:space:]]+1\.91 MiB \(112000000 B / 56\)" "$REPORT"; check $? "mean landed append size from the delta sum over the delta count"
 grep -qE 'P50:[[:space:]]+<= 1 MiB' "$REPORT"; check $? "P50 named as a bucket upper bound"
 grep -qE 'P95:[[:space:]]+<= 16 MiB' "$REPORT"; check $? "P95 named as a bucket upper bound (subtracting the two snapshots' P95s would have said 0 B)"
-grep -qE 'time spent persisting:[[:space:]]+unavailable: not implemented' "$REPORT"; check $? "persistence duration row skipped, not zeroed"
-grep -qE 'effective token interval:[[:space:]]+unavailable: not implemented' "$REPORT"; check $? "token interval row skipped, not zeroed"
+grep -qE 'prefill-write-through 20[[:space:]]+decode-point 2[[:space:]]+request-complete 28' "$REPORT"; check $? "persist attempts by origin, as bucket-free counter deltas"
+grep -qE 'writer fs time \(all landed blobs\): 500 ms, inference waits on permits: 35 ms' "$REPORT"; check $? "writer-busy and wait totals across ALL work, not only landed appends"
+grep -qE 'inference +n 56  mean 1 ms  P50 <= 1 ms' "$REPORT"; check $? "inference-thread timing from stage bucket deltas"
+grep -qE 'wait +n 56  mean 535 us  P50 <= 10 us' "$REPORT"; check $? "permit-wait timing (mean = delta sum over delta count)"
+grep -qE 'writer +n 56  mean 500 us' "$REPORT"; check $? "writer filesystem timing per landed append"
+grep -qE 'e2e +n 56  mean 4\.57 ms.*P50 <= 10 ms.*P95 <= 100 ms' "$REPORT"; check $? "end-to-end latency including async completion"
+grep -qE 'effective token interval: unavailable until a verified durable-token metric exists' "$REPORT"; check $? "token interval row stays withheld, not zeroed"
 has "$REPORT" "not reported: needs a verified durable-token metric"; check $? "write amplification withheld without durability"
 grep -qE "capacity:[[:space:]]+60 GiB" "$REPORT"; check $? "cache capacity captured from /props"
 grep -qE "identity: model sushi-qwen4  arch qwen4_exp  build 1\.5\.0  engine exl3  kv affine8/8  chunk 8192" "$REPORT"; check $? "served model and build identity captured"
 jq -e '.status=="ok"' "$RJSON" >/dev/null; check $? "report.json records a usable comparison"
 jq -e '.histogram.bucket_deltas==[5,10,30,5,5,0,0,0,0,0,1] and .histogram.n==56' "$RJSON" >/dev/null; check $? "report.json carries the same bucket deltas"
+jq -e '.durations.bounds_us|length==9' "$RJSON" >/dev/null; check $? "report.json carries the duration bounds"
+jq -e '.durations.stages.inference.n==56 and .durations.stages.inference.mean_us==1000 and .durations.stages.inference.p50_bound==1000' "$RJSON" >/dev/null
+check $? "inference stage: count, mean and the percentile's own bucket bound"
+jq -e '.durations.stages.writer.sum_us==28000 and .durations.stages.wait.p95_bound==100' "$RJSON" >/dev/null
+check $? "writer and wait stages diffed from their own buckets"
+jq -e '.durations.stages.e2e.n==56 and .durations.stages.e2e.mean_us > .durations.stages.inference.mean_us' "$RJSON" >/dev/null
+check $? "e2e exceeds inference time: the async completion is counted, and never as blocking"
+jq -e '.origins.request_complete==28 and .origins.prefill_write_through==20' "$RJSON" >/dev/null
+check $? "origin deltas in JSON"
+jq -e '.writer.busy_ns==500000000 and .writer.wait_ns==35000000' "$RJSON" >/dev/null
+check $? "writer-busy and wait totals in JSON"
 jq -e '.histogram.p50_bucket==1048576 and .histogram.p95_bucket==16777216' "$RJSON" >/dev/null; check $? "report.json names the percentile buckets, not invented values"
 jq -e '.bytes.total==61472768 and (.bytes.by_kind|length==6)' "$RJSON" >/dev/null; check $? "report.json carries total and all six kinds"
 jq -e '.bytes.failed==4096' "$RJSON" >/dev/null; check $? "failed-write bytes delta"
@@ -154,6 +170,8 @@ grep -qE "total:[[:space:]]+not measured" "$REPORT"; check $? "no total is inven
 grep -qE "failed:[[:space:]]+not measured" "$REPORT"; check $? "no failed-byte figure is invented"
 grep -qE 'landed:[[:space:]]+not measured' "$REPORT"; check $? "serialization counts reported as absent"
 grep -qE 'mean:[[:space:]]+not measured' "$REPORT"; check $? "no mean is extrapolated from nothing"
+grep -qE 'inference +not measured' "$REPORT"; check $? "timing stages read as absent in a build without them"
+has "$REPORT" "no timing histogram in one or both snapshots"; check $? "the missing-histogram reason is named"
 jq -e '.status=="incomplete" and (.bytes.total==null) and (.serializations.landed==null)' "$RJSON" >/dev/null
 check $? "JSON report keeps absence as null"
 
@@ -211,6 +229,10 @@ has "$REPORT" "served model changed"; check $? "the refusal says why"
 serve_case boundschange bounds
 [ "$RC" = 2 ]; check $? "a histogram whose bounds moved is refused"
 has "$REPORT" "histogram bounds differ"; check $? "the refusal names the bounds"
+
+serve_case stagebounds stageb
+[ "$RC" = 2 ]; check $? "duration bounds that moved are refused too"
+has "$REPORT" "duration histogram bounds differ"; check $? "the timing refusal names the duration bounds"
 
 serve_case tierreset tier
 [ "$RC" = 0 ]; check $? "a per-tier reopen is not a process reset"

@@ -103,6 +103,60 @@ serialization denominator. Do not label its ratio exact write amplification.
 `--ssm-checkpoint-stride` was intentionally removed (`docs/flags.md`); changing
 that grid is separate from completion cadence. `POINT_GRID` remains unchanged.
 
+## Timing and origin instrumentation (landed)
+
+The receipt around `appendCommitWith` now also carries, in the same 64 fixed
+slots and with no new allocation:
+
+- an **origin** per attempt (`prefill_write_through`, `decode_point`,
+  `request_complete`, `idle_spill`, `decline_spill`, `other`), named at each
+  production call site and counted at begin (attempts, not outcomes);
+- four **duration stages** for landed appends: `inference` (the inference
+  thread's own span — GPU→host readback, serialization, synchronous writes and
+  permit waits; readback cannot be split out without touching MLX internals,
+  so it rides inside this stage), `wait` (the part blocked on the writer's
+  host-byte permit, measured inside `waitForRoomLocked`), `writer` (the writer
+  thread's `open`/`write`/`rename` time of this operation's landed blobs) and
+  `e2e` (begin to last reference released — wall-clock including queueing; it
+  is NOT time blocking inference and must never be read as a stall);
+- two process-wide counters, `writer_busy_ns` and `writer_wait_ns`, which
+  cover ALL writer work including receipt-less (untracked, restore-time and
+  bare-writer) spans, so the totals never under-count while the histograms
+  only ever show landed appends.
+
+Without a writer thread the synchronous write time lands in `inference`, not
+`writer`; `wait` ⊆ `inference` and `writer` + queueing ≈ `e2e − inference`.
+Overflow (`untracked`) drops that operation's stage observations but not its
+total contributions. Timestamps are boot-clock reads at begin/finish/last-
+release only — never per token, never per blob part beyond the one stopwatch
+per write.
+
+## Durable-token attribution (blocked, documented)
+
+The interval and amplification rows still have NO metric, and a plausible-
+looking approximation was rejected rather than built:
+
+- `landed` counts filesystem completion; restorability additionally requires
+  the KV extent, the hybrid checkpoint rule and QSA pooled-history coverage,
+  each with its own check (`fullPrefixEntryId`, `entryWholeOnDisk`, hybrid
+  selection) — none is per-operation proof.
+- A restorable-token counter must be MONOTONIC to be diffable by the
+  measurement tool (a falling process counter is refused as a reset), yet
+  budget eviction, poisoning, trimming and fence drops REMOVE previously
+  restorable prefixes. A correct counter therefore needs an ownership audit
+  of every removal path — that is a persistence-machinery redesign, not an
+  instrumentation edit.
+- Attribution must also survive branching: an append may re-land an already
+  recoverable prefix (spec sidecar rewrite, checkpoint thinning) and add
+  zero new restorable tokens; distinguishing new coverage needs the
+  recovery-cursor bookkeeping the audit's "Feasible policy boundary" section
+  already lists as a prerequisite for throttling.
+
+Until that lands, `scripts/measure-persistence.sh` keeps rows 5 (durable
+column) and 9 withheld, and looks for a counter named
+`*durable_tokens_total` or `*restorable_tokens_total`; the engine serves
+neither.
+
 ## Validation isolation
 
 The production executable must remain untouched. Use an explicit separate Zig
@@ -112,14 +166,15 @@ production server. No live workload comparison has yet been performed.
 
 ## Handoff status
 
-The user requested conclusion before the full mission was complete. The initial
-instrumentation milestone adds bounded logical-append receipts, filesystem
-completion outcome counters, byte histograms, and per-model staging figures.
-It changes no persistence policy or tensor ownership. The read-only measurement tool has since landed
-(`scripts/measure-persistence.sh`, [measurements](engine-persistence-measurements.md)); no engine flag has been
-added. Phase 1 remains incomplete: confirmed hybrid recovery
+The initial instrumentation milestone added bounded logical-append receipts,
+filesystem completion outcome counters, byte histograms, and per-model staging
+figures. `scripts/measure-persistence.sh` landed beside it, and the receipts
+now also carry timing stages and origins (see "Timing and origin
+instrumentation") — still no engine flag and no persistence-policy change.
+Phase 1 remains incomplete: confirmed hybrid recovery
 cursors, token intervals and write-amplification denominators are still needed
-before implementing the minimum-token gate.
+before implementing the minimum-token gate (see "Durable-token attribution
+(blocked, documented)").
 
 Validation completed: host suite 748 passed / 7 skipped; focused disk-write,
 DiskStats, props, metrics and Qwen prefill-grid tests 25 passed; ReleaseFast
@@ -130,8 +185,22 @@ still pending at handoff. No real-model A/B, restart workload, TTFT comparison
 or measured GPU-memory non-regression has been performed. No SSD-write savings
 are claimed. The production binary's checksum remained unchanged.
 
+Resume validation (timing and origins): full `test-host` tier green with the
+timing receipts, writer-attribution and origin counters added; the candidate
+ReleaseFast binary builds to an isolated prefix and its `--help` runs without
+touching a model; `zig-out/bin/sushi`'s checksum is byte-identical before and
+after. `tests/test_measure_persistence.sh` covers the tool's use of the new
+fields (107 assertions). MLX-tier tests that exercise the renamed signatures
+(`prefix_cache`, `qwen4_prefix_cache_test`, `glm5_prefix_cache_test`,
+`dsv41_prefix_cache_test`, `kv_disk_cache`, `metrics`, `models_api`,
+`model_registry`) are compile-checked by the ReleaseFast build but NOT
+EXECUTED here (they need MLX); a full `zig build test` run is deferred to the
+user. No live workload has been measured yet.
+
 Continue by completing operation-to-confirmed-recovery attribution (including
-QSA and branched prefixes), then write failing cumulative-threshold tests.
+QSA and branched prefixes and the eviction-aware monotonicity problem
+documented under "Durable-token attribution (blocked, documented)"), then
+write failing cumulative-threshold tests.
 Gate before snapshot capture, preserve the existing checkpoint-retention cap,
 and force existing behavior wherever an equivalent budgeted RAM recovery point
 cannot be proved. Do not use the serialization `landed` counter as that proof.
