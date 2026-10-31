@@ -130,6 +130,8 @@ pub const Operation = struct {
 
 pub const Snapshot = struct {
     written: [kind_count]u64 = @splat(0),
+    /// Landed filesystem bytes, including partial logical appends and standalone writes.
+    by_origin_kind: [origin_count][kind_count]u64 = @splat(@splat(0)),
     /// Bytes handed to a write that failed, or staged and then dropped; never part of `written`.
     failed: u64 = 0,
     operations: OperationSnapshot = .{},
@@ -150,6 +152,7 @@ pub const Snapshot = struct {
 
 pub const Stats = struct {
     written: [kind_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+    by_origin_kind: [origin_count][kind_count]std.atomic.Value(u64) = @splat(@splat(.init(0))),
     failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     parent: ?*Stats = null,
     operations: [5]std.atomic.Value(u64) = @splat(.init(0)),
@@ -163,6 +166,7 @@ pub const Stats = struct {
     writer_wait_ns: std.atomic.Value(u64) = .init(0),
     /// Inference-thread-only receipt for synchronous writes. Writer threads pass their own explicitly.
     active: ?*Operation = null,
+    active_origin: Origin = .other,
 
     pub fn beginOperation(self: *Stats, io: std.Io, origin: Origin) ?*Operation {
         self.noteOrigin(origin);
@@ -237,13 +241,18 @@ pub const Stats = struct {
     }
 
     pub fn recordWritten(self: *Stats, kind: Kind, bytes: u64) void {
-        self.recordWrittenFor(kind, bytes, self.active);
+        self.recordWrittenAttributed(kind, bytes, self.active, self.active_origin);
     }
 
     pub fn recordWrittenFor(self: *Stats, kind: Kind, bytes: u64, op: ?*Operation) void {
+        self.recordWrittenAttributed(kind, bytes, op, if (op) |o| o.origin else .other);
+    }
+
+    pub fn recordWrittenAttributed(self: *Stats, kind: Kind, bytes: u64, op: ?*Operation, origin: Origin) void {
         _ = self.written[@backingInt(kind)].fetchAdd(bytes, .monotonic);
+        _ = self.by_origin_kind[@backingInt(origin)][@backingInt(kind)].fetchAdd(bytes, .monotonic);
         if (op) |o| _ = o.written.fetchAdd(bytes, .monotonic);
-        if (self.parent) |p| p.recordWrittenFor(kind, bytes, null);
+        if (self.parent) |p| p.recordWrittenAttributed(kind, bytes, null, origin);
     }
 
     pub fn recordFailed(self: *Stats, bytes: u64) void {
@@ -259,6 +268,9 @@ pub const Stats = struct {
     pub fn snapshot(self: *const Stats) Snapshot {
         var s: Snapshot = .{ .failed = self.failed.load(.monotonic) };
         for (&s.written, &self.written) |*dst, *src| dst.* = src.load(.monotonic);
+        for (&s.by_origin_kind, &self.by_origin_kind) |*dst, *src| {
+            for (dst, src) |*cell, *atomic| cell.* = atomic.load(.monotonic);
+        }
         s.operations = .{
             .landed = self.operations[0].load(.monotonic),
             .noop = self.operations[1].load(.monotonic),
@@ -286,6 +298,12 @@ pub fn writePrometheus(snap: Snapshot, w: *std.Io.Writer) !void {
     try w.print("# HELP sushi:prefix_cache_write_bytes_total Bytes the SSD prefix cache wrote to the filesystem since process start, by file kind\n# TYPE sushi:prefix_cache_write_bytes_total counter\n", .{});
     inline for (kind_names, 0..) |name, i| {
         try w.print("sushi:prefix_cache_write_bytes_total{{kind=\"{s}\"}} {d}\n", .{ name, snap.written[i] });
+    }
+    try w.writeAll("# HELP sushi:prefix_cache_write_origin_bytes_total Landed filesystem bytes by persistence origin and file kind, including partial appends\n# TYPE sushi:prefix_cache_write_origin_bytes_total counter\n");
+    inline for (origin_names, 0..) |origin, oi| {
+        inline for (kind_names, 0..) |kind, ki| {
+            try w.print("sushi:prefix_cache_write_origin_bytes_total{{origin=\"{s}\",kind=\"{s}\"}} {d}\n", .{ origin, kind, snap.by_origin_kind[oi][ki] });
+        }
     }
     try w.print("\n# HELP sushi:prefix_cache_write_failed_bytes_total Bytes of SSD prefix cache writes that failed or were dropped before landing\n# TYPE sushi:prefix_cache_write_failed_bytes_total counter\nsushi:prefix_cache_write_failed_bytes_total {d}\n\n", .{snap.failed});
     const op = snap.operations;
@@ -322,6 +340,14 @@ pub fn writeJson(snap: Snapshot, w: *std.Io.Writer) !void {
     try w.print("\"prefix_cache_writes\":{{\"written_bytes\":{{", .{});
     inline for (kind_names, 0..) |name, i| {
         try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", name, snap.written[i] });
+    }
+    try w.writeAll("},\"by_origin_kind\":{");
+    inline for (origin_names, 0..) |origin, oi| {
+        try w.print("{s}\"{s}\":{{", .{ if (oi == 0) "" else ",", origin });
+        inline for (kind_names, 0..) |kind, ki| {
+            try w.print("{s}\"{s}\":{d}", .{ if (ki == 0) "" else ",", kind, snap.by_origin_kind[oi][ki] });
+        }
+        try w.writeAll("}");
     }
     try w.print("}},\"failed_bytes\":{d},\"origins\":{{", .{snap.failed});
     inline for (origin_names, 0..) |name, i| {
@@ -407,6 +433,25 @@ test "operation tracking is bounded and a completed slot can be reused" {
     try std.testing.expectEqual(@as(u64, 1), stats.snapshot().operations.landed);
 }
 
+test "landed byte attribution includes partial and receiptless operations exactly once" {
+    var parent: Stats = .{};
+    var tier: Stats = .{ .parent = &parent };
+    const partial = tier.beginOperation(std.testing.io, .prefill_write_through).?;
+    tier.recordWrittenAttributed(.ssm, 120, partial, .prefill_write_through);
+    partial.finish(.partial);
+    tier.recordWrittenAttributed(.qsa, 40, null, .request_complete);
+    const snap = tier.snapshot();
+    try std.testing.expectEqual(@as(u64, 120), snap.by_origin_kind[@backingInt(Origin.prefill_write_through)][@backingInt(Kind.ssm)]);
+    try std.testing.expectEqual(@as(u64, 40), snap.by_origin_kind[@backingInt(Origin.request_complete)][@backingInt(Kind.qsa)]);
+    try std.testing.expectEqual(@as(u64, 0), snap.operations.landed);
+    try std.testing.expectEqual(snap.by_origin_kind, parent.snapshot().by_origin_kind);
+    var by_kind: [kind_count]u64 = @splat(0);
+    for (snap.by_origin_kind) |row| for (row, 0..) |bytes, kind| {
+        by_kind[kind] += bytes;
+    };
+    try std.testing.expectEqual(snap.written, by_kind);
+}
+
 test "timing receipts: a landed append records its four spans; other outcomes do not" {
     var stats: Stats = .{};
     const op = stats.beginOperation(std.testing.io, .idle_spill).?;
@@ -476,6 +521,7 @@ test "the renderings name every origin, stage and writer total" {
     try writePrometheus(snap, &w);
     const prom = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_persist_origin_total{origin=\"request_complete\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_write_origin_bytes_total{origin=\"request_complete\",kind=\"meta\"} 10") != null);
     try std.testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_writer_busy_ns_total 2500") != null);
     try std.testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_writer_wait_ns_total 1500") != null);
     try std.testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_serialization_duration_us_bucket{stage=\"writer\",le=\"10\"} 1") != null);
@@ -489,6 +535,7 @@ test "the renderings name every origin, stage and writer total" {
     defer parsed.deinit();
     const obj = parsed.value.object.get("prefix_cache_writes").?.object;
     try std.testing.expectEqual(@as(i64, 1), obj.get("origins").?.object.get("request_complete").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), obj.get("by_origin_kind").?.object.get("request_complete").?.object.get("meta").?.integer);
     try std.testing.expectEqual(@as(i64, 2500), obj.get("writer_busy_ns").?.integer);
     try std.testing.expectEqual(@as(i64, 1500), obj.get("writer_wait_ns").?.integer);
     const stages = obj.get("serialization").?.object.get("durations").?.object;
@@ -504,7 +551,7 @@ test "the Prometheus and JSON renderings name every kind and the failed counter"
     var w: std.Io.Writer = .fixed(&buf);
     try writePrometheus(snap, &w);
     const prom = w.buffered();
-    var json_buf: [2048]u8 = undefined;
+    var json_buf: [8192]u8 = undefined;
     var jw: std.Io.Writer = .fixed(&json_buf);
     try jw.writeAll("{");
     try writeJson(snap, &jw);

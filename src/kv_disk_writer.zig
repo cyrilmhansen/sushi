@@ -20,6 +20,7 @@ pub const Blob = struct {
     part: Part = .whole,
     kind: write_stats.Kind,
     operation: ?*write_stats.Operation = null,
+    origin: write_stats.Origin = .other,
 };
 
 /// A file staged in parts: the first truncates its `tmp`, the rest append, the last renames.
@@ -75,6 +76,7 @@ pub const Writer = struct {
     stats: ?*write_stats.Stats = null,
     /// Set by the single producer for one logical append; copied into each accepted blob.
     operation: ?*write_stats.Operation = null,
+    origin: write_stats.Origin = .other,
     /// Diagnostics / test bars. Written under the mutex.
     files_written: u64 = 0,
     bytes_written: u64 = 0,
@@ -145,8 +147,8 @@ pub const Writer = struct {
         self.mutex.unlock(self.io);
     }
 
-    fn noteWritten(self: *Writer, kind: write_stats.Kind, n: usize, op: ?*write_stats.Operation) void {
-        if (self.stats) |st| st.recordWrittenFor(kind, n, op);
+    fn noteWritten(self: *Writer, kind: write_stats.Kind, n: usize, op: ?*write_stats.Operation, origin: write_stats.Origin) void {
+        if (self.stats) |st| st.recordWrittenAttributed(kind, n, op, origin);
     }
 
     fn noteFailed(self: *Writer, n: usize, op: ?*write_stats.Operation) void {
@@ -198,6 +200,7 @@ pub const Writer = struct {
             .part = part,
             .kind = kind,
             .operation = self.operation,
+            .origin = self.origin,
         }) catch |err| {
             self.noteFailureLocked(path, @errorName(err));
             if (part != .whole) self.markBrokenLocked(path);
@@ -512,7 +515,7 @@ pub const Writer = struct {
                 if (self.stats) |st| st.recordWriterBusy(fs_ns, blob.operation);
                 if (blob.part == .whole or blob.part == .last) self.files_written += 1;
                 self.bytes_written += blob.bytes.len;
-                self.noteWritten(blob.kind, blob.bytes.len, blob.operation);
+                self.noteWritten(blob.kind, blob.bytes.len, blob.operation, blob.origin);
             }
             self.inflight_bytes = 0;
             self.inflight_path = null;
@@ -905,17 +908,20 @@ test "kv_disk_writer: one receipt spans queued pieces and fencing cannot complet
     w.setPaused(true);
     const op = stats.beginOperation(std.testing.io, .other).?;
     w.operation = op;
+    w.origin = .prefill_write_through;
     for ([_]Part{ .first, .last }) |part| {
         const b = try stagedBlob(root, "chunk", 256);
         w.submitPart(b.path, b.bytes, part, .kv);
     }
     w.operation = null;
+    w.origin = .other;
     op.finish(.complete);
     try testing.expectEqual(@as(u64, 0), stats.snapshot().operations.landed);
     w.setPaused(false);
     w.drain();
     try testing.expectEqual(@as(u64, 1), stats.snapshot().operations.landed);
     try testing.expectEqual(@as(u64, 512), stats.snapshot().operations.bytes);
+    try testing.expectEqual(@as(u64, 512), stats.snapshot().by_origin_kind[@backingInt(write_stats.Origin.prefill_write_through)][@backingInt(StatKind.kv)]);
 
     w.setPaused(true);
     const fenced = stats.beginOperation(std.testing.io, .other).?;

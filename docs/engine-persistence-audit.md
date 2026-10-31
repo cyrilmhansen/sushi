@@ -67,6 +67,9 @@ The read-only before/after tool for this area is `scripts/measure-persistence.sh
 ([measurements](engine-persistence-measurements.md)): two `GET` snapshots either side of a session and the diff
 between them. It changes nothing, and it withholds bytes-per-newly-durable-token and write amplification until a
 verified durable-token metric exists, because this audit's own conclusion is that `landed` is not that proof.
+The [second campaign](engine-persistence-campaign2.md) adds fixed origin-by-kind
+landed-byte accounting so a future window can distinguish prefill, completion
+and spill costs, including bytes in partial appends.
 
 ## Feasible policy boundary
 

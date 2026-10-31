@@ -101,6 +101,19 @@ serve_case() {
 # ---------------------------------------------------------------- 1. the happy path
 
 serve_case instrumented full
+
+# Origin-by-kind deltas are composed from the same landed-byte counters, even
+# when one origin's append was partial (the per-origin operation outcome is not a filter).
+jq '.prefix_cache_writes.by_origin_kind = {prefill_write_through:{ssm:100},request_complete:{ssm:50}}' "$FX/instrumented/start/metrics.json" >"$SERVE/metrics.json"
+cp "$FX/instrumented/start/props.json" "$SERVE/props"
+"$TOOL" --url "$U" --dir "$RUNS" start originbytes >/dev/null 2>&1
+jq '.prefix_cache_writes.by_origin_kind = {prefill_write_through:{ssm:130},request_complete:{ssm:120}}' "$FX/instrumented/stop/metrics.json" >"$SERVE/metrics.json"
+cp "$FX/instrumented/stop/props.json" "$SERVE/props"
+"$TOOL" --url "$U" --dir "$RUNS" stop originbytes >/dev/null 2>&1
+"$TOOL" --dir "$RUNS" report originbytes >/dev/null 2>&1
+jq -e '[.bytes.by_origin_kind[] | select(.origin == "prefill_write_through") | .kinds[] | select(.kind == "ssm") | .bytes] == [30] and [.bytes.by_origin_kind[] | select(.origin == "request_complete") | .kinds[] | select(.kind == "ssm") | .bytes] == [70]' "$RUNS/originbytes/report.json" >/dev/null
+check $? "origin-by-kind bytes are differenced independently of operation outcome"
+
 has "$TMP/full.snapshots" "start snapshot of"; check $? "start snapshot taken"
 has "$TMP/full.snapshots" "stop snapshot of"; check $? "stop snapshot taken"
 [ -f "$REPORT" ]; check $? "report written"

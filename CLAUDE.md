@@ -51,6 +51,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/engine-prefix-cache.md](docs/engine-prefix-cache.md) | hot cache, hybrid restore, trimming, SSD-first, checkouts, spec state |
 | [docs/engine-persistence-audit.md](docs/engine-persistence-audit.md) | persistence ownership audit, completion semantics, cadence constraints |
 | [docs/engine-persistence-measurements.md](docs/engine-persistence-measurements.md) | `measure-persistence.sh`: the read-only SSD-write window and what each row is worth |
+| [docs/engine-persistence-campaign2.md](docs/engine-persistence-campaign2.md) | pi-2 root-cause analysis, H1–H4 feasibility and operator A/B plan |
 | [docs/engine-kernels.md](docs/engine-kernels.md) | decode/MoE/prefill/verify kernels, NAX/MPP pitfalls, proving and timing a kernel |
 | [docs/engine-mlx-gotchas.md](docs/engine-mlx-gotchas.md) | MLX errors, dtype promotion, barriers, views vs copies, allocator, Zig/tokenizer traps |
 | [docs/engine-memory-admission.md](docs/engine-memory-admission.md) | Metal OOM, preflight, auto-context, prefill chunk, admission |

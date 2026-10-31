@@ -472,6 +472,12 @@ They count what the filesystem accepted, never what was submitted, and run from 
   (the post-finish flush), `idle_spill`, `decline_spill` and `other`; `/metrics.json` carries the same map as `origins`.
   The sum of origins is the count of begun operations, so it is at least landed+noop+partial+failed (receipt overflow
   adds to `untracked` but every attempt also names its origin).
+- `sushi:prefix_cache_write_origin_bytes_total{origin,kind}` and
+  `prefix_cache_writes.by_origin_kind` attribute landed filesystem bytes when
+  each file write completes, including partial appends. The fixed 6×6 cells
+  add up to the existing per-kind byte totals; writes outside a logical append
+  use `other`. Receipt overflow does not hide their bytes. See
+  [campaign 2](engine-persistence-campaign2.md) for the pi-2 analysis.
 - **Persistence timing**: `sushi:prefix_cache_serialization_duration_us` is a histogram per landed append with a
   `stage` label — `inference` (readback + serialization + synchronous writes + permit waits, the time the inference
   thread actually spent), `wait` (the part of that blocked on the writer's host-byte permit), `writer` (writer-thread

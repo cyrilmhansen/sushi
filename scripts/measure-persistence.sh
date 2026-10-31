@@ -218,6 +218,8 @@ def flat($p): . as $o | reduce ($o|keys[]) as $k ({}; if num($o[$k]) then . + {(
    | . + ($ctr | flat("counters."))
    | . + ($mm.gauges | obj | flat("gauges."))
    | . + ($pw.written_bytes | obj | flat("ssd_written_bytes."))
+   | . + (reduce (($pw.by_origin_kind | obj) | keys[]) as $o ({};
+       . + ($pw.by_origin_kind[$o] | obj | flat("ssd_origin_kind." + $o + "."))))
    | . + (if num($pw.failed_bytes) then {ssd_failed_bytes: $pw.failed_bytes} else {} end)
    | . + ($pw.origins | obj | flat("origins."))
    | . + (if num($pw.writer_busy_ns) then {writer_busy_ns: $pw.writer_busy_ns} else {} end)
@@ -288,7 +290,7 @@ def ident($i): if $i == null then $NA else (($i.model // $NA) | tostring) + "  a
 ($s[0]) as $a | ($b[0]) as $b0
 | def dd($k): if (num($a.n[$k]) and num($b0.n[$k])) then {k: $k, from: $a.n[$k], to: $b0.n[$k], delta: ($b0.n[$k] - $a.n[$k])} else null end;
   def delta($k): (dd($k)) as $r | if $r == null then null else $r.delta end;
-  def is_process($k): ($k | startswith("counters.")) or ($k | startswith("ssd_written_bytes.")) or ($k | startswith("serialization.")) or ($k | startswith("origins.")) or ($k == "ssd_failed_bytes") or ($k == "writer_busy_ns") or ($k == "writer_wait_ns");
+  def is_process($k): ($k | startswith("counters.")) or ($k | startswith("ssd_written_bytes.")) or ($k | startswith("ssd_origin_kind.")) or ($k | startswith("serialization.")) or ($k | startswith("origins.")) or ($k == "ssd_failed_bytes") or ($k == "writer_busy_ns") or ($k == "writer_wait_ns");
   # a props_prefix_cache total that can only go up for this model's tier, so a decrease is the tier
   # reopening; used bytes, entry count, staging and the budgets are gauges or settings, not totals
   def is_tier($k): ($k | startswith("props_prefix_cache."))
@@ -359,6 +361,7 @@ def ident($i): if $i == null then $NA else (($i.model // $NA) | tostring) + "  a
   # ---- bytes by kind, over the kinds both snapshots report
   | ([ kinds[] | select((num($a.n["ssd_written_bytes." + .])) and (num($b0.n["ssd_written_bytes." + .]))) ]) as $kk
   | ([ $kk[] | { kind: ., bytes: delta("ssd_written_bytes." + .) } ]) as $by_kind
+  | ([ origins[] as $o | {origin: $o, kinds: [kinds[] as $k | {kind: $k, bytes: delta("ssd_origin_kind." + $o + "." + $k)}]} ]) as $by_origin_kind
   | (if ($by_kind | length) == 0 then null else ([ $by_kind[].bytes ] | add) end) as $total
   | ([ kinds[] | select((num($a.n["ssd_written_bytes." + .]) or num($b0.n["ssd_written_bytes." + .])) and (($kk | index(.)) == null)) ]) as $kind_gaps
   | (if num($a.n["ssd_failed_bytes"]) and num($b0.n["ssd_failed_bytes"]) then (delta("ssd_failed_bytes")) else null end) as $failed
@@ -490,7 +493,7 @@ def ident($i): if $i == null then $NA else (($i.model // $NA) | tostring) + "  a
     identity: { start: $a.identity, stop: $b0.identity },
     capacity: { disk_bytes: $b0.n["props_prefix_cache.disk_bytes"], disk_used_bytes: $b0.n["props_prefix_cache.disk_used_bytes"],
                 disk_entries: $b0.n["props_prefix_cache.disk_entries"] },
-    bytes: { total: $total, by_kind: $by_kind, failed: $failed,
+    bytes: { total: $total, by_kind: $by_kind, by_origin_kind: $by_origin_kind, failed: $failed,
              mb_per_min: (if ($total != null) and ($dur > 0) then r2($total / 1000000 / ($dur / 60)) else null end),
              mib_per_min: (if ($total != null) and ($dur > 0) then r2($total / 1048576 / ($dur / 60)) else null end) },
     tokens: { prefill: $prefill, generated: $generated, processed: $processed, prompt: $prompt, restored: $restored,

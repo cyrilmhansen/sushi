@@ -1552,11 +1552,19 @@ pub const DiskTier = struct {
     pub fn appendCommitWith(self: *DiskTier, p: CommitParams, s: mlx.mlx_stream, opts: CommitOpts) !PersistOutcome {
         const receipt = self.stats.beginOperation(self.io, opts.origin);
         self.stats.active = receipt;
-        if (self.writer) |w| w.operation = receipt;
+        self.stats.active_origin = opts.origin;
+        if (self.writer) |w| {
+            w.operation = receipt;
+            w.origin = opts.origin;
+        }
         var outcome: write_stats.Operation.Outcome = .failed;
         defer {
             self.stats.active = null;
-            if (self.writer) |w| w.operation = null;
+            self.stats.active_origin = .other;
+            if (self.writer) |w| {
+                w.operation = null;
+                w.origin = .other;
+            }
             if (receipt) |op| op.finish(outcome);
         }
         // With the writer armed the commit lands whole, piece by piece: each piece stages at most

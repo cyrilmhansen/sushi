@@ -55,6 +55,7 @@ R=~/.sushi/runs/persistence/pi-baseline/report.json
 jq '.bytes.by_kind, .bytes.mb_per_min, .serializations, .histogram' "$R"
 jq '.durations.stages | with_entries(select(.value != null and .value.n? > 0))' "$R"   # empty on stage A
 jq '.origins, .writer' "$R"                                                            # empty on stage A
+jq '.bytes.by_origin_kind' "$R"                                                        # available when origin-by-kind counters are served
 ```
 
 ## Stage B — the candidate instrumentation build
