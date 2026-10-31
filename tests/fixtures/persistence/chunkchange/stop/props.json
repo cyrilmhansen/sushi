@@ -1,0 +1,51 @@
+{
+  "batching": {
+    "max_group": 4,
+    "reason": "ok",
+    "supported": true
+  },
+  "default_generation_settings": {
+    "model": "sushi-qwen4",
+    "n_ctx": "131072"
+  },
+  "memory": {
+    "active_bytes": 40000000000,
+    "available_bytes": 60000000000,
+    "cache_bytes": 1000000000,
+    "kv_cache_bytes": 2000000000,
+    "max_safe_context": 131072,
+    "owned_bytes": 42000000000,
+    "peak_bytes": 41000000000
+  },
+  "settings": {
+    "drafter": "none",
+    "engine": "exl3",
+    "kv_cache": {
+      "scheme": "affine8",
+      "source": "default"
+    },
+    "kv_quant": "8",
+    "max_concurrent": 4,
+    "model": "qwen4_exp",
+    "mtp": {
+      "default_on": true,
+      "depth": 3,
+      "loaded": true
+    },
+    "prefill_chunk": 4096,
+    "prefix_cache": {
+      "disk_bytes": 64424509440,
+      "disk_entries": 9,
+      "disk_used_bytes": 10000000,
+      "disk_written_bytes": 76218368,
+      "mem_bytes": 8000000000,
+      "ram_enabled": true,
+      "serialization_bytes": 132000000,
+      "serialization_landed": 68,
+      "writer_staged_bytes": 0,
+      "writer_staged_peak_bytes": 33554432
+    },
+    "version": "1.5.0"
+  },
+  "total_slots": 1
+}

@@ -457,6 +457,9 @@ They count what the filesystem accepted, never what was submitted, and run from 
   in `written`, since the filesystem took it. These are filesystem bytes, not NAND wear.
 - `/props settings.prefix_cache.disk_written_bytes` is the tier's own total, so a model that unloads takes its figure with
   it while the process counters keep it.
+- **Measuring a window**: `scripts/measure-persistence.sh` diffs two `GET` snapshots of these counters and the token
+  counters around a session, changing nothing
+  ([measurements](engine-persistence-measurements.md)).
 - Logical append accounting surrounds `appendCommitWith`, including all its bounded pieces and synchronous token
   writes. `/metrics` exposes `sushi:prefix_cache_serialization_operations_total` with outcomes `landed`, `noop`,
   `partial`, `failed`, `untracked`, and the `sushi:prefix_cache_serialization_bytes` histogram for landed operations.

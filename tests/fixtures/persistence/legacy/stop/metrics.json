@@ -1,0 +1,34 @@
+{
+  "counters": {
+    "generation_tokens_total": 50500,
+    "prefill_tokens_total": 201000,
+    "prefix_cache_hits_total": 14,
+    "prefix_cache_queries_total": 8,
+    "prefix_cache_tokens_total": 4000,
+    "prompt_tokens_total": 201000,
+    "requests_cancelled_total": 0,
+    "requests_failed_total": 0,
+    "requests_rejected_total": 0,
+    "requests_success_total": 20
+  },
+  "decode_serial": {
+    "mtp_off": 1
+  },
+  "gauges": {
+    "memory_mb": 40000,
+    "requests_running": 0
+  },
+  "histograms": {
+    "time_to_first_token_seconds": {
+      "bounds": [
+        0.1
+      ],
+      "bucket_counts": [
+        1
+      ],
+      "count": 1,
+      "sum": 0.2
+    }
+  },
+  "sessions": []
+}

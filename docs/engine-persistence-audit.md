@@ -61,6 +61,13 @@ This is an implementation audit, not a measurement of write savings.
   release entry handles immediately before the slot appends, allowing donation;
   an uncommitted checked-out entry cannot be treated as retained recovery state.
 
+## Reading the numbers
+
+The read-only before/after tool for this area is `scripts/measure-persistence.sh`
+([measurements](engine-persistence-measurements.md)): two `GET` snapshots either side of a session and the diff
+between them. It changes nothing, and it withholds bytes-per-newly-durable-token and write amplification until a
+verified durable-token metric exists, because this audit's own conclusion is that `landed` is not that proof.
+
 ## Feasible policy boundary
 
 The least invasive candidate is to defer only when existing budgeted RAM state
@@ -108,8 +115,9 @@ production server. No live workload comparison has yet been performed.
 The user requested conclusion before the full mission was complete. The initial
 instrumentation milestone adds bounded logical-append receipts, filesystem
 completion outcome counters, byte histograms, and per-model staging figures.
-It changes no persistence policy or tensor ownership. Neither requested CLI
-flag has been added. Phase 1 remains incomplete: confirmed hybrid recovery
+It changes no persistence policy or tensor ownership. The read-only measurement tool has since landed
+(`scripts/measure-persistence.sh`, [measurements](engine-persistence-measurements.md)); no engine flag has been
+added. Phase 1 remains incomplete: confirmed hybrid recovery
 cursors, token intervals and write-amplification denominators are still needed
 before implementing the minimum-token gate.
 

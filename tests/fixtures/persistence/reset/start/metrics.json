@@ -1,0 +1,78 @@
+{
+  "counters": {
+    "generation_tokens_total": 50500,
+    "prefill_tokens_total": 201000,
+    "prefix_cache_hits_total": 14,
+    "prefix_cache_queries_total": 8,
+    "prefix_cache_tokens_total": 4000,
+    "prompt_tokens_total": 201000,
+    "requests_cancelled_total": 0,
+    "requests_failed_total": 0,
+    "requests_rejected_total": 0,
+    "requests_success_total": 20
+  },
+  "decode_serial": {
+    "mtp_off": 1
+  },
+  "gauges": {
+    "memory_mb": 40000,
+    "requests_running": 0
+  },
+  "histograms": {
+    "time_to_first_token_seconds": {
+      "bounds": [
+        0.1
+      ],
+      "bucket_counts": [
+        1
+      ],
+      "count": 1,
+      "sum": 0.2
+    }
+  },
+  "prefix_cache_writes": {
+    "failed_bytes": 8192,
+    "serialization": {
+      "byte_bounds": [
+        4096,
+        65536,
+        1048576,
+        4194304,
+        16777216,
+        67108864,
+        268435456,
+        1073741824,
+        2147483648,
+        4294967296
+      ],
+      "byte_buckets": [
+        7,
+        13,
+        34,
+        7,
+        6,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1
+      ],
+      "bytes": 132000000,
+      "failed": 3,
+      "landed": 68,
+      "noop": 6,
+      "partial": 3,
+      "untracked": 0
+    },
+    "written_bytes": {
+      "kv": 62914560,
+      "meta": 262144,
+      "qsa": 3145728,
+      "ring": 262144,
+      "spec": 1048576,
+      "ssm": 8388608
+    }
+  },
+  "sessions": []
+}
