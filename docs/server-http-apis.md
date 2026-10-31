@@ -271,6 +271,11 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
   Unlike the request counters they run from process start whatever turns metrics on, and the routes keep the 503-while-off
   rule. `/props settings.prefix_cache.disk_written_bytes` is that model's own total since its tier opened (`disk_stats`,
   the same sequence-locked publish as `disk_used_bytes`), so an unload and reload restarts it while the process total keeps it.
+  Logical append completion and size are exposed separately as `sushi:prefix_cache_serialization_operations_total`
+  and `sushi:prefix_cache_serialization_bytes` (histogram), and as `prefix_cache_writes.serialization` in JSON.
+  `landed` certifies filesystem completion, not hybrid restorability. `/props settings.prefix_cache` also carries
+  `serialization_landed`, `serialization_bytes`, `writer_staged_bytes` and `writer_staged_peak_bytes`; see the linked
+  write-counter documentation for bucket semantics and bounded tracking overflow.
 - `/metrics.json` ends with `"sessions"`, one row per live request (phases `prefill` and `decode`, cap 32; published
   by the inference thread under `queue_mu`, copied by the reader under the same lock — there is no separate
   `/requests` route): `model`, `request_id` (submit sequence; stable across polls of one request, never reused),

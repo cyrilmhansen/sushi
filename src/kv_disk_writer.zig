@@ -19,6 +19,7 @@ pub const Blob = struct {
     epoch: u64,
     part: Part = .whole,
     kind: write_stats.Kind,
+    operation: ?*write_stats.Operation = null,
 };
 
 /// A file staged in parts: the first truncates its `tmp`, the rest append, the last renames.
@@ -72,6 +73,8 @@ pub const Writer = struct {
     fail_at: FailAt = .write,
     /// Where written and failed bytes are reported, by kind. Null in a bare writer.
     stats: ?*write_stats.Stats = null,
+    /// Set by the single producer for one logical append; copied into each accepted blob.
+    operation: ?*write_stats.Operation = null,
     /// Diagnostics / test bars. Written under the mutex.
     files_written: u64 = 0,
     bytes_written: u64 = 0,
@@ -126,7 +129,10 @@ pub const Writer = struct {
         if (self.thread) |t| t.join();
         self.thread = null;
         self.mutex.lockUncancelable(self.io);
-        for (self.queue.items) |*b| self.freeBlob(b);
+        for (self.queue.items) |*b| {
+            self.noteFailed(b.bytes.len, b.operation);
+            self.freeBlob(b);
+        }
         self.queue.clearRetainingCapacity();
         self.pending_bytes = 0;
         self.queue.deinit(self.allocator);
@@ -139,17 +145,18 @@ pub const Writer = struct {
         self.mutex.unlock(self.io);
     }
 
-    fn noteWritten(self: *Writer, kind: write_stats.Kind, n: usize) void {
-        if (self.stats) |st| st.recordWritten(kind, n);
+    fn noteWritten(self: *Writer, kind: write_stats.Kind, n: usize, op: ?*write_stats.Operation) void {
+        if (self.stats) |st| st.recordWrittenFor(kind, n, op);
     }
 
-    fn noteFailed(self: *Writer, n: usize) void {
-        if (self.stats) |st| st.recordFailed(n);
+    fn noteFailed(self: *Writer, n: usize, op: ?*write_stats.Operation) void {
+        if (self.stats) |st| st.recordFailedFor(n, op);
     }
 
     fn freeBlob(self: *Writer, b: *Blob) void {
         self.allocator.free(b.path);
         self.allocator.free(b.bytes);
+        if (b.operation) |op| op.release();
     }
 
     /// Stage one file. Takes ownership of both slices on every path, including errors.
@@ -167,7 +174,7 @@ pub const Writer = struct {
         defer self.mutex.unlock(self.io);
         if (!self.running) {
             // No writer: dropping is correct, the index file rides the same queue.
-            self.noteFailed(bytes.len);
+            self.noteFailed(bytes.len, self.operation);
             self.allocator.free(path);
             self.allocator.free(bytes);
             self.files_dropped += 1;
@@ -177,7 +184,7 @@ pub const Writer = struct {
             log.warn("  [disk-cache] background write failed: {s} ({s})\n", .{ "InjectedSubmitFailure", path });
             self.noteFailureLocked(path, "InjectedSubmitFailure");
             if (part != .whole) self.markBrokenLocked(path);
-            self.noteFailed(bytes.len);
+            self.noteFailed(bytes.len, self.operation);
             self.allocator.free(path);
             self.allocator.free(bytes);
             self.files_dropped += 1;
@@ -190,15 +197,17 @@ pub const Writer = struct {
             .epoch = self.epoch,
             .part = part,
             .kind = kind,
+            .operation = self.operation,
         }) catch |err| {
             self.noteFailureLocked(path, @errorName(err));
             if (part != .whole) self.markBrokenLocked(path);
-            self.noteFailed(bytes.len);
+            self.noteFailed(bytes.len, self.operation);
             self.allocator.free(path);
             self.allocator.free(bytes);
             self.files_dropped += 1;
             return;
         };
+        if (self.operation) |op| op.retain();
         self.pending_bytes += bytes.len;
         self.peak_bytes = @max(self.peak_bytes, self.pending_bytes + self.inflight_bytes);
         self.work.signal(self.io);
@@ -333,7 +342,7 @@ pub const Writer = struct {
             var owned = self.queue.orderedRemove(i);
             if (owned.part != .whole and cut == null) cut = self.allocator.dupe(u8, owned.path) catch null;
             if (owned.part == .whole or owned.part == .last) self.clearBrokenLocked(owned.path);
-            self.noteFailed(owned.bytes.len);
+            self.noteFailed(owned.bytes.len, owned.operation);
             self.freeBlob(&owned);
             self.files_dropped += 1;
         }
@@ -489,11 +498,11 @@ pub const Writer = struct {
             } else self.clearBrokenLocked(blob.path);
             if (dropped) {
                 self.files_dropped += 1;
-                self.noteFailed(blob.bytes.len);
+                self.noteFailed(blob.bytes.len, blob.operation);
             } else {
                 if (blob.part == .whole or blob.part == .last) self.files_written += 1;
                 self.bytes_written += blob.bytes.len;
-                self.noteWritten(blob.kind, blob.bytes.len);
+                self.noteWritten(blob.kind, blob.bytes.len, blob.operation);
             }
             self.inflight_bytes = 0;
             self.inflight_path = null;
@@ -827,6 +836,44 @@ test "kv_disk_writer: landed bytes count under their kind, a rewrite counts its 
     try testing.expectEqual(@as(u64, 11), s.written[@intFromEnum(StatKind.meta)]);
     try testing.expectEqual(@as(u64, 0), s.failed);
     try testing.expectEqual(w.bytes_written, s.totalWritten());
+}
+
+test "kv_disk_writer: one receipt spans queued pieces and fencing cannot complete it" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    var stats: write_stats.Stats = .{};
+    var w = Writer.init(testing.allocator, std.testing.io);
+    w.stats = &stats;
+    try w.start();
+    defer w.deinit();
+    w.setPaused(true);
+    const op = stats.beginOperation().?;
+    w.operation = op;
+    for ([_]Part{ .first, .last }) |part| {
+        const b = try stagedBlob(root, "chunk", 256);
+        w.submitPart(b.path, b.bytes, part, .kv);
+    }
+    w.operation = null;
+    op.finish(.complete);
+    try testing.expectEqual(@as(u64, 0), stats.snapshot().operations.landed);
+    w.setPaused(false);
+    w.drain();
+    try testing.expectEqual(@as(u64, 1), stats.snapshot().operations.landed);
+    try testing.expectEqual(@as(u64, 512), stats.snapshot().operations.bytes);
+
+    w.setPaused(true);
+    const fenced = stats.beginOperation().?;
+    w.operation = fenced;
+    const b = try stagedBlob(root, "fenced", 64);
+    w.submit(b.path, b.bytes, .meta);
+    w.operation = null;
+    fenced.finish(.complete);
+    w.fence(root);
+    w.setPaused(false);
+    try testing.expectEqual(@as(u64, 1), stats.snapshot().operations.failed);
+    try testing.expectEqual(@as(u64, 1), stats.snapshot().operations.landed);
 }
 
 test "kv_disk_writer: a failed, dropped or fenced blob lands in failed, never in written" {

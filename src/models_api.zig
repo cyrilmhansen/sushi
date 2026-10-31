@@ -706,6 +706,10 @@ const PropsSettings = struct {
     prefix_cache_disk_entries: u64 = 0,
     /// Bytes the tier has written since its model loaded.
     prefix_cache_disk_written_bytes: u64 = 0,
+    prefix_cache_serialization_landed: u64 = 0,
+    prefix_cache_serialization_bytes: u64 = 0,
+    prefix_cache_staged_bytes: u64 = 0,
+    prefix_cache_staged_peak_bytes: u64 = 0,
     prefix_cache_ram_enabled: bool = true,
     /// The byte figures are a streamed load's (0 resident or off).
     vision: struct { loaded: bool = false, source: []const u8 = "default", tower_bytes: u64 = 0, encode_bytes: u64 = 0 } = .{},
@@ -745,6 +749,10 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .prefix_cache_disk_used_bytes = disk.used,
         .prefix_cache_disk_entries = disk.entries,
         .prefix_cache_disk_written_bytes = disk.written,
+        .prefix_cache_serialization_landed = disk.serialization_landed,
+        .prefix_cache_serialization_bytes = disk.serialization_bytes,
+        .prefix_cache_staged_bytes = disk.staged,
+        .prefix_cache_staged_peak_bytes = disk.staged_peak,
         .vision = .{
             .loaded = lm.vision_encoder != null,
             .source = model_load.visionChoiceFor(config, config.expert_streaming).sourceName(),
@@ -764,7 +772,7 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
     };
     var vision_buf: [160]u8 = undefined;
     const vision = try std.fmt.bufPrint(&vision_buf, "{{\"loaded\":{},\"source\":\"{s}\",\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, st.vision.source, st.vision.tower_bytes, st.vision.encode_bytes });
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d},\"serialization_landed\":{d},\"serialization_bytes\":{d},\"writer_staged_bytes\":{d},\"writer_staged_peak_bytes\":{d}}},\"vision\":{s}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                st.kv_cache.label(),
         st.kv_cache.sourceName(),
@@ -779,6 +787,8 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
         st.prefix_cache_disk_bytes,                 st.prefix_cache_disk_used_bytes,
         st.prefix_cache_disk_written_bytes,         st.prefix_cache_disk_entries,
+        st.prefix_cache_serialization_landed,       st.prefix_cache_serialization_bytes,
+        st.prefix_cache_staged_bytes,               st.prefix_cache_staged_peak_bytes,
         vision,
     });
 }
@@ -995,7 +1005,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqual(@as(i64, 4), st.get("max_concurrent").?.integer);
     try testing.expect(st.get("prefix_cache").?.object.get("ram_enabled").?.bool);
 
-    const used = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 20 << 30, .prefix_cache_disk_used_bytes = 3 << 30, .prefix_cache_disk_written_bytes = 7 << 30, .prefix_cache_disk_entries = 5, .prefix_cache_ram_enabled = false });
+    const used = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 20 << 30, .prefix_cache_disk_used_bytes = 3 << 30, .prefix_cache_disk_written_bytes = 7 << 30, .prefix_cache_disk_entries = 5, .prefix_cache_serialization_landed = 3, .prefix_cache_serialization_bytes = 900, .prefix_cache_staged_bytes = 100, .prefix_cache_staged_peak_bytes = 200, .prefix_cache_ram_enabled = false });
     defer testing.allocator.free(used);
     var up = try std.json.parseFromSlice(std.json.Value, testing.allocator, used[",\"settings\":".len..], .{});
     defer up.deinit();
@@ -1004,6 +1014,10 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqual(@as(i64, 3 << 30), pc.get("disk_used_bytes").?.integer);
     try testing.expectEqual(@as(i64, 7 << 30), pc.get("disk_written_bytes").?.integer);
     try testing.expectEqual(@as(i64, 5), pc.get("disk_entries").?.integer);
+    try testing.expectEqual(@as(i64, 3), pc.get("serialization_landed").?.integer);
+    try testing.expectEqual(@as(i64, 900), pc.get("serialization_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 100), pc.get("writer_staged_bytes").?.integer);
+    try testing.expectEqual(@as(i64, 200), pc.get("writer_staged_peak_bytes").?.integer);
 
     const exact = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "q4", .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 4096, .prefix_cache_ram_enabled = false });
     defer testing.allocator.free(exact);

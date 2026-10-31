@@ -136,13 +136,26 @@ pub const MemoryContextRefusal = struct {
 /// One model's SSD prefix tier as the inference thread last saw it: the budget, bytes in use, entry
 /// count and bytes written since the tier opened. A sequence lock keeps a reader's numbers from one publish.
 pub const DiskStats = struct {
-    pub const Snapshot = struct { budget: u64 = 0, used: u64 = 0, entries: u64 = 0, written: u64 = 0 };
+    pub const Snapshot = struct {
+        budget: u64 = 0,
+        used: u64 = 0,
+        entries: u64 = 0,
+        written: u64 = 0,
+        serialization_landed: u64 = 0,
+        serialization_bytes: u64 = 0,
+        staged: u64 = 0,
+        staged_peak: u64 = 0,
+    };
 
     seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     budget: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     used: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     entries: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     written: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    serialization_landed: std.atomic.Value(u64) = .init(0),
+    serialization_bytes: std.atomic.Value(u64) = .init(0),
+    staged: std.atomic.Value(u64) = .init(0),
+    staged_peak: std.atomic.Value(u64) = .init(0),
 
     /// Inference thread only (the single writer).
     pub fn publish(self: *DiskStats, snap: Snapshot) void {
@@ -151,6 +164,10 @@ pub const DiskStats = struct {
         self.used.store(snap.used, .seq_cst);
         self.entries.store(snap.entries, .seq_cst);
         self.written.store(snap.written, .seq_cst);
+        self.serialization_landed.store(snap.serialization_landed, .seq_cst);
+        self.serialization_bytes.store(snap.serialization_bytes, .seq_cst);
+        self.staged.store(snap.staged, .seq_cst);
+        self.staged_peak.store(snap.staged_peak, .seq_cst);
         _ = self.seq.fetchAdd(1, .seq_cst);
     }
 
@@ -163,6 +180,10 @@ pub const DiskStats = struct {
                 .used = self.used.load(.seq_cst),
                 .entries = self.entries.load(.seq_cst),
                 .written = self.written.load(.seq_cst),
+                .serialization_landed = self.serialization_landed.load(.seq_cst),
+                .serialization_bytes = self.serialization_bytes.load(.seq_cst),
+                .staged = self.staged.load(.seq_cst),
+                .staged_peak = self.staged_peak.load(.seq_cst),
             };
             if (self.seq.load(.seq_cst) == before) return snap;
         }
@@ -2245,7 +2266,7 @@ test "DiskStats: each model keeps its own tier, and a reader never mixes two pub
     const Writer = struct {
         fn run(stats: *DiskStats, stop: *std.atomic.Value(bool)) void {
             var n: u64 = 1;
-            while (!stop.load(.seq_cst)) : (n += 1) stats.publish(.{ .budget = n, .used = 2 * n, .entries = 3 * n, .written = 4 * n });
+            while (!stop.load(.seq_cst)) : (n += 1) stats.publish(.{ .budget = n, .used = 2 * n, .entries = 3 * n, .written = 4 * n, .serialization_landed = 5 * n, .serialization_bytes = 6 * n, .staged = 7 * n, .staged_peak = 8 * n });
         }
     };
     var stop = std.atomic.Value(bool).init(false);
@@ -2257,6 +2278,10 @@ test "DiskStats: each model keeps its own tier, and a reader never mixes two pub
         try std.testing.expectEqual(s.budget * 2, s.used);
         try std.testing.expectEqual(s.budget * 3, s.entries);
         try std.testing.expectEqual(s.budget * 4, s.written);
+        try std.testing.expectEqual(s.budget * 5, s.serialization_landed);
+        try std.testing.expectEqual(s.budget * 6, s.serialization_bytes);
+        try std.testing.expectEqual(s.budget * 7, s.staged);
+        try std.testing.expectEqual(s.budget * 8, s.staged_peak);
     }
     stop.store(true, .seq_cst);
     thread.join();

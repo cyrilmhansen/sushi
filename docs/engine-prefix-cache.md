@@ -457,6 +457,26 @@ They count what the filesystem accepted, never what was submitted, and run from 
   in `written`, since the filesystem took it. These are filesystem bytes, not NAND wear.
 - `/props settings.prefix_cache.disk_written_bytes` is the tier's own total, so a model that unloads takes its figure with
   it while the process counters keep it.
+- Logical append accounting surrounds `appendCommitWith`, including all its bounded pieces and synchronous token
+  writes. `/metrics` exposes `sushi:prefix_cache_serialization_operations_total` with outcomes `landed`, `noop`,
+  `partial`, `failed`, `untracked`, and the `sushi:prefix_cache_serialization_bytes` histogram for landed operations.
+  Divide its sum by count for mean bytes; use cumulative buckets for P50/P95. `/metrics.json` adds `serialization`
+  under `prefix_cache_writes`: the same outcomes, `bytes`, finite `byte_bounds` and **non-cumulative** `byte_buckets`
+  (the last bucket is infinity). A multi-piece 2 GiB append is one observation. Standalone restore-time metadata
+  rewrites remain in the existing byte totals but are not append operations.
+- `landed` means the logical append returned complete and every associated write finished without a reported error;
+  it does **not** certify hybrid restoration or power-loss durability. No-op appends have no histogram observation.
+  Failed/partial operations' landed bytes remain in the existing per-kind totals. As with those totals, an individual
+  failed syscall may have written an unknown partial payload; this is not a block-device or NAND-wear measurement.
+- Tracking uses 64 fixed receipts per tier and one receipt pointer per already-budgeted writer blob. Receipts hold
+  scalar counters, never tensor handles or token sequences. Overflow increments `untracked` without waiting,
+  changing writes, or allocating another receipt; per-kind byte totals still include those operations. Writer
+  permits, cache budgets, checkpoint ownership and persistence policy are unchanged.
+- `/props settings.prefix_cache` adds `serialization_landed`, `serialization_bytes`, `writer_staged_bytes` and
+  `writer_staged_peak_bytes`, sampled at the existing cache-publication points (not per decode token). These are
+  per-tier figures; the writer peak measures staging, not total process memory.
+- This is an instrumentation foundation. Confirmed hybrid recovery cursors, token intervals and token-based
+  persistence throttling are not implemented. See the [ownership audit](engine-persistence-audit.md).
 - Guards: `disk_write_stats.zig` (accounting and both renderings), `kv_disk_writer.zig` (`landed bytes count under their
   kind`, `a failed, dropped or fenced blob`, `a file staged in parts`), `DiskTier write counters:` in `kv_disk_cache.zig`
   and `qwen4_disk_qsa.zig`, `both feeds carry the SSD prefix cache write counters` in `metrics.zig`.

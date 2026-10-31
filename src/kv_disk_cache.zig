@@ -1549,11 +1549,28 @@ pub const DiskTier = struct {
 
     /// The one commit entry point; the positional wrappers above and below forward to it.
     pub fn appendCommitWith(self: *DiskTier, p: CommitParams, s: mlx.mlx_stream, opts: CommitOpts) !PersistOutcome {
-        if (opts.flush_bound) |bound| return self.appendCommitWithSpecBounded(p, s, bound);
+        const receipt = self.stats.beginOperation();
+        self.stats.active = receipt;
+        if (self.writer) |w| w.operation = receipt;
+        var outcome: write_stats.Operation.Outcome = .failed;
+        defer {
+            self.stats.active = null;
+            if (self.writer) |w| w.operation = null;
+            if (receipt) |op| op.finish(outcome);
+        }
         // With the writer armed the commit lands whole, piece by piece: each piece stages at most
         // `max_flush_bytes`, and the writer's permit bounds the host bytes in flight. Without it a
         // piece is a synchronous write, so one per commit bounds the stall.
-        return self.appendCommitPieces(p, s, opts.whole or self.writer != null);
+        const result = if (opts.flush_bound) |bound|
+            try self.appendCommitWithSpecBounded(p, s, bound)
+        else
+            try self.appendCommitPieces(p, s, opts.whole or self.writer != null);
+        outcome = switch (result) {
+            .persisted => .complete,
+            .partial => .partial,
+            .skipped => .skipped,
+        };
+        return result;
     }
 
     /// `appendCommit` with an explicit per-call flush bound (bytes): the loop stops after the
@@ -7819,6 +7836,8 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-wcount", 0, 128);
     defer tier.deinit();
     tier.enableBackgroundWriter();
+    // Force several pieces while preserving a single logical append observation.
+    tier.max_flush_bytes = 1;
     try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, dflash, null, s));
     tier.drainWriter();
 
@@ -7830,14 +7849,18 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     try testing.expectEqual(sumBytes(e.chunk_bytes), cold.written[@intFromEnum(write_stats.Kind.kv)]);
     try testing.expect(e.spec_bytes > 0);
     try testing.expectEqual(e.spec_bytes, cold.written[@intFromEnum(write_stats.Kind.spec)]);
-    try testing.expectEqual(@as(u64, 600 * 4) + meta_json, cold.written[@intFromEnum(write_stats.Kind.meta)]);
+    try testing.expect(cold.written[@intFromEnum(write_stats.Kind.meta)] >= @as(u64, 600 * 4) + meta_json);
     for ([_]write_stats.Kind{ .ssm, .qsa, .ring }) |k| try testing.expectEqual(@as(u64, 0), wroteKind(&tier, k));
     try testing.expectEqual(@as(u64, 0), cold.failed);
+    try testing.expectEqual(@as(u64, 1), cold.operations.landed);
+    try testing.expectEqual(cold.totalWritten(), cold.operations.bytes);
 
     // The same commit again persists nothing.
     try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommitWithSpec(cache.entries, cache.step, cache.config, tokens[0..600], false, null, dflash, null, s));
     tier.drainWriter();
-    try testing.expectEqual(cold, tier.stats.snapshot());
+    var repeated = cold;
+    repeated.operations.noop += 1;
+    try testing.expectEqual(repeated, tier.stats.snapshot());
 
     // 600 -> 800 tokens: chunks 0-3 are whole on disk; chunk 4 (the old partial tail) is written again with chunks 5 and 6.
     try fillCache(&cache, s, 2, 200, 8, 600.0, .float32);
@@ -7849,6 +7872,8 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     try testing.expectEqual(sumBytes(grown.chunk_bytes[4..]), ext.written[@intFromEnum(write_stats.Kind.kv)] - cold.written[@intFromEnum(write_stats.Kind.kv)]);
     try testing.expectEqual(cold.written[@intFromEnum(write_stats.Kind.spec)], ext.written[@intFromEnum(write_stats.Kind.spec)]);
     try testing.expectEqual(@as(u64, 0), ext.failed);
+    try testing.expectEqual(@as(u64, 2), ext.operations.landed);
+    try testing.expectEqual(ext.totalWritten(), ext.operations.bytes);
 }
 
 test "DiskTier write counters: a spec sidecar replaced by an extension counts its full bytes again" {
@@ -7911,6 +7936,8 @@ test "DiskTier write counters: a failed background write lands in failed, never 
     tier.drainWriter();
     try testing.expectEqual(cb[3], tier.stats.snapshot().failed);
     try testing.expectEqual(sumBytes(cb) - cb[3], wroteKind(&tier, .kv));
+    try testing.expectEqual(@as(u64, 0), tier.stats.snapshot().operations.landed);
+    try testing.expectEqual(@as(u64, 1), tier.stats.snapshot().operations.failed);
 }
 
 test "DiskTier write counters: the synchronous manifest write counts meta on success and failed on error" {

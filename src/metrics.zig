@@ -1183,6 +1183,9 @@ test "both feeds carry the SSD prefix cache write counters, for every kind" {
     const testing = std.testing;
     write_stats.process.recordWritten(.ring, 1);
     write_stats.process.recordFailed(1);
+    const op = write_stats.process.beginOperation().?;
+    write_stats.process.recordWrittenFor(.meta, 5, op);
+    op.finish(.complete);
     var m = Metrics.init();
     var buf: [32 * 1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -1198,4 +1201,9 @@ test "both feeds carry the SSD prefix cache write counters, for every kind" {
         try testing.expect(written.get(name) != null);
     }
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "sushi:prefix_cache_write_failed_bytes_total ") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "sushi:prefix_cache_serialization_bytes_bucket{le=\"+Inf\"}") != null);
+    const serialization = parsed.value.object.get("prefix_cache_writes").?.object.get("serialization").?.object;
+    try testing.expect(serialization.get("landed").?.integer > 0);
+    try testing.expect(serialization.get("bytes").?.integer >= 5);
+    try testing.expectEqual(write_stats.byte_bounds.len + 1, serialization.get("byte_buckets").?.array.items.len);
 }

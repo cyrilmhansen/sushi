@@ -2963,7 +2963,17 @@ pub fn publishDiskStats(sch: *Scheduler) void {
         var snap: model_registry_mod.DiskStats.Snapshot = .{};
         if (entry.state == .ready) {
             if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
-                snap = .{ .budget = d.max_bytes, .used = d.total_bytes, .entries = d.entryCount(), .written = d.stats.snapshot().totalWritten() };
+                const writes = d.stats.snapshot();
+                snap = .{
+                    .budget = d.max_bytes,
+                    .used = d.total_bytes,
+                    .entries = d.entryCount(),
+                    .written = writes.totalWritten(),
+                    .serialization_landed = writes.operations.landed,
+                    .serialization_bytes = writes.operations.bytes,
+                    .staged = d.stagedHostBytes(),
+                    .staged_peak = if (d.writer) |w| w.peakBytes() else 0,
+                };
             };
         }
         entry.disk_stats.publish(snap);
