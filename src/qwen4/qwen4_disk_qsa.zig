@@ -322,8 +322,9 @@ test "byte-identical hybrid checkpoints on branches hard-link with fewer filesys
     src[2].qsa_pooled = makeArange(s, &.{ 1, 128, 4 }, 800);
     src[2].qsa_ratio = 4;
     src[2].qsa_hist_rows = 512;
-    var cp = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s);
-    defer cp.deinit(testing.allocator);
+    var cp = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s)};
+    defer cp[0].deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cp, &src, s);
 
     var baseline_ssm: u64 = 0;
     var optimized_ssm: u64 = 0;
@@ -332,14 +333,16 @@ test "byte-identical hybrid checkpoints on branches hard-link with fewer filesys
         var tier = try DiskTier.init(testing.allocator, io, base, fp, 0, 128);
         tier.ssm_file_dedup = dedup;
         tier.enableBackgroundWriter();
-        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &a, false, &.{cp}, s);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &a, false, &cp, s);
         tier.drainWriter(); // only a landed file may be linked
-        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &b, false, &.{cp}, s);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &b, false, &cp, s);
         tier.drainWriter();
         const written = tier.stats.snapshot().written[@backingInt(write_stats.Kind.ssm)];
         if (dedup) optimized_ssm = written else baseline_ssm = written;
         try testing.expect(tier.writer.?.peakBytes() <= tier.writer_permit_bytes);
         try testing.expectEqual(@as(usize, 2), tier.entryCount());
+        try testing.expect(tier.entries.items[0].qsa_history_bytes > 0);
+        try testing.expect(tier.entries.items[1].qsa_history_bytes > 0);
 
         // Different QSA aux at the same position must write its own SSM file.
         var other = buildHybridEntries(s, 100, 500);
@@ -348,9 +351,10 @@ test "byte-identical hybrid checkpoints on branches hard-link with fewer filesys
         other[2].qsa_pooled = makeArange(s, &.{ 1, 128, 4 }, 900);
         other[2].qsa_ratio = 4;
         other[2].qsa_hist_rows = 512;
-        var mismatch = try transformer_mod.captureSsmCheckpoint(testing.allocator, &other, 512, s);
-        defer mismatch.deinit(testing.allocator);
-        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &c, false, &.{mismatch}, s);
+        var mismatch = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &other, 512, s)};
+        defer mismatch[0].deinit(testing.allocator);
+        try transformer_mod.attachQsaHistoryToLatest(&mismatch, &other, s);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &c, false, &mismatch, s);
         tier.drainWriter();
         try testing.expect(tier.stats.snapshot().written[@backingInt(write_stats.Kind.ssm)] > written);
         tier.deinit();
