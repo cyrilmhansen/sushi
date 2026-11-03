@@ -112,8 +112,10 @@ pub fn mtpDraftCapForRoom(room: u32) ?u32 {
 /// the speculative round that carries the closer is cut to end on it, and the state there joins the checkpoints.
 pub const ThoughtPoint = struct {
     closer: u32,
-    /// Positions a point may sit on: 1 where the recurrent state restores anywhere, the pool size on GLM.
+    /// Positions a point may sit on: the QSA ratio for Qwen MTP, the pool size on GLM.
     grid: u32,
+    /// Origin for grid alignment. Qwen MTP rows are relative to its history base; other callers use zero.
+    grid_base: usize = 0,
     /// A thought shorter than this is cheaper to prefill than to keep.
     min_tokens: u32,
     /// Absolute position of the state the thought starts from.
@@ -140,7 +142,9 @@ pub fn thoughtRound(tp: ThoughtPoint, path: []const u32, anchor: usize) ThoughtR
     const at = std.mem.indexOfScalar(u32, path, tp.closer) orelse return .whole;
     const closer_pos = anchor + at;
     if (closer_pos -| tp.base < tp.min_tokens) return .skip;
-    const end = (closer_pos + 1) / tp.grid * tp.grid;
+    const state_end = closer_pos + 1;
+    if (state_end < tp.grid_base) return .skip;
+    const end = tp.grid_base + (state_end - tp.grid_base) / tp.grid * tp.grid;
     if (end <= anchor) return .skip;
     return .{ .keep = end - anchor };
 }
@@ -504,6 +508,32 @@ test "thoughtRound: a round ends on the closer or the grid position at or below 
     try testing.expectEqual(ThoughtRound{ .keep = 1 }, thoughtRound(pooled, &.{ 9, 4 }, 111));
     // The boundary below the closer is behind the round's own start: no state stands there.
     try testing.expectEqual(ThoughtRound.skip, thoughtRound(pooled, &.{ 9, 4 }, 110));
+}
+
+test "thoughtRound: QSA grid aligns to the MTP history origin for every closer remainder" {
+    const base: usize = 101;
+    const ratio: u32 = 4;
+    for (0..ratio) |remainder| {
+        const closer_pos = base + 520 + remainder;
+        const path = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+        const anchor = closer_pos - 8;
+        const tp: ThoughtPoint = .{ .closer = 9, .grid = ratio, .grid_base = base, .min_tokens = 0, .base = base };
+        const expected = base + (closer_pos + 1 - base) / ratio * ratio;
+        const round = thoughtRound(tp, &path, anchor);
+        try testing.expectEqual(ThoughtRound{ .keep = expected - anchor }, round);
+        try testing.expectEqual(@as(usize, 0), (anchor + (switch (round) {
+            .keep => |n| n,
+            else => unreachable,
+        }) - base) % ratio);
+        try testing.expect(expected <= closer_pos + 1);
+    }
+}
+
+test "thoughtRound: QSA alignment does not alter GLM pool-grid or recurrent checkpoints" {
+    const glm: ThoughtPoint = .{ .closer = 9, .grid = 4, .min_tokens = 0, .base = 100 };
+    try testing.expectEqual(ThoughtRound{ .keep = 2 }, thoughtRound(glm, &.{ 1, 9, 2 }, 110));
+    const recurrent: ThoughtPoint = .{ .closer = 9, .grid = 1, .min_tokens = 0, .base = 100 };
+    try testing.expectEqual(ThoughtRound{ .keep = 2 }, thoughtRound(recurrent, &.{ 1, 9, 2 }, 110));
 }
 
 test "cutMtpRound: a round cut at any of its tokens streams what the whole round does" {

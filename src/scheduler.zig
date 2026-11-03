@@ -4407,17 +4407,25 @@ fn thoughtPointWanted(slot: *const Slot, checkpoints_on: bool) bool {
 /// at or below it) is a restore point the next prompt shares (docs/engine-prefix-cache.md#thought-points).
 fn armThoughtPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
     if (!thoughtPointWanted(slot, checkpoints_on)) return;
-    const grid: u32 = if (gen.glm_dflash_native)
-        @intCast(glm5_prefix.pool_size)
-    else if (gen.mtp != null and !gen.dspark and slot.ssm_entries != null)
-        1
-    else
-        return;
+    var grid: u32 = 1;
+    var grid_base: usize = 0;
+    if (gen.glm_dflash_native) {
+        grid = @intCast(glm5_prefix.pool_size);
+    } else if (gen.mtp != null and !gen.dspark and slot.ssm_entries != null) {
+        const head_cache = gen.mtp_cache orelse return;
+        switch (head_cache) {
+            .qwen4 => |cache| {
+                grid = @max(cache.st.entry.qsa_ratio, 1);
+                grid_base = gen.mtp_position_base;
+            },
+            .mimo => return,
+        }
+    } else return;
     const tok = slot.model.tokenizer orelse return;
     const open = tok.specialTokenId("<think>") orelse return;
     const close = tok.specialTokenId("</think>") orelse return;
     if (std.mem.indexOfScalar(u32, slot.full_prompt[slot.full_prompt.len - 2 ..], open) == null) return;
-    gen.thought_point = .{ .closer = close, .grid = grid, .min_tokens = mtp_plan.thought_point_min_tokens, .base = slot.full_prompt.len };
+    gen.thought_point = .{ .closer = close, .grid = grid, .grid_base = grid_base, .min_tokens = mtp_plan.thought_point_min_tokens, .base = slot.full_prompt.len };
 }
 
 /// A thought the next prompt would re-render differently is no restore point: its state is dropped before the commit.

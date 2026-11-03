@@ -1090,19 +1090,25 @@ test "qwen4 thought point: MTP rounds cut at the closer emit the tokens the uncu
     const cut = try MtpChainTestSlot.init(a, io, &xfm, &tok, &prompt, 4);
     defer cut.deinit(a);
     const gen = &cut.gen.?;
-    gen.thought_point = .{ .closer = closer, .grid = 1, .min_tokens = 0, .base = prompt.len };
+    const history_base = gen.mtp_position_base;
+    const qsa_ratio = @max(gen.mtp_cache.?.qwen4.st.entry.qsa_ratio, 1);
+    gen.thought_point = .{ .closer = closer, .grid = qsa_ratio, .grid_base = history_base, .min_tokens = 0, .base = prompt.len };
+    var checked_checkpoint = false;
     while (gen.generated_ids.items.len < want) {
         const round = (try gen.nextMtp(a)) orelse return error.MtpRoundDeclined;
         a.free(round.tokens);
-        // The round that took the point ended on the closer, and the state stands right behind it.
-        if (gen.thought_point.?.state == .taken and gen.ssm_checkpoints.items.len == 1 and gen.generated_ids.items.len == at + 1) {
+        if (!checked_checkpoint and gen.thought_point.?.state == .taken and gen.ssm_checkpoints.items.len == 1) {
             try testing.expectEqual(closer, gen.generated_ids.items[at]);
-            try testing.expectEqual(prompt.len + at + 1, gen.ssm_checkpoints.items[0].pos);
-            try testing.expectEqual(prompt.len + at + 1, cut.off);
+            const closer_end = prompt.len + at + 1;
+            const expected = history_base + (closer_end - history_base) / qsa_ratio * qsa_ratio;
+            try testing.expectEqual(expected, gen.ssm_checkpoints.items[0].pos);
+            try testing.expectEqual(@as(usize, 0), (expected - history_base) % qsa_ratio);
+            try testing.expectEqual(expected, cut.off);
+            checked_checkpoint = true;
         }
     }
     try testing.expectEqual(ThoughtPoint.State.taken, gen.thought_point.?.state);
     try testing.expectEqual(@as(usize, 1), gen.ssm_checkpoints.items.len);
-    try testing.expectEqual(prompt.len + at + 1, gen.ssm_checkpoints.items[0].pos);
+    try testing.expect(checked_checkpoint);
     try testing.expectEqualSlices(u32, reference[0..want], gen.generated_ids.items[0..want]);
 }
