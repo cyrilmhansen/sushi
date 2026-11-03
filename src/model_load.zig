@@ -117,6 +117,7 @@ pub const LoadParams = struct {
     kv_quant_explicit: bool = false,
     /// Per-model hot prefix cache capacity (count). 0 disables.
     prefix_cache_capacity: u32 = 1,
+    prefix_cache_persist_min_tokens: u32 = 0,
     prefix_cache_ram_enabled: bool = true,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
     prefix_cache_mem_bytes: u64 = 0,
@@ -2572,6 +2573,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             clamped_prefix_mem,
         );
         entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0 and !params.config.isGlm5();
+        if (params.config.isQwen4() and ram_prefix_cache and disk_prefix_cache)
+            entry.prefix_cache.?.persist_min_tokens = params.prefix_cache_persist_min_tokens;
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
         entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated() or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .min_span;

@@ -933,6 +933,7 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default,
     kv_quant_explicit: bool = false,
     prefix_cache_capacity: u32 = 1,
+    prefix_cache_persist_min_tokens: u32 = 0,
     prefix_cache_ram_enabled: bool = true,
     prefix_cache_mem_bytes: u64 = 0,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
@@ -1039,6 +1040,7 @@ pub const Scheduler = struct {
     /// crippled warm reuse — and disabled it entirely on hybrids — after
     /// every model switch.
     prefix_cache_capacity: u32,
+    prefix_cache_persist_min_tokens: u32,
     prefix_cache_ram_enabled: bool,
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
@@ -1247,6 +1249,7 @@ pub const Scheduler = struct {
             .kv_quant_explicit = params.kv_quant_explicit,
             .ctx_size_flag = params.ctx_size,
             .prefix_cache_capacity = params.prefix_cache_capacity,
+            .prefix_cache_persist_min_tokens = params.prefix_cache_persist_min_tokens,
             .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
@@ -1776,6 +1779,7 @@ pub const Scheduler = struct {
             // startup model — pre-plumbing these were (1, 0, stride 0),
             // which silently degraded warm reuse after every model switch.
             .prefix_cache_capacity = self.prefix_cache_capacity,
+            .prefix_cache_persist_min_tokens = self.prefix_cache_persist_min_tokens,
             .prefix_cache_ram_enabled = self.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
