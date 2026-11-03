@@ -1143,10 +1143,12 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     // the second is the live gap (SSM_SNAPSHOT_BACKOFF 30 + 124 generated).
     const L: c_int = 400;
     const cp_lo: c_int = 46;
+    const cp_aligned: c_int = 48;
     const cp_hi: c_int = L - 154;
     inline for (.{ cp_lo, cp_hi }) |cp| {
         try t.expect(L - cp > QSA_RING_ROWS and @mod(cp, ratio) != 0);
     }
+    try t.expect(L - cp_aligned > QSA_RING_ROWS and @mod(cp_aligned, ratio) == 0);
 
     var prng = std.Random.DefaultPrng.init(0x51A_C0DE);
     const keys = try attn256RandBf16(prng.random(), &[_]c_int{ 1, L, hd }, s);
@@ -1170,13 +1172,13 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     // The head appends in chunks and the trunk checkpoints at the end of each, exactly as the
     // prefill loop does: the mark is taken while the ring still ends at that row.
     var from: c_int = 0;
-    inline for (.{ cp_lo, cp_hi, L }) |to| {
+    inline for (.{ cp_lo, cp_aligned, cp_hi, L }) |to| {
         var chunk = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(chunk);
         try mlx.check(mlx.mlx_slice(&chunk, keys, &[_]c_int{ 0, from, 0 }, 3, &[_]c_int{ 1, to, hd }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
         try qsaTestAppendPool(&xfm, &m.entry, chunk, from, s);
         m.seq_offset = @intCast(to);
-        if (to != L) try xfm.qwen4MtpMarkQsaLeftover(@intCast(to));
+        if (to != L and @mod(to, ratio) != 0) try xfm.qwen4MtpMarkQsaLeftover(@intCast(to));
         from = to;
     }
 
@@ -1187,7 +1189,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     defer committed_marks.deinit();
     try t.expectEqual(@as(usize, 2), committed_marks.len);
 
-    inline for (.{ cp_hi, cp_lo }) |want| {
+    inline for (.{ cp_aligned, cp_hi, cp_lo }) |want| {
         // A head that appended straight to `want` — the state the clamp must reproduce.
         var refe: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_ratio = ratio };
         defer ssmFreeQsaState(&refe);
@@ -1207,10 +1209,15 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
 
         try t.expectEqual(@as(usize, @intCast(want)), m.seq_offset);
         try t.expectEqual(want, m.entry.qsa_hist_rows);
-        try t.expectEqual(@mod(want, ratio), mlx.getShape(m.entry.aux_state)[1]);
-        const ref_lv = try qsaLeftoverAt(refe.aux_state, qsaHistoryRows(&refe), want, ratio, s);
-        defer _ = mlx.mlx_array_free(ref_lv);
-        try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.entry.aux_state, ref_lv, s));
+        const want_lv = @mod(want, ratio);
+        if (want_lv == 0) {
+            try t.expect(m.entry.aux_state.ctx == null);
+        } else {
+            try t.expectEqual(want_lv, mlx.getShape(m.entry.aux_state)[1]);
+            const ref_lv = try qsaLeftoverAt(refe.aux_state, qsaHistoryRows(&refe), want, ratio, s);
+            defer _ = mlx.mlx_array_free(ref_lv);
+            try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.entry.aux_state, ref_lv, s));
+        }
         try t.expectEqual(@divTrunc(want, ratio), mlx.getShape(m.entry.qsa_pooled)[1]);
         try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(m.entry.qsa_pooled, refe.qsa_pooled, s));
 
