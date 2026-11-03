@@ -20,6 +20,10 @@ pub const Kind = enum {
     meta,
 };
 
+pub const Origin = enum { prefill_write_through, decode_during, decode_end, idle_spill, decline_spill, other };
+const origin_names = @typeInfo(Origin).@"enum".field_names;
+pub const origin_count = origin_names.len;
+
 const kind_names = @typeInfo(Kind).@"enum".field_names;
 pub const kind_count = kind_names.len;
 
@@ -27,6 +31,11 @@ pub const Snapshot = struct {
     written: [kind_count]u64 = @splat(0),
     /// Bytes handed to a write that failed, or staged and then dropped; never part of `written`.
     failed: u64 = 0,
+    origin_bytes: [origin_count][kind_count]u64 = @splat(@splat(0)),
+    ssm_files: [origin_count]u64 = @splat(0),
+    ssm_last_bytes: u64 = 0,
+    ssm_total_bytes: u64 = 0,
+    completion_skipped: u64 = 0,
 
     pub fn totalWritten(self: Snapshot) u64 {
         var n: u64 = 0;
@@ -39,10 +48,32 @@ pub const Stats = struct {
     written: [kind_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
     failed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     parent: ?*Stats = null,
+    origin_bytes: [origin_count][kind_count]std.atomic.Value(u64) = @splat(@splat(std.atomic.Value(u64).init(0))),
+    ssm_files: [origin_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
+    ssm_last_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    ssm_total_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    completion_skipped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn recordWritten(self: *Stats, kind: Kind, bytes: u64) void {
+        self.recordWrittenFrom(.other, kind, bytes);
+    }
+
+    pub fn recordWrittenFrom(self: *Stats, origin: Origin, kind: Kind, bytes: u64) void {
         _ = self.written[@intFromEnum(kind)].fetchAdd(bytes, .monotonic);
-        if (self.parent) |p| p.recordWritten(kind, bytes);
+        _ = self.origin_bytes[@intFromEnum(origin)][@intFromEnum(kind)].fetchAdd(bytes, .monotonic);
+        if (self.parent) |p| p.recordWrittenFrom(origin, kind, bytes);
+    }
+
+    pub fn recordSsmFile(self: *Stats, origin: Origin, bytes: u64) void {
+        _ = self.ssm_files[@intFromEnum(origin)].fetchAdd(1, .monotonic);
+        _ = self.ssm_last_bytes.store(bytes, .monotonic);
+        _ = self.ssm_total_bytes.fetchAdd(bytes, .monotonic);
+        if (self.parent) |p| p.recordSsmFile(origin, bytes);
+    }
+
+    pub fn recordCompletionSkipped(self: *Stats) void {
+        _ = self.completion_skipped.fetchAdd(1, .monotonic);
+        if (self.parent) |p| p.recordCompletionSkipped();
     }
 
     pub fn recordFailed(self: *Stats, bytes: u64) void {
@@ -53,6 +84,13 @@ pub const Stats = struct {
     pub fn snapshot(self: *const Stats) Snapshot {
         var s: Snapshot = .{ .failed = self.failed.load(.monotonic) };
         for (&s.written, &self.written) |*dst, *src| dst.* = src.load(.monotonic);
+        for (&s.origin_bytes, &self.origin_bytes) |*dst_row, *src_row| {
+            for (dst_row, src_row) |*dst, *src| dst.* = src.load(.monotonic);
+        }
+        for (&s.ssm_files, &self.ssm_files) |*dst, *src| dst.* = src.load(.monotonic);
+        s.ssm_last_bytes = self.ssm_last_bytes.load(.monotonic);
+        s.ssm_total_bytes = self.ssm_total_bytes.load(.monotonic);
+        s.completion_skipped = self.completion_skipped.load(.monotonic);
         return s;
     }
 };
@@ -74,7 +112,25 @@ pub fn writeJson(snap: Snapshot, w: *std.Io.Writer) !void {
     inline for (kind_names, 0..) |name, i| {
         try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", name, snap.written[i] });
     }
-    try w.print("}},\"failed_bytes\":{d}}}", .{snap.failed});
+    const file_count = ssmFilesTotal(snap);
+    try w.print("}},\"failed_bytes\":{d},\"ssm_checkpoint_files\":{{\"last_bytes\":{d},\"average_bytes\":{d},\"total_bytes\":{d},\"count\":{d}}},\"completion_skipped\":{d},\"origins\":{{", .{ snap.failed, snap.ssm_last_bytes, if (file_count > 0) snap.ssm_total_bytes / file_count else 0, snap.ssm_total_bytes, file_count, snap.completion_skipped });
+    inline for (origin_names, 0..) |name, oi| {
+        try w.print("{s}\"{s}\":{{\"ssm_files\":{d},\"written_bytes\":{{", .{ if (oi == 0) "" else ",", name, snap.ssm_files[oi] });
+        inline for (kind_names, 0..) |kind, ki| try w.print("{s}\"{s}\":{d}", .{ if (ki == 0) "" else ",", kind, snap.origin_bytes[oi][ki] });
+        try w.print("}},\"total_bytes\":{d}}}", .{originTotal(snap.origin_bytes[oi])});
+    }
+    try w.print("}}}}", .{});
+}
+
+fn originTotal(row: [kind_count]u64) u64 {
+    var n: u64 = 0;
+    for (row) |v| n +|= v;
+    return n;
+}
+fn ssmFilesTotal(snap: Snapshot) u64 {
+    var n: u64 = 0;
+    for (snap.ssm_files) |v| n +|= v;
+    return n;
 }
 
 test "Stats: a write lands in its kind and in the parent, a failure in failed only" {
@@ -96,11 +152,16 @@ test "Stats: a write lands in its kind and in the parent, a failure in failed on
 test "the Prometheus and JSON renderings name every kind and the failed counter" {
     var snap: Snapshot = .{ .failed = 9 };
     for (&snap.written, 0..) |*b, i| b.* = 1000 + i;
+    snap.origin_bytes[@intFromEnum(Origin.decode_end)][@intFromEnum(Kind.ssm)] = 42;
+    snap.ssm_files[@intFromEnum(Origin.decode_end)] = 1;
+    snap.ssm_last_bytes = 42;
+    snap.ssm_total_bytes = 42;
+    snap.completion_skipped = 3;
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writePrometheus(snap, &w);
     const prom = w.buffered();
-    var json_buf: [1024]u8 = undefined;
+    var json_buf: [4096]u8 = undefined;
     var jw: std.Io.Writer = .fixed(&json_buf);
     try jw.writeAll("{");
     try writeJson(snap, &jw);
@@ -116,4 +177,10 @@ test "the Prometheus and JSON renderings name every kind and the failed counter"
     }
     try std.testing.expect(std.mem.indexOf(u8, prom, "sushi:prefix_cache_write_failed_bytes_total 9\n") != null);
     try std.testing.expectEqual(@as(i64, 9), obj.get("failed_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), obj.get("ssm_checkpoint_files").?.object.get("count").?.integer);
+    try std.testing.expectEqual(@as(i64, 42), obj.get("ssm_checkpoint_files").?.object.get("average_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), obj.get("completion_skipped").?.integer);
+    const decode_end = obj.get("origins").?.object.get("decode_end").?.object;
+    try std.testing.expectEqual(@as(i64, 1), decode_end.get("ssm_files").?.integer);
+    try std.testing.expectEqual(@as(i64, 42), decode_end.get("total_bytes").?.integer);
 }

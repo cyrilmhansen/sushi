@@ -19,6 +19,9 @@ pub const Blob = struct {
     epoch: u64,
     part: Part = .whole,
     kind: write_stats.Kind,
+    origin: write_stats.Origin = .other,
+    file_bytes: usize = 0,
+    checkpoint_file: bool = false,
 };
 
 /// A file staged in parts: the first truncates its `tmp`, the rest append, the last renames.
@@ -139,8 +142,11 @@ pub const Writer = struct {
         self.mutex.unlock(self.io);
     }
 
-    fn noteWritten(self: *Writer, kind: write_stats.Kind, n: usize) void {
-        if (self.stats) |st| st.recordWritten(kind, n);
+    fn noteWritten(self: *Writer, blob: Blob) void {
+        if (self.stats) |st| {
+            st.recordWrittenFrom(blob.origin, blob.kind, blob.bytes.len);
+            if (blob.checkpoint_file and (blob.part == .whole or blob.part == .last)) st.recordSsmFile(blob.origin, blob.file_bytes);
+        }
     }
 
     fn noteFailed(self: *Writer, n: usize) void {
@@ -156,12 +162,20 @@ pub const Writer = struct {
     /// Blocks while the unwritten queue is over the permit (the only place the inference
     /// thread waits on the writer). Single producer: the inference thread.
     pub fn submit(self: *Writer, path: []u8, bytes: []u8, kind: write_stats.Kind) void {
-        self.submitPart(path, bytes, .whole, kind);
+        self.submitPartFrom(path, bytes, .whole, kind, .other, bytes.len, false);
+    }
+
+    pub fn submitFrom(self: *Writer, path: []u8, bytes: []u8, kind: write_stats.Kind, origin: write_stats.Origin) void {
+        self.submitPartFrom(path, bytes, .whole, kind, origin, bytes.len, false);
     }
 
     /// `submit` for one part of a file staged in parts (`Part`). A part that cannot be staged
     /// drops the rest of its file.
     pub fn submitPart(self: *Writer, path: []u8, bytes: []u8, part: Part, kind: write_stats.Kind) void {
+        self.submitPartFrom(path, bytes, part, kind, .other, bytes.len, false);
+    }
+
+    pub fn submitPartFrom(self: *Writer, path: []u8, bytes: []u8, part: Part, kind: write_stats.Kind, origin: write_stats.Origin, file_bytes: usize, checkpoint_file: bool) void {
         std.debug.assert(!self.deinited);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -190,6 +204,9 @@ pub const Writer = struct {
             .epoch = self.epoch,
             .part = part,
             .kind = kind,
+            .origin = origin,
+            .file_bytes = file_bytes,
+            .checkpoint_file = checkpoint_file,
         }) catch |err| {
             self.noteFailureLocked(path, @errorName(err));
             if (part != .whole) self.markBrokenLocked(path);
@@ -493,7 +510,7 @@ pub const Writer = struct {
             } else {
                 if (blob.part == .whole or blob.part == .last) self.files_written += 1;
                 self.bytes_written += blob.bytes.len;
-                self.noteWritten(blob.kind, blob.bytes.len);
+                self.noteWritten(blob);
             }
             self.inflight_bytes = 0;
             self.inflight_path = null;

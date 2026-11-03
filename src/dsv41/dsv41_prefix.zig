@@ -396,6 +396,10 @@ fn rollbackLive(
 /// `held` names the phase that waited on the writer, for the log.
 pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, s: mlx.mlx_stream, held: []const u8) void {
     if (self.disk == null or prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+    const tier = if (self.disk) |*d| d else return;
+    const old_origin = tier.write_origin;
+    tier.write_origin = if (std.mem.eql(u8, held, "decode")) .decode_during else .prefill_write_through;
+    defer tier.write_origin = old_origin;
     var pending = false;
     for (cps) |*cp| pending = pending or !cp.isReleased();
     if (!pending) return;

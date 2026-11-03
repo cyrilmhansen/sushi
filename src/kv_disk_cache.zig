@@ -415,6 +415,8 @@ pub const DiskTier = struct {
     rows_base: u32 = std.math.maxInt(u32),
     /// Bytes this tier wrote, by kind. Heap-allocated: the background writer holds the pointer.
     stats: *write_stats.Stats,
+    /// Frozen into each queued blob at submission; changed only around producer calls.
+    write_origin: write_stats.Origin = .other,
     /// Background writer (heap-allocated so the mutex survives `init`'s by-value
     /// return). Null = the synchronous `mlx_save_safetensors` path.
     writer: ?*disk_writer.Writer = null,
@@ -2087,7 +2089,7 @@ pub const DiskTier = struct {
             try fw.interface.flush();
             // Bytes past the record (a torn or stale tail) would never be billed or swept.
             try f.setLength(self.io, record.len * 4);
-            self.stats.recordWritten(.meta, (record.len - from) * 4);
+            self.stats.recordWrittenFrom(self.write_origin, .meta, (record.len - from) * 4);
         }
 
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
@@ -2704,12 +2706,21 @@ pub const DiskTier = struct {
     /// Write (or, with the writer, stage) one safetensors file at `path`, which it takes.
     /// Returns the file's byte size.
     pub fn saveNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
-        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, kind, s);
+        return self.saveNamedImpl(path, list, meta, kind, false, s);
+    }
+
+    fn saveCheckpointNamed(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
+        return self.saveNamedImpl(path, list, meta, .ssm, true, s);
+    }
+
+    fn saveNamedImpl(self: *DiskTier, path: []u8, list: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, checkpoint_file: bool, s: mlx.mlx_stream) !u64 {
+        if (self.writer) |w| return self.stageSafetensors(w, path, list, meta, kind, checkpoint_file, s);
         const size = self.saveSync(path, list, meta) catch |err| {
             self.stats.recordFailed(dataLen(list));
             return err;
         };
-        self.stats.recordWritten(kind, size);
+        self.stats.recordWrittenFrom(self.write_origin, kind, size);
+        if (checkpoint_file) self.stats.recordSsmFile(self.write_origin, size);
         return size;
     }
 
@@ -2853,7 +2864,7 @@ pub const DiskTier = struct {
 
     /// Stage one materialized file through the writer: one blob, or `Writer.partBytes` parts
     /// when larger, each allocated only once the permit has room for it. Takes `path`.
-    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
+    fn stageSafetensors(self: *DiskTier, w: *disk_writer.Writer, path: []u8, tensors: []NamedTensor, meta: []const MetaPair, kind: write_stats.Kind, checkpoint_file: bool, s: mlx.mlx_stream) !u64 {
         var path_owned: ?[]u8 = path;
         defer if (path_owned) |p| self.allocator.free(p);
         // The readback stays here (mlx arrays are inference-thread-owned); only bytes cross.
@@ -2883,7 +2894,7 @@ pub const DiskTier = struct {
                 return err;
             };
             if (last) path_owned = null;
-            w.submitPart(blob_path, bytes, part, kind); // takes both buffers
+            w.submitPartFrom(blob_path, bytes, part, kind, self.write_origin, total, checkpoint_file); // takes both buffers
             staged += n;
         }
         return total;
@@ -3326,7 +3337,7 @@ pub const DiskTier = struct {
         }
 
         const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
-        return self.saveNamed(path, list.items, meta.items, .ssm, s);
+        return self.saveCheckpointNamed(path, list.items, meta.items, s);
     }
 
     pub const QsaHistoryResult = struct { bytes: u64 = 0, rows: u32 = 0, inherited: bool = false };
@@ -3757,7 +3768,7 @@ pub const DiskTier = struct {
             errdefer self.allocator.free(final_path);
             w.waitForRoom(buf.items.len);
             const bytes = try buf.toOwnedSlice(self.allocator);
-            w.submit(final_path, bytes, .meta);
+            w.submitFrom(final_path, bytes, .meta, self.write_origin);
             return;
         }
         defer self.allocator.free(final_path);
@@ -3773,7 +3784,7 @@ pub const DiskTier = struct {
             try fw.interface.flush();
         }
         try std.Io.Dir.renameAbsolute(tmp_path, final_path, self.io);
-        self.stats.recordWritten(.meta, buf.items.len);
+        self.stats.recordWrittenFrom(self.write_origin, .meta, buf.items.len);
     }
 
     /// The lowest manifest version that describes this entry. The version is a compatibility

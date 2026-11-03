@@ -3183,6 +3183,9 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trans
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
     if (!hc.ssd_first) return;
     const d = if (hc.disk) |*dd| dd else return;
+    const old_origin = d.write_origin;
+    d.write_origin = .prefill_write_through;
+    defer d.write_origin = old_origin;
     if (d.writer == null) return;
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
@@ -5789,7 +5792,6 @@ test "a shutdown drain ends a queued request with an error, a client disconnect 
     destroyAbandoned(take.abandoned);
 }
 
-
 test "decode share: the default is 0.25 and reaches /props" {
     const saved = prefill_interleave_cached;
     defer prefill_interleave_cached = saved;
@@ -5855,8 +5857,6 @@ test "decode share: ticks to the budget, keeps one tick at zero, stops when deco
     try testing.expectEqual(@as(u32, 0), none.calls);
 }
 
-
-
 test "decode share: 0.25 owes a third of the chunk time in ticks" {
     const ms = std.time.ns_per_ms;
     var f = FakeDecodeTicks{ .left = 1000, .ns = 10 * ms };
@@ -5876,7 +5876,6 @@ test "decode share: the kill switch disables the effective share" {
     try testing.expectEqual(@as(f32, 0.5), prefillDecodeShare());
     try testing.expectEqual(std.math.maxInt(u64), decodeShareBudgetNs(std.math.maxInt(u64), 0.9));
 }
-
 
 test "decode share: cancelled prefill stops its hosted ticks before touching the scheduler" {
     var cancelled = std.atomic.Value(bool).init(true);

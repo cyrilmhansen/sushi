@@ -19,6 +19,7 @@ const transformer_mod = @import("transformer.zig");
 const model_mod = @import("model.zig");
 const kv_quant = @import("kv_quant.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
+const write_stats = @import("disk_write_stats.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const restore_dump = @import("restore_dump.zig");
@@ -823,7 +824,6 @@ pub const HotPrefixCache = struct {
         }
         return null;
     }
-
 
     /// The rows a restore will deliver, which is not the rows it matched: a hybrid restore is
     /// clamped to its highest SSM checkpoint at or below the match, so the lien test must weigh this.
@@ -2118,6 +2118,7 @@ pub const HotPrefixCache = struct {
             log.info("  [disk-cache] completion persistence skipped ({d}/{d} tokens since checkpoint)\n", .{ interval, self.persist_min_tokens });
             break :blk true;
         };
+        if (skip_completion) write_stats.process.recordCompletionSkipped();
         if (!skip_completion and self.capturesLiveForDisk() and disk_len > 0) {
             const rows: ?*const glm5_prefix.MlaRows = if (disk_glm) |*r| r else if (new_glm) |*r| r else null;
             self.capturePendingDisk(source_cache, tokens, disk_len, has_tools, eff_vision_key, eff_media_start, prompt_len, ssm_cps, dflash, mtp, new_rings, rows);
@@ -2725,6 +2726,9 @@ pub const HotPrefixCache = struct {
         glm: ?*const glm5_prefix.MlaRows,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
+        const old_origin = d.write_origin;
+        d.write_origin = .decline_spill;
+        defer d.write_origin = old_origin;
         if (text_len == 0) return;
         const tokens = all_tokens[0..text_len];
         const text = self.textCheckpoints(all_cps, text_len, all_tokens.len) orelse return;
@@ -2886,6 +2890,9 @@ pub const HotPrefixCache = struct {
         if (!self.ssd_first) return;
         if (self.entries.items.len <= 1) return;
         const d = if (self.disk) |*dd| dd else return;
+        const old_origin = d.write_origin;
+        d.write_origin = .idle_spill;
+        defer d.write_origin = old_origin;
 
         // The active session is the single MRU entry; `last_used` is a strictly increasing counter.
         var newest_used: u64 = 0;
@@ -3050,6 +3057,9 @@ pub const HotPrefixCache = struct {
     /// Write the pending record whole and release it: its rows may be a finished request's own
     /// buffers, which nothing could read again to resume a partial entry.
     fn flushPendingRecord(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, s: mlx.mlx_stream) void {
+        const old_origin = d.write_origin;
+        d.write_origin = .decode_end;
+        defer d.write_origin = old_origin;
         var pending = self.pending_disk orelse return;
         self.pending_disk = null;
         defer pending.deinit(self.allocator);
@@ -3132,6 +3142,9 @@ pub const HotPrefixCache = struct {
         if (!self.disk_dirty) return;
         self.disk_dirty = false;
         const d = if (self.disk) |*dd| dd else return;
+        const old_origin = d.write_origin;
+        d.write_origin = .decode_end;
+        defer d.write_origin = old_origin;
         defer self.releaseRingCpsToDisk();
         // Flush the live state captured at commit, not what the RAM entry retained after its trim.
         if (self.pending_disk != null) return self.flushPendingRecord(d, s);
@@ -6475,8 +6488,6 @@ test "HotPrefixCache: with an SSD tier the RAM entry keeps only its newest two c
         }
     }
 }
-
-
 
 test "HotPrefixCache: a byte-budget trim never lands on a released checkpoint, which this entry cannot restore from" {
     const cps = [_]SSMCheckpoint{

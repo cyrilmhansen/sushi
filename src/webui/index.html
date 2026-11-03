@@ -3712,6 +3712,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const total = Object.values(w.written_bytes).reduce((a, b) => a + b, 0);
     const dt = prev ? (now - prev.t) / 1000 : 0;
     return { t: now, total, kinds: w.written_bytes, failed: w.failed_bytes || 0,
+      origins: w.origins || null, checkpoints: w.ssm_checkpoint_files || null, completionSkipped: w.completion_skipped || 0,
       rate: prev && dt > 0 && total >= prev.total ? (total - prev.total) / dt : null,
       amplification: onDisk > 0 ? total / onDisk : null };
   }
@@ -3841,18 +3842,25 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     ]);
 
     const ssdVolume = serverInfo.disk?.volume;
-    kv($('writes'), [
+    const writeRows = [
       ['Cache location', esc(ssdVolume ? cacheVolumeText(ssdVolume) : 'Destination unavailable')],
       ...(writes ? [
       ['Written', bytes(writes.total)],
       ['Write rate', writes.rate == null ? '-' : bytes(writes.rate) + '/s'],
       ['Written per byte on disk', writes.amplification == null ? '-' : fmt(writes.amplification, 1) + 'x'],
       ...Object.entries(writes.kinds).map(([k, v]) => [WRITE_KINDS[k] || esc(k), bytes(v)]),
+      ...(writes.checkpoints ? [['Last SSM checkpoint file', bytes(writes.checkpoints.last_bytes)], ['Average SSM checkpoint file', bytes(writes.checkpoints.average_bytes)], ['Completions skipped', fmtInt(writes.completionSkipped)]] : []),
       ['Failed or dropped', bytes(writes.failed)],
       ] : [['Not reported by this server', '-']]),
-    ]);
-    const writeRows = $('writes').querySelectorAll('span');
-    if (writeRows.length > 1) writeRows[1].title = ssdVolume?.path || '';
+    ];
+    kv($('writes'), writeRows);
+    if (writes?.origins) {
+      const labels = { prefill_write_through: 'Prefill write-through', decode_end: 'Decode end', idle_spill: 'Idle spill', decline_spill: 'Decline spill', other: 'Other' };
+      const detail = Object.entries(writes.origins).map(([origin, o]) => `<tr><td>${esc(labels[origin] || origin)}</td><td>${fmtInt(o.ssm_files || 0)}</td><td>${bytes(o.total_bytes || 0)}</td><td><details><summary>By kind</summary>${Object.entries(o.written_bytes || {}).map(([k, v]) => `${esc(WRITE_KINDS[k] || k)}: ${bytes(v)}`).join('<br>')}</details></td></tr>`).join('');
+      $('writes').insertAdjacentHTML('beforeend', `<div class="foot" style="text-align:left"><table><thead><tr><th>Write origin</th><th>SSM files</th><th>Incremental bytes</th><th></th></tr></thead><tbody>${detail}</tbody></table></div>`);
+    }
+    const locationRows = $('writes').querySelectorAll('span');
+    if (locationRows.length > 1) locationRows[1].title = ssdVolume?.path || '';
     hist('ttft', h.time_to_first_token_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
     hist('e2e', h.e2e_request_latency_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
     sessions(d.sessions || [], now, g);
