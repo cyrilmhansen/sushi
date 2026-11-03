@@ -351,6 +351,8 @@ const Entry = struct {
     /// `prompt_ids ++ generated_ids` from the request that produced this snapshot.
     /// Owned by the entry; freed on eviction.
     tokens: []u32,
+    completion_cursor: usize = 0,
+    deferred_completion: bool = false,
     /// Whether the request had tools enabled (different chat template, can't
     /// share cache across).
     has_tools: bool,
@@ -621,6 +623,8 @@ pub const HotPrefixCache = struct {
     disk: ?kv_disk_cache.DiskTier = null,
     /// A commit landed since the last `flushPendingDisk`.
     disk_dirty: bool = false,
+    /// Qwen completion snapshot interval; zero preserves every completion write.
+    persist_min_tokens: u32 = 0,
     /// `last_used` of the entry the current request restored from; `evictLruToAdmit` refuses to evict it.
     last_restored_used: ?u64 = null,
     /// The raw prefix that restore matched, before a hybrid clamp (`checkoutRestored`).
@@ -2092,7 +2096,29 @@ pub const HotPrefixCache = struct {
         const disk_len = diskTextLen(tokens.len, eff_vision_key, eff_media_start);
         // Record what the live cache holds now, before any byte-budget trim: the SSD tier gets the
         // whole entry whatever the RAM tier keeps.
-        if (self.capturesLiveForDisk() and disk_len > 0) {
+        var completion_cursor: usize = 0;
+        var longest: usize = 0;
+        if (self.persist_min_tokens > 0) for (self.entries.items) |*e| {
+            if (e.completion_cursor == 0 or e.vision_key != 0 or e.has_tools != has_tools or !std.meta.eql(e.quant_config, quant_config)) continue;
+            if (e.tokens.len > disk_len or e.tokens.len < longest) continue;
+            if (!std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) continue;
+            longest = e.tokens.len;
+            completion_cursor = e.completion_cursor;
+        };
+        const skip_completion = self.persist_min_tokens > 0 and self.ram_enabled and
+            !self.disk_dirty and self.pending_disk == null and eff_vision_key == 0 and
+            disk_len > 0 and blk: {
+            const d = if (self.disk) |*tier| tier else break :blk false;
+            if (completion_cursor == 0) {
+                const match = d.bestHybridMatch(tokens[0..disk_len], has_tools, quant_config, std.math.maxInt(u32), .{}) orelse break :blk false;
+                completion_cursor = match.cp;
+            }
+            const interval = disk_len -| completion_cursor;
+            if (interval >= self.persist_min_tokens) break :blk false;
+            log.info("  [disk-cache] completion persistence skipped ({d}/{d} tokens since checkpoint)\n", .{ interval, self.persist_min_tokens });
+            break :blk true;
+        };
+        if (!skip_completion and self.capturesLiveForDisk() and disk_len > 0) {
             const rows: ?*const glm5_prefix.MlaRows = if (disk_glm) |*r| r else if (new_glm) |*r| r else null;
             self.capturePendingDisk(source_cache, tokens, disk_len, has_tools, eff_vision_key, eff_media_start, prompt_len, ssm_cps, dflash, mtp, new_rings, rows);
             // Whatever the RAM tier then does with the candidate, the record is flushed.
@@ -2121,7 +2147,7 @@ pub const HotPrefixCache = struct {
         };
         // The pending record holds every checkpoint for the SSD tier, so the hot entry keeps only its newest.
         // A GDN checkpoint past the record's text prefix is not in it and stays.
-        const hot_keeps_newest = self.pending_disk != null and (new_glm != null or (glm.ram == null and glm.disk == null));
+        const hot_keeps_newest = (self.pending_disk != null or skip_completion) and (new_glm != null or (glm.ram == null and glm.disk == null));
         const record_text: usize = if (new_glm != null) std.math.maxInt(usize) else disk_len;
         // GDN checkpoints are cut after the byte-budget trim below, which lands on one of them.
         if (hot_keeps_newest and new_glm != null) self.keepNewestCheckpoints(&ssm_cps, record_text);
@@ -2225,7 +2251,7 @@ pub const HotPrefixCache = struct {
                     {
                         // The resident entry already covers the trim target;
                         // the candidate's EXTRA tokens still belong on disk.
-                        self.spillDeclinedToDisk(&new_snap, tokens, diskTextLen(tokens.len, eff_vision_key, eff_media_start), has_tools, MediaStamp.of(eff_vision_key, eff_media_start), eff_cps, new_rings, if (new_glm) |*rows| rows else null);
+                        if (!skip_completion) self.spillDeclinedToDisk(&new_snap, tokens, diskTextLen(tokens.len, eff_vision_key, eff_media_start), has_tools, MediaStamp.of(eff_vision_key, eff_media_start), eff_cps, new_rings, if (new_glm) |*rows| rows else null);
                         var discarded = new_snap;
                         discarded.deinit();
                         if (new_dflash) |*d| d.deinit();
@@ -2342,7 +2368,7 @@ pub const HotPrefixCache = struct {
             if (!trimmed_ok) {
                 // RAM decline is not a value verdict: offer the candidate to
                 // the SSD tier before discarding it.
-                self.spillDeclinedToDisk(&new_snap, tokens, diskTextLen(tokens.len, eff_vision_key, eff_media_start), has_tools, MediaStamp.of(eff_vision_key, eff_media_start), eff_cps, new_rings, if (new_glm) |*rows| rows else null);
+                if (!skip_completion) self.spillDeclinedToDisk(&new_snap, tokens, diskTextLen(tokens.len, eff_vision_key, eff_media_start), has_tools, MediaStamp.of(eff_vision_key, eff_media_start), eff_cps, new_rings, if (new_glm) |*rows| rows else null);
                 var discarded_snap = new_snap;
                 discarded_snap.deinit();
                 if (new_dflash) |*d| d.deinit();
@@ -2546,6 +2572,8 @@ pub const HotPrefixCache = struct {
                 for (cps) |*cp| merged_ssm_bytes += ssmCheckpointBytes(cp);
             }
             e.tokens = tokens_owned;
+            e.completion_cursor = if (self.persist_min_tokens == 0) 0 else if (skip_completion) completion_cursor else disk_len;
+            e.deferred_completion = skip_completion;
             e.snapshot = new_snap;
             e.has_tools = has_tools;
             e.vision_key = eff_vision_key;
@@ -2588,7 +2616,7 @@ pub const HotPrefixCache = struct {
                     if (!self.evictOneLruProgress("byte budget", null)) break;
                 }
             }
-            if (self.disk != null) self.disk_dirty = true;
+            if (self.disk != null and !skip_completion) self.disk_dirty = true;
             self.logResident();
             return .{ .ok = eff_tokens.len };
         }
@@ -2604,6 +2632,8 @@ pub const HotPrefixCache = struct {
         }
         const incoming: Entry = .{
             .tokens = tokens_owned,
+            .completion_cursor = if (self.persist_min_tokens == 0) 0 else if (skip_completion) completion_cursor else disk_len,
+            .deferred_completion = skip_completion,
             .has_tools = has_tools,
             .vision_key = eff_vision_key,
             .cache_key = cache_key,
@@ -2628,7 +2658,7 @@ pub const HotPrefixCache = struct {
         if (!try self.retainNewEntry(incoming)) return .declined;
         // The trim prices a prefix against the checkpoints that survive a shed, so the shed runs here too.
         if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
-        if (self.disk != null) self.disk_dirty = true;
+        if (self.disk != null and !skip_completion) self.disk_dirty = true;
         self.logResident();
         return .{ .ok = eff_tokens.len };
     }
@@ -2848,8 +2878,8 @@ pub const HotPrefixCache = struct {
         };
     }
 
-    /// At the end of a request every idle entry is written to the SSD tier, and RAM is trimmed
-    /// back to the active session plus the idle allowance. Writing is unconditional; the
+    /// At the end of a request idle entries not deferred by the completion interval are written
+    /// to the SSD tier, and RAM is trimmed back to the active session plus the idle allowance. The
     /// allowance is a hard cap shed in two tiers: entries with a proven durable copy first,
     /// then (naming the reason) the rest, oldest first.
     pub fn spillIdleEntries(self: *HotPrefixCache, s: mlx.mlx_stream) void {
@@ -2861,7 +2891,7 @@ pub const HotPrefixCache = struct {
         var newest_used: u64 = 0;
         for (self.entries.items) |*e| newest_used = @max(newest_used, e.last_used);
 
-        // Pass 1: write, unconditionally. Attribute anything the writer lost since the last pass
+        // Pass 1: write non-deferred entries. Attribute anything the writer lost since the last pass
         // before sampling the error counter: a failure between two passes is invisible to the delta.
         _ = d.harvestWriteFailures();
         const errs_before = d.writeErrors();
@@ -2876,6 +2906,7 @@ pub const HotPrefixCache = struct {
             idle_bytes +|= e.kv_bytes;
             // Vision entries never spill: a token-only disk key is ambiguous.
             if (e.vision_key != 0) continue;
+            if (e.deferred_completion) continue;
             const specs = entrySpecCommits(e);
             const outcome = d.appendCommitWithSpec(
                 e.snapshot.entries,
