@@ -314,6 +314,10 @@ fn printUsage(io: std.Io) void {
         \\                        (SUSHI_PREFIX_CACHE_DIR) and are restored
         \\                        across restarts instead of recomputed. 0/off
         \\                        disables.
+        \\  --prefix-cache-persist-min-tokens <n>
+        \\                      Hybrid text completions may skip SSD writes until
+        \\                        a landed recovery point is n tokens behind
+        \\                        the newest checkpoint (default: 0, off).
         \\  --prefix-cache-ssm-dedup
         \\                      Reuse byte-identical landed SSM checkpoint
         \\                        files across branches by hard link (opt-in).
@@ -825,6 +829,9 @@ pub fn main(init: std.process.Init) !void {
             server_mod.prefix_cache_disk_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-ssm-dedup")) {
             server_mod.prefix_cache_ssm_dedup = true;
+        } else if (std.mem.eql(u8, args[i], "--prefix-cache-persist-min-tokens") and i + 1 < args.len) {
+            i += 1;
+            server_mod.prefix_cache_persist_min_tokens = flagInt(u32, "--prefix-cache-persist-min-tokens", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--think-penalty") and i + 1 < args.len) {
             i += 1;
             const lambda = std.fmt.parseFloat(f32, args[i]) catch -1;
@@ -1444,6 +1451,7 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
             .prefix_cache_ssm_dedup = server_mod.prefix_cache_ssm_dedup,
+            .prefix_cache_persist_min_tokens = server_mod.prefix_cache_persist_min_tokens,
             .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
             .ssd_budget_bytes = ssd_budget_bytes,
             .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
@@ -1731,6 +1739,7 @@ fn runHeadlessServe(
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
         .prefix_cache_ssm_dedup = server_mod.prefix_cache_ssm_dedup,
+        .prefix_cache_persist_min_tokens = server_mod.prefix_cache_persist_min_tokens,
         .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
         .ssd_budget_bytes = ssd_budget_bytes,
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,

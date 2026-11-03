@@ -645,6 +645,9 @@ pub const HotPrefixCache = struct {
     ram_enabled: bool = true,
     /// SSD-first mode; set by the scheduler at load.
     ssd_first: bool = false,
+    /// Opt-in minimum advance of a newly captured Qwen checkpoint over a landed SSD anchor.
+    /// Zero keeps every completion write; skipped tails are recomputed after restart/eviction.
+    persist_min_tokens: u32 = 0,
     /// SSD-first: the RAM allowance for idle entries (the resolved `--prefix-cache-mem`).
     /// `spillIdleEntries` evicts only past it; 0 = nothing idle stays resident.
     ssd_idle_mem: u64 = 0,
@@ -2090,9 +2093,10 @@ pub const HotPrefixCache = struct {
 
         // Taken before the budget trim can drop the first item.
         const disk_len = diskTextLen(tokens.len, eff_vision_key, eff_media_start);
+        const skip_completion = self.shouldDeferTextHybridCompletion(source_cache, tokens, has_tools, eff_vision_key, eff_media_start, ssm_cps, dflash, mtp, new_rings);
         // Record what the live cache holds now, before any byte-budget trim: the SSD tier gets the
         // whole entry whatever the RAM tier keeps.
-        if (self.capturesLiveForDisk() and disk_len > 0) {
+        if (!skip_completion and self.capturesLiveForDisk() and disk_len > 0) {
             const rows: ?*const glm5_prefix.MlaRows = if (disk_glm) |*r| r else if (new_glm) |*r| r else null;
             self.capturePendingDisk(source_cache, tokens, disk_len, has_tools, eff_vision_key, eff_media_start, prompt_len, ssm_cps, dflash, mtp, new_rings, rows);
             // Whatever the RAM tier then does with the candidate, the record is flushed.
@@ -2119,9 +2123,10 @@ pub const HotPrefixCache = struct {
         if (new_glm) |*rows| if (ssm_cps) |cps| {
             ssm_cps = glm5_prefix.keepThrough(self.allocator, cps, rows.len);
         };
-        // The pending record holds every checkpoint for the SSD tier, so the hot entry keeps only its newest.
-        // A GDN checkpoint past the record's text prefix is not in it and stays.
-        const hot_keeps_newest = self.pending_disk != null and (new_glm != null or (glm.ram == null and glm.disk == null));
+        // The hot entry keeps the same newest points when a completion is deferred: older
+        // checkpoints are released, so the policy never buys fewer writes with more RAM.
+        // A GDN checkpoint past the record's text prefix stays.
+        const hot_keeps_newest = (self.pending_disk != null or skip_completion) and (new_glm != null or (glm.ram == null and glm.disk == null));
         const record_text: usize = if (new_glm != null) std.math.maxInt(usize) else disk_len;
         // GDN checkpoints are cut after the byte-budget trim below, which lands on one of them.
         if (hot_keeps_newest and new_glm != null) self.keepNewestCheckpoints(&ssm_cps, record_text);
@@ -2588,7 +2593,7 @@ pub const HotPrefixCache = struct {
                     if (!self.evictOneLruProgress("byte budget", null)) break;
                 }
             }
-            if (self.disk != null) self.disk_dirty = true;
+            if (self.disk != null and !skip_completion) self.disk_dirty = true;
             self.logResident();
             return .{ .ok = eff_tokens.len };
         }
@@ -2628,7 +2633,7 @@ pub const HotPrefixCache = struct {
         if (!try self.retainNewEntry(incoming)) return .declined;
         // The trim prices a prefix against the checkpoints that survive a shed, so the shed runs here too.
         if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
-        if (self.disk != null) self.disk_dirty = true;
+        if (self.disk != null and !skip_completion) self.disk_dirty = true;
         self.logResident();
         return .{ .ok = eff_tokens.len };
     }
@@ -3794,6 +3799,81 @@ pub const HotPrefixCache = struct {
     pub fn capturesLiveForDisk(self: *const HotPrefixCache) bool {
         const d = if (self.disk) |*dd| dd else return false;
         return self.ssd_first or d.writer != null;
+    }
+
+    /// Decide before creating `pending_disk`. The disk index itself is the lineage cursor:
+    /// every candidate compares with a landed checkpoint under the same token prefix. This
+    /// deliberately allows an undurable tail; its client can replay it after restart.
+    fn shouldDeferTextHybridCompletion(
+        self: *HotPrefixCache,
+        source: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        media_start: ?usize,
+        cps_opt: ?[]SSMCheckpoint,
+        dflash: ?DflashCommit,
+        mtp: ?DflashCommit,
+        rings: ?[]const KVCacheSnapshot,
+    ) bool {
+        if (self.persist_min_tokens == 0 or !self.ram_enabled or !self.hybrid or !self.qsa_history_required) return false;
+        if (vision_key != 0 or media_start != null or rings != null or self.pending_disk != null or self.disk_dirty) return false;
+        const d = if (self.disk) |*dd| dd else return false;
+        if (d.writer == null or tokens.len > std.math.maxInt(u32)) return false;
+        const cps = cps_opt orelse return false;
+        if (cps.len == 0) return false;
+        const newest = &cps[cps.len - 1];
+        if (newest.isReleased() or newest.pos > tokens.len or !transformer_mod.checkpointHasQsaPooled(newest)) return false;
+
+        // Force the ordinary live capture if this entry might need a byte-budget trim or
+        // decline. Otherwise the baseline's newest-checkpoint thinning fits without a
+        // pending copy and without retaining any extra recurrent state.
+        var bill = liveCacheBytes(source);
+        for (cps) |*cp| bill +|= ssmCheckpointBytes(cp);
+        var can_admit_by_count = self.entries.items.len < self.max_entries;
+        for (self.entries.items) |*e| {
+            if (e.checked_out_by == null) can_admit_by_count = true;
+            if (e.has_tools != has_tools or e.vision_key != 0 or !std.meta.eql(e.quant_config, source.config)) continue;
+            if (e.tokens.len > tokens.len or !std.mem.eql(u32, e.tokens, tokens[0..e.tokens.len])) continue;
+            // A replacement may keep one old point beside the new one after thinning.
+            if (e.ssm_checkpoints) |held| {
+                if (held.len > 0) bill +|= ssmCheckpointBytes(&held[held.len - 1]);
+            }
+            break;
+        }
+        if (!can_admit_by_count) {
+            log.info("  [persist-policy] forced completion: RAM entry count budget\n", .{});
+            return false;
+        }
+        if (dflash) |df| bill +|= liveCacheBytes(df.cache);
+        if (mtp) |m| {
+            bill +|= liveCacheBytes(m.cache);
+            if (m.head) |h| {
+                inline for (.{ h.aux_state, h.qsa_pooled }) |arr| {
+                    if (arr.ctx != null) bill +|= @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
+                }
+            }
+            for (m.head_marks) |mark| {
+                if (mark.rows.ctx != null) bill +|= @as(u64, mlx.mlx_array_size(mark.rows)) * @as(u64, mlx.mlx_array_itemsize(mark.rows));
+            }
+        }
+        if (self.max_kv_bytes > 0 and bill > self.max_kv_bytes) {
+            log.info("  [persist-policy] forced completion: RAM budget\n", .{});
+            return false;
+        }
+
+        const indexed = d.bestHybridMatch(tokens, has_tools, source.config, @intCast(tokens.len), .{}) orelse {
+            log.info("  [persist-policy] forced completion: no matching SSD anchor\n", .{});
+            return false;
+        };
+        if (newest.pos >= indexed.cp and newest.pos - indexed.cp >= self.persist_min_tokens) return false;
+        const anchor = d.confirmedTextHybridAnchor(tokens, has_tools, source.config) orelse {
+            log.info("  [persist-policy] forced completion: SSD anchor pending or incomplete\n", .{});
+            return false;
+        };
+        const skip = newest.pos >= anchor and newest.pos - anchor < self.persist_min_tokens;
+        if (skip) log.info("  [persist-policy] skipped completion at checkpoint {d} (SSD anchor {d}, interval {d})\n", .{ newest.pos, anchor, self.persist_min_tokens });
+        return skip;
     }
 
     /// Bytes the cache currently holds resident. A hint for the connection thread's admission

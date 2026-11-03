@@ -280,6 +280,24 @@ reply every turn. A thinking request with tools now takes one more point mid-dec
 <a id="checkpoints-on-ssd"></a>
 ### Qwen's GDN checkpoints live on the SSD
 
+`--prefix-cache-persist-min-tokens N` (default `0`) allows a text-only Qwen
+completion to omit its SSD write when its newest checkpoint is fewer than N
+tokens beyond a landed, matching disk checkpoint. The disk index is the
+lineage cursor; a branch cannot inherit another branch's unmatched token tail.
+The live completion is **not** staged for a later request. The RAM entry keeps
+the same newest checkpoint limit and byte budget as the baseline. If it is
+evicted or the process restarts, a later request replays its prompt from the
+older disk checkpoint, or cold-prefills if that point is unavailable. The
+client must supply the complete conversation prompt again.
+
+The policy forces the normal completion write without a confirmed KV, SSM and
+QSA recovery anchor, when writer work is pending, or when the candidate could
+need RAM trimming. Prefill write-through and memory-pressure spilling keep
+their existing behavior. N measures checkpoint advancement, not a guaranteed
+maximum replay distance: the 8192-token prefill checkpoint grid, prompt-end
+capture, branching, and skipped tails all affect the next usable restore point.
+The option has no effect on other architectures or SSD-only operation.
+
 `--prefix-cache-ssm-dedup` is an opt-in Qwen-only file reuse experiment. When a
 new branch would serialize an SSM checkpoint, the tier compares its complete
 safetensors byte stream with a landed checkpoint at the same position in another

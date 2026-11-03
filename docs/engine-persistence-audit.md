@@ -73,6 +73,13 @@ and spill costs, including bytes in partial appends.
 
 ## Feasible policy boundary
 
+The optional `--prefix-cache-persist-min-tokens` policy intentionally relaxes
+post-restart recovery coverage. It checks a matching landed hybrid SSD anchor
+before skipping live capture, discards the new tail at process exit, and
+recomputes it from a later full client prompt. Its RAM entry still sheds older
+checkpoints under the baseline limit. A queued write, KV-only record, or
+missing QSA bank is never counted as that anchor.
+
 Campaign 2 now includes `--prefix-cache-ssm-dedup`, a narrower opt-in write
 reduction that does not defer a completion. It compares a newly serialized Qwen
 checkpoint byte for byte with a landed checkpoint file at the same position in

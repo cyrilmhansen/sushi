@@ -129,6 +129,7 @@ pub const LoadParams = struct {
     /// archs; entries live under `~/.sushi/kv-cache/<fingerprint>`.
     prefix_cache_disk_bytes: u64 = 0,
     prefix_cache_ssm_dedup: bool = false,
+    prefix_cache_persist_min_tokens: u32 = 0,
     /// Sizes the SSD budget for this model and logs the `Allocating` line (`server.prefixCacheDiskForLoad`);
     /// takes the cache directory. Null = `prefix_cache_disk_bytes` as given (tests).
     prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?disk_placement.DefaultDiskBudget = null,
@@ -2523,6 +2524,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated() or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .min_span;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         entry.prefix_cache.?.hybrid = has_ssm_layers or params.config.isGlm5() or params.config.isDsv41();
+        entry.prefix_cache.?.persist_min_tokens = if (params.config.longCtxGated() and entry.prefix_cache.?.qsa_history_required and ram_prefix_cache and disk_prefix_cache) params.prefix_cache_persist_min_tokens else 0;
+        if (params.prefix_cache_persist_min_tokens > 0 and entry.prefix_cache.?.persist_min_tokens == 0)
+            log.warn("[disk-cache] --prefix-cache-persist-min-tokens needs a supported hybrid SSD tier and RAM retention\n", .{});
         if (disk_tier) |tier| {
             entry.prefix_cache.?.disk = tier;
             entry.prefix_cache.?.disk.?.cp_thin =

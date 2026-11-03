@@ -618,6 +618,7 @@ pub fn clearResolvedPrefixCacheMem() void {
 pub var prefix_cache_disk_bytes: u64 = disk_placement.DEFAULT_DISK_CAP;
 /// Opt-in exact-file reuse of Qwen SSM checkpoints across branched disk records.
 pub var prefix_cache_ssm_dedup: bool = false;
+pub var prefix_cache_persist_min_tokens: u32 = 0;
 /// Set by `--prefix-cache-disk`: the operator's number is the budget as given.
 pub var prefix_cache_disk_explicit = false;
 

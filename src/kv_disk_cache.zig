@@ -830,6 +830,30 @@ pub const DiskTier = struct {
         return best;
     }
 
+    /// A conservative, landed recovery anchor for a text-only hybrid lineage. A candidate may
+    /// lose its new tail on restart only when this older point is still a complete disk record.
+    /// The normal restore path remains responsible for validating tensor contents and QSA shape.
+    pub fn confirmedTextHybridAnchor(self: *DiskTier, tokens: []const u32, has_tools: bool, quant: kv_quant.KVQuantConfig) ?u32 {
+        if (tokens.len < 2 or tokens.len > std.math.maxInt(u32)) return null;
+        _ = self.harvestWriteFailures();
+        const m = self.bestHybridMatch(tokens, has_tools, quant, @intCast(tokens.len), .{}) orelse return null;
+        const e = &self.entries.items[m.idx];
+        if (e.vision_key != 0 or e.media_start != null or self.entryWritesPending(e.id)) return null;
+        if (!self.entryWholeOnDisk(e.id)) return null;
+        if (!(self.tokenRecordMatches(e, m.cp) catch false)) return null;
+        const at = std.mem.indexOfScalar(u32, e.ssm_positions, m.cp) orelse return null;
+        const point = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, e.id, m.cp }) catch return null;
+        defer self.allocator.free(point);
+        if (!self.chunkLanded(point, e.ssm_bytes[at])) return null;
+        // Qwen checkpoints store their pooled bank separately. A missing bank makes this point
+        // unusable even when its SSM file and every KV chunk landed.
+        if (e.qsa_history_rows < m.cp or e.qsa_history_bytes == 0) return null;
+        const qsa = std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, e.id }) catch return null;
+        defer self.allocator.free(qsa);
+        if (!self.chunkLanded(qsa, e.qsa_history_bytes)) return null;
+        return m.cp;
+    }
+
     /// A ringed target's lookup: the entry and ring file restoring the most of `prompt_ids`
     /// within `limit`. A ring file at `pos` holding `rows` serves a clamp to `at <= pos` while
     /// its rows still reach a window below `at` (a full match re-forwards its last token).

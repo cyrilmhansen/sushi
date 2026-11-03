@@ -61,11 +61,10 @@ operator should rank again after collecting those fields.
 H2 ranks first as a **measurement and proof target**, not as an enabled policy.
 The existing superseded path already accounts for 32 no-op attempts, so a new
 gate must demonstrate real bytes beyond those no-ops. H3 has the largest kind
-ceiling, but a format change has much greater regression risk. A nominal
-`--prefix-cache-persist-min-tokens` setting is withheld until a host fixture
-can prove cumulative eligibility, branch isolation, QSA/MTP restoration and
-zero extra retained tensor state. Thresholds 1024/4096/16384 cannot be
-estimated from request counts: no restorable-token gaps were measured.
+ceiling, but a format change has much greater regression risk. The baseline
+could not estimate threshold savings from request counts: no restorable-token
+gaps were measured. The later interval experiment explicitly accepts more
+recomputation after restart and is documented in [engine-prefix-cache](engine-prefix-cache.md).
 
 ## Opt-in engine experiment after the instrumentation baseline
 
@@ -80,20 +79,28 @@ point, and disk budget billing stays at baseline logical file sizes. No tensor
 or pending snapshot is retained for deduplication. A fixed 40 KiB stack buffer
 compares one donor at a time; the writer permit is unchanged.
 
-This does not throttle completion or promise a cumulative token interval.
-Skipping a completion that adds a prompt-end or thought checkpoint would lose
-that restore point on restart, while keeping its pending record across turns
-would exceed the cache memory contract. Byte-identical branch checkpoints are
-the currently proven candidate for avoiding a file write without changing that
-contract. The exact eligible fraction and latency cost remain for operator A/B.
+This deduplication option remains independent of the later completion interval.
+The interval intentionally allows a newer prompt-end or thought checkpoint to
+be lost on restart. It never retains a pending record across turns. Both options
+need operator A/B measurements of actual bytes and inference latency.
 
 ## Operator A/B procedure
+
+For the interval experiment, keep `--prefix-cache-ssm-dedup` off in both arms.
+Run the same production-equivalent command below with no interval flag for the
+baseline and with `--prefix-cache-persist-min-tokens 1024` for the candidate;
+give each arm its own `SUSHI_PREFIX_CACHE_DIR`. Repeat with 4096 only after the
+first run establishes a real byte reduction and acceptable replay cost. The
+existing `prefill_write_through` origin count measures checkpoint writes the
+interval cannot suppress. Count `[persist-policy]` log lines for skips, missing
+anchors and RAM-budget fallbacks. A skipped completion removes its newest SSD
+recovery point, so replay after restart can exceed N tokens.
 
 The user performs all live runs and model/server control. Build each candidate
 into its own isolated prefix; do not overwrite `zig-out/bin/sushi`. Each window
 uses the same production-equivalent model, KV8, GDN16, MTP policy, 220k context,
-2048 prefill chunk, cache budgets, prompts and temperature. For a future
-candidate, vary only the presence of `--prefix-cache-ssm-dedup`. Give each run a separate `SUSHI_PREFIX_CACHE_DIR`, and
+2048 prefill chunk, cache budgets, prompts and temperature. Vary only
+`--prefix-cache-persist-min-tokens`, keeping SSM dedup off. Give each run a separate `SUSHI_PREFIX_CACHE_DIR`, and
 compare warm windows after the same warm-up so cold cache creation does not
 masquerade as policy cost.
 
@@ -104,7 +111,7 @@ candidate's production-equivalent launch shape is:
 cd "${SUSHI_CHECKOUT:?set checkout}"
 SUSHI_PREFIX_CACHE_DIR="/tmp/sushi-campaign2-cache-baseline" \
 DYLD_LIBRARY_PATH="$PWD/lib/mlx/lib" \
-/tmp/sushi-campaign2-ssm-dedup/bin/sushi --serve --host 127.0.0.1 \
+/tmp/sushi-persist-interval-candidate/bin/sushi --serve --host 127.0.0.1 \
   --port "${SUSHI_PORT:-12345}" --model "${SUSHI_MODEL:?set model path}" \
   --mtp --no-vision --kv-quant 8 --max-resident-models 1 --timeout 900 \
   --mtp-greedy-tail --prefix-cache-mem 1GB --mtp-min-depth 1 \
@@ -113,16 +120,16 @@ DYLD_LIBRARY_PATH="$PWD/lib/mlx/lib" \
   --prefix-cache-disk 20GB --prefix-cache-entries 4 --temp 1 --metrics
 ```
 
-For the optimized arm, use `/tmp/sushi-campaign2-cache-dedup` and append
-`--prefix-cache-ssm-dedup` to the same command. The operator starts each arm
+For the optimized arm, use `/tmp/sushi-campaign2-cache-n1024` and append
+`--prefix-cache-persist-min-tokens 1024` to the same command. The operator starts each arm
 only after taking the live server down by their own procedure. This document
 does not authorize an automated server restart.
 
 ```bash
 cd "${SUSHI_CHECKOUT:?set checkout}"
 shasum -a 256 zig-out/bin/sushi
-./.zig-toolchain/zig build -Doptimize=ReleaseFast --prefix /tmp/sushi-campaign2-ssm-dedup
-shasum -a 256 zig-out/bin/sushi /tmp/sushi-campaign2-ssm-dedup/bin/sushi
+./.zig-toolchain/zig build -Doptimize=ReleaseFast --prefix /tmp/sushi-persist-interval-candidate
+shasum -a 256 zig-out/bin/sushi /tmp/sushi-persist-interval-candidate/bin/sushi
 
 # Run these around each operator-controlled Pi session against its server URL:
 scripts/measure-persistence.sh --url "${SUSHI_URL:?set URL}" --dir /tmp/sushi-campaign2-reports start pi-baseline
@@ -133,7 +140,7 @@ jq '.bytes.by_origin_kind, .bytes.by_kind, .serializations, .durations.stages' /
 ```
 
 Repeat the `start`, `stop`, `report` and `jq` commands with session name
-`pi-dedup` after the operator has started the optimized configuration. Record cache
+`pi-n1024` after the operator has started the optimized configuration. Record cache
 hits, post-restart restorable tokens, TTFT, throughput, resident cache bytes,
 MLX/host peak and writer staging peak beside the byte report. Neither the
 script nor this experiment starts, stops or reconfigures the live server.
