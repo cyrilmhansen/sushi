@@ -2555,6 +2555,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
     params.config.prefix_cache_disk_declined = params.prefix_cache_disk_bytes > 0 and disk_tier == null;
     const disk_prefix_cache = disk_tier != null;
+    if (params.prefix_cache_persist_min_tokens > 0) {
+        const reason: ?[]const u8 = if (!params.config.isQwen4()) "unsupported architecture" else if (!cache_applies) "prefix cache unavailable" else if (!ram_prefix_cache) "RAM retention off" else if (!disk_prefix_cache) "SSD tier unavailable" else null;
+        if (reason) |why|
+            log.info("[disk-cache] completion persistence interval: {d} tokens (inactive: {s})\n", .{ params.prefix_cache_persist_min_tokens, why })
+        else
+            log.info("[disk-cache] completion persistence interval: {d} tokens (Qwen hybrid, active)\n", .{params.prefix_cache_persist_min_tokens});
+    }
     if (cache_applies and (ram_prefix_cache or disk_prefix_cache)) {
         // The weights are resident here, so the resolver's active-memory read
         // is honest; the raw launch budget never reaches initWithMem (a 40 GB

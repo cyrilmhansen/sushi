@@ -352,6 +352,7 @@ const Entry = struct {
     /// Owned by the entry; freed on eviction.
     tokens: []u32,
     completion_cursor: usize = 0,
+    deferred_completion: bool = false,
     /// Whether the request had tools enabled (different chat template, can't
     /// share cache across).
     has_tools: bool,
@@ -2572,6 +2573,7 @@ pub const HotPrefixCache = struct {
             }
             e.tokens = tokens_owned;
             e.completion_cursor = if (self.persist_min_tokens == 0) 0 else if (skip_completion) completion_cursor else disk_len;
+            e.deferred_completion = skip_completion;
             e.snapshot = new_snap;
             e.has_tools = has_tools;
             e.vision_key = eff_vision_key;
@@ -2631,6 +2633,7 @@ pub const HotPrefixCache = struct {
         const incoming: Entry = .{
             .tokens = tokens_owned,
             .completion_cursor = if (self.persist_min_tokens == 0) 0 else if (skip_completion) completion_cursor else disk_len,
+            .deferred_completion = skip_completion,
             .has_tools = has_tools,
             .vision_key = eff_vision_key,
             .cache_key = cache_key,
@@ -2875,8 +2878,8 @@ pub const HotPrefixCache = struct {
         };
     }
 
-    /// At the end of a request every idle entry is written to the SSD tier, and RAM is trimmed
-    /// back to the active session plus the idle allowance. Writing is unconditional; the
+    /// At the end of a request idle entries not deferred by the completion interval are written
+    /// to the SSD tier, and RAM is trimmed back to the active session plus the idle allowance. The
     /// allowance is a hard cap shed in two tiers: entries with a proven durable copy first,
     /// then (naming the reason) the rest, oldest first.
     pub fn spillIdleEntries(self: *HotPrefixCache, s: mlx.mlx_stream) void {
@@ -2888,7 +2891,7 @@ pub const HotPrefixCache = struct {
         var newest_used: u64 = 0;
         for (self.entries.items) |*e| newest_used = @max(newest_used, e.last_used);
 
-        // Pass 1: write, unconditionally. Attribute anything the writer lost since the last pass
+        // Pass 1: write non-deferred entries. Attribute anything the writer lost since the last pass
         // before sampling the error counter: a failure between two passes is invisible to the delta.
         _ = d.harvestWriteFailures();
         const errs_before = d.writeErrors();
@@ -2903,6 +2906,7 @@ pub const HotPrefixCache = struct {
             idle_bytes +|= e.kv_bytes;
             // Vision entries never spill: a token-only disk key is ambiguous.
             if (e.vision_key != 0) continue;
+            if (e.deferred_completion) continue;
             const specs = entrySpecCommits(e);
             const outcome = d.appendCommitWithSpec(
                 e.snapshot.entries,
