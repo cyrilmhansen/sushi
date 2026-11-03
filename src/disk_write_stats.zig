@@ -21,6 +21,9 @@ pub const Kind = enum {
 };
 
 pub const Origin = enum { prefill_write_through, decode_during, decode_end, idle_spill, decline_spill, other };
+pub const CompletionDecision = enum { skipped_interval, threshold_reached, no_anchor, dirty_or_pending, ineligible };
+const decision_names = @typeInfo(CompletionDecision).@"enum".field_names;
+pub const decision_count = decision_names.len;
 const origin_names = @typeInfo(Origin).@"enum".field_names;
 pub const origin_count = origin_names.len;
 
@@ -36,6 +39,7 @@ pub const Snapshot = struct {
     ssm_last_bytes: u64 = 0,
     ssm_total_bytes: u64 = 0,
     completion_skipped: u64 = 0,
+    completion_decisions: [decision_count]u64 = @splat(0),
 
     pub fn totalWritten(self: Snapshot) u64 {
         var n: u64 = 0;
@@ -53,6 +57,7 @@ pub const Stats = struct {
     ssm_last_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     ssm_total_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     completion_skipped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    completion_decisions: [decision_count]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
 
     pub fn recordWritten(self: *Stats, kind: Kind, bytes: u64) void {
         self.recordWrittenFrom(.other, kind, bytes);
@@ -76,6 +81,11 @@ pub const Stats = struct {
         if (self.parent) |p| p.recordCompletionSkipped();
     }
 
+    pub fn recordCompletionDecision(self: *Stats, decision: CompletionDecision) void {
+        _ = self.completion_decisions[@intFromEnum(decision)].fetchAdd(1, .monotonic);
+        if (self.parent) |p| p.recordCompletionDecision(decision);
+    }
+
     pub fn recordFailed(self: *Stats, bytes: u64) void {
         _ = self.failed.fetchAdd(bytes, .monotonic);
         if (self.parent) |p| p.recordFailed(bytes);
@@ -91,6 +101,7 @@ pub const Stats = struct {
         s.ssm_last_bytes = self.ssm_last_bytes.load(.monotonic);
         s.ssm_total_bytes = self.ssm_total_bytes.load(.monotonic);
         s.completion_skipped = self.completion_skipped.load(.monotonic);
+        for (&s.completion_decisions, &self.completion_decisions) |*dst, *src| dst.* = src.load(.monotonic);
         return s;
     }
 };
@@ -113,7 +124,9 @@ pub fn writeJson(snap: Snapshot, w: *std.Io.Writer) !void {
         try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", name, snap.written[i] });
     }
     const file_count = ssmFilesTotal(snap);
-    try w.print("}},\"failed_bytes\":{d},\"ssm_checkpoint_files\":{{\"last_bytes\":{d},\"average_bytes\":{d},\"total_bytes\":{d},\"count\":{d}}},\"completion_skipped\":{d},\"origins\":{{", .{ snap.failed, snap.ssm_last_bytes, if (file_count > 0) snap.ssm_total_bytes / file_count else 0, snap.ssm_total_bytes, file_count, snap.completion_skipped });
+    try w.print("}},\"failed_bytes\":{d},\"ssm_checkpoint_files\":{{\"last_bytes\":{d},\"average_bytes\":{d},\"total_bytes\":{d},\"count\":{d}}},\"completion_skipped\":{d},\"completion_decisions\":{{", .{ snap.failed, snap.ssm_last_bytes, if (file_count > 0) snap.ssm_total_bytes / file_count else 0, snap.ssm_total_bytes, file_count, snap.completion_skipped });
+    inline for (decision_names, 0..) |name, i| try w.print("{s}\"{s}\":{d}", .{ if (i == 0) "" else ",", name, snap.completion_decisions[i] });
+    try w.print("}},\"origins\":{{", .{});
     inline for (origin_names, 0..) |name, oi| {
         try w.print("{s}\"{s}\":{{\"ssm_files\":{d},\"written_bytes\":{{", .{ if (oi == 0) "" else ",", name, snap.ssm_files[oi] });
         inline for (kind_names, 0..) |kind, ki| try w.print("{s}\"{s}\":{d}", .{ if (ki == 0) "" else ",", kind, snap.origin_bytes[oi][ki] });
@@ -157,6 +170,8 @@ test "the Prometheus and JSON renderings name every kind and the failed counter"
     snap.ssm_last_bytes = 42;
     snap.ssm_total_bytes = 42;
     snap.completion_skipped = 3;
+    snap.completion_decisions[@intFromEnum(CompletionDecision.skipped_interval)] = 3;
+    snap.completion_decisions[@intFromEnum(CompletionDecision.threshold_reached)] = 2;
     var buf: [2048]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writePrometheus(snap, &w);
@@ -180,6 +195,9 @@ test "the Prometheus and JSON renderings name every kind and the failed counter"
     try std.testing.expectEqual(@as(i64, 1), obj.get("ssm_checkpoint_files").?.object.get("count").?.integer);
     try std.testing.expectEqual(@as(i64, 42), obj.get("ssm_checkpoint_files").?.object.get("average_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 3), obj.get("completion_skipped").?.integer);
+    const decisions = obj.get("completion_decisions").?.object;
+    try std.testing.expectEqual(@as(i64, 3), decisions.get("skipped_interval").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), decisions.get("threshold_reached").?.integer);
     const decode_end = obj.get("origins").?.object.get("decode_end").?.object;
     try std.testing.expectEqual(@as(i64, 1), decode_end.get("ssm_files").?.integer);
     try std.testing.expectEqual(@as(i64, 42), decode_end.get("total_bytes").?.integer);

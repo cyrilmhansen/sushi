@@ -2105,19 +2105,29 @@ pub const HotPrefixCache = struct {
             longest = e.tokens.len;
             completion_cursor = e.completion_cursor;
         };
+        var completion_decision: write_stats.CompletionDecision = .ineligible;
         const skip_completion = self.persist_min_tokens > 0 and self.ram_enabled and
             !self.disk_dirty and self.pending_disk == null and eff_vision_key == 0 and
             disk_len > 0 and blk: {
             const d = if (self.disk) |*tier| tier else break :blk false;
+            completion_decision = .no_anchor;
             if (completion_cursor == 0) {
                 const match = d.bestHybridMatch(tokens[0..disk_len], has_tools, quant_config, std.math.maxInt(u32), .{}) orelse break :blk false;
                 completion_cursor = match.cp;
             }
             const interval = disk_len -| completion_cursor;
-            if (interval >= self.persist_min_tokens) break :blk false;
+            if (interval >= self.persist_min_tokens) {
+                completion_decision = .threshold_reached;
+                break :blk false;
+            }
+            completion_decision = .skipped_interval;
             log.info("  [disk-cache] completion persistence skipped ({d}/{d} tokens since checkpoint)\n", .{ interval, self.persist_min_tokens });
             break :blk true;
         };
+        if (self.persist_min_tokens > 0) {
+            if (self.disk_dirty or self.pending_disk != null) completion_decision = .dirty_or_pending;
+            write_stats.process.recordCompletionDecision(completion_decision);
+        }
         if (skip_completion) write_stats.process.recordCompletionSkipped();
         if (!skip_completion and self.capturesLiveForDisk() and disk_len > 0) {
             const rows: ?*const glm5_prefix.MlaRows = if (disk_glm) |*r| r else if (new_glm) |*r| r else null;

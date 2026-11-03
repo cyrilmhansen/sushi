@@ -3725,7 +3725,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const total = Object.values(w.written_bytes).reduce((a, b) => a + b, 0);
     const dt = prev ? (now - prev.t) / 1000 : 0;
     return { t: now, total, kinds: w.written_bytes, failed: w.failed_bytes || 0,
-      origins: w.origins || null, checkpoints: w.ssm_checkpoint_files || null, completionSkipped: w.completion_skipped || 0,
+      origins: w.origins || null, checkpoints: w.ssm_checkpoint_files || null, completionSkipped: w.completion_skipped || 0, completionDecisions: w.completion_decisions || null,
       rate: prev && dt > 0 && total >= prev.total ? (total - prev.total) / dt : null,
       amplification: onDisk > 0 ? total / onDisk : null };
   }
@@ -3884,7 +3884,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       ['Write rate', writes.rate == null ? '-' : bytes(writes.rate) + '/s'],
       ['Written per byte on disk', writes.amplification == null ? '-' : fmt(writes.amplification, 1) + 'x'],
       ...Object.entries(writes.kinds).map(([k, v]) => [WRITE_KINDS[k] || esc(k), bytes(v)]),
-      ...(writes.checkpoints ? [['Last SSM checkpoint file', bytes(writes.checkpoints.last_bytes)], ['Average SSM checkpoint file', bytes(writes.checkpoints.average_bytes)], ['Completions skipped', fmtInt(writes.completionSkipped)]] : []),
+      ...(writes.checkpoints ? [['Last SSM checkpoint file', bytes(writes.checkpoints.last_bytes)], ['Average SSM checkpoint file', bytes(writes.checkpoints.average_bytes)], ['Completions skipped', fmtInt(writes.completionSkipped)], ...(writes.completionDecisions ? [['Persistence decisions', Object.entries(writes.completionDecisions).map(([k, v]) => `${esc(k.replaceAll('_', ' '))}: ${fmtInt(v)}`).join(' · ')]] : [])] : []),
       ['Failed or dropped', bytes(writes.failed)],
       ] : [['Not reported by this server', '-']]),
     ];
