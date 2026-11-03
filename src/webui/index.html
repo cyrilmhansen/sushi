@@ -456,7 +456,20 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 @media (min-width: 900px) {
   #dashPanel .charts, #dashPanel .row2 { grid-template-columns: 1fr 1fr; }
   #dashPanel .charts .card:last-child { grid-column: 1 / -1; }
+  #dashPanel .row2 .wide { grid-column: 1 / -1; }
 }
+#dashWriteOrigins { min-width: 0; margin-top: var(--s3); }
+#dashWriteOrigins .table-wrap { margin: 0; }
+#dashWriteOrigins table { width: 100%; min-width: 590px; table-layout: auto; border-collapse: collapse; font-size: var(--fs-md); }
+#dashWriteOrigins th, #dashWriteOrigins td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+#dashWriteOrigins th { background: var(--surface-2); text-align: left; }
+#dashWriteOrigins tr:last-child td { border-bottom: 0; }
+#dashWriteOrigins .origin-name { min-width: 190px; }
+#dashWriteOrigins .origin-count, #dashWriteOrigins .origin-bytes { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+#dashWriteOrigins .origin-detail { min-width: 220px; }
+#dashWriteOrigins details { text-align: left; }
+#dashWriteOrigins details summary { cursor: pointer; white-space: nowrap; }
+#dashWriteOrigins .kind-list { margin-top: 6px; color: var(--text-2); white-space: nowrap; }
 #dashPanel .card { padding: var(--s3) 14px; }
 #dashPanel .legend { display: flex; gap: var(--s3); font-weight: 400; color: var(--text-2); font-size: var(--fs-sm); flex-wrap: wrap; }
 #dashPanel .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
@@ -765,7 +778,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <div class="card"><h2>Request totals</h2><div class="kv" id="dashTotals"></div></div>
     <div class="card"><h2>Time to first token<span class="legend">requests per bucket</span></h2><div class="hist" id="dashHTtft"></div><div class="histlabels" id="dashHlTtft"></div></div>
     <div class="card"><h2>End-to-end time per request<span class="legend">requests per bucket</span></h2><div class="hist" id="dashHE2e"></div><div class="histlabels" id="dashHlE2e"></div></div>
-    <div class="card"><h2>Prefix cache writes<span class="legend">SSD, since the server started</span></h2><div class="kv" id="dashWrites"></div><div class="foot" style="text-align:left">Filesystem writes, not SSD wear. A rewritten file counts again.</div></div>
+    <div class="card wide"><h2>Prefix cache writes<span class="legend">SSD, since the server started</span></h2><div class="kv" id="dashWrites"></div><div id="dashWriteOrigins"></div><div class="foot" style="text-align:left">Filesystem writes, not SSD wear. A rewritten file counts again.</div></div>
   </section>
   </div>
 </section>
@@ -3716,6 +3729,28 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       rate: prev && dt > 0 && total >= prev.total ? (total - prev.total) / dt : null,
       amplification: onDisk > 0 ? total / onDisk : null };
   }
+  const writeOriginExpansion = new Map();
+  function renderWriteOrigins(el, origins) {
+    if (!el._writeOriginClickListener) {
+      el.addEventListener('click', event => {
+        const summary = event.target.closest?.('summary');
+        const details = summary?.parentElement;
+        if (!details?.dataset.origin) return;
+        setTimeout(() => writeOriginExpansion.set(details.dataset.origin, details.open), 0);
+      });
+      el._writeOriginClickListener = true;
+    }
+    if (!origins) { setHtml(el, ''); return; }
+    const labels = { prefill_write_through: 'Prefill write-through', decode_during: 'Decode during', decode_end: 'Decode end', idle_spill: 'Idle spill', decline_spill: 'Decline spill', other: 'Other' };
+    const rows = Object.entries(origins).map(([origin, o]) => {
+      const total = o.total_bytes || 0;
+      const previous = writeOriginExpansion.get(origin);
+      const open = previous === undefined ? total > 0 || (o.ssm_files || 0) > 0 : previous;
+      const kinds = Object.entries(o.written_bytes || {}).map(([kind, value]) => `${esc(WRITE_KINDS[kind] || kind)}: ${esc(bytes(value))}`).join('<br>');
+      return `<tr><td class="origin-name">${esc(labels[origin] || origin)}</td><td class="origin-count">${fmtInt(o.ssm_files || 0)}</td><td class="origin-bytes">${esc(bytes(total))}</td><td class="origin-detail"><details data-origin="${esc(origin)}"${open ? ' open' : ''}><summary>Bytes by kind</summary><div class="kind-list">${kinds}</div></details></td></tr>`;
+    }).join('');
+    setHtml(el, `<div class="table-wrap"><table><thead><tr><th>Write origin</th><th class="origin-count">SSM files</th><th class="origin-bytes">Incremental bytes</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table></div>`);
+  }
   function push(k, v) { series[k].push(v); }
   // Appends the server samples newer than the last one seen; returns the latest decode and prefill rates (tok/s).
   function ingestHistory(samples, fields) {
@@ -3854,11 +3889,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       ] : [['Not reported by this server', '-']]),
     ];
     kv($('writes'), writeRows);
-    if (writes?.origins) {
-      const labels = { prefill_write_through: 'Prefill write-through', decode_end: 'Decode end', idle_spill: 'Idle spill', decline_spill: 'Decline spill', other: 'Other' };
-      const detail = Object.entries(writes.origins).map(([origin, o]) => `<tr><td>${esc(labels[origin] || origin)}</td><td>${fmtInt(o.ssm_files || 0)}</td><td>${bytes(o.total_bytes || 0)}</td><td><details><summary>By kind</summary>${Object.entries(o.written_bytes || {}).map(([k, v]) => `${esc(WRITE_KINDS[k] || k)}: ${bytes(v)}`).join('<br>')}</details></td></tr>`).join('');
-      $('writes').insertAdjacentHTML('beforeend', `<div class="foot" style="text-align:left"><table><thead><tr><th>Write origin</th><th>SSM files</th><th>Incremental bytes</th><th></th></tr></thead><tbody>${detail}</tbody></table></div>`);
-    }
+    renderWriteOrigins($('dashWriteOrigins'), writes?.origins);
     const locationRows = $('writes').querySelectorAll('span');
     if (locationRows.length > 1) locationRows[1].title = ssdVolume?.path || '';
     hist('ttft', h.time_to_first_token_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
