@@ -573,6 +573,7 @@ pub fn queryModel(buf: []u8, raw_path: []const u8) ?[]const u8 {
 // (`prefixCacheDiskForLoad`) is what bounds the bytes. 0 disables.
 pub var prefix_cache_capacity: u32 = 32;
 pub var prefix_cache_persist_min_tokens: u32 = 0;
+pub var prefix_cache_prefill_min_tokens: u32 = 0;
 /// RAM retention is opt-in: `--prefix-cache-mem` turns it on, `0` or `off` keeps it off.
 pub var prefix_cache_ram_enabled: bool = false;
 

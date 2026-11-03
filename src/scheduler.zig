@@ -934,6 +934,7 @@ pub const LoadRequest = struct {
     kv_quant_explicit: bool = false,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_persist_min_tokens: u32 = 0,
+    prefix_cache_prefill_min_tokens: u32 = 0,
     prefix_cache_ram_enabled: bool = true,
     prefix_cache_mem_bytes: u64 = 0,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
@@ -1041,6 +1042,7 @@ pub const Scheduler = struct {
     /// every model switch.
     prefix_cache_capacity: u32,
     prefix_cache_persist_min_tokens: u32,
+    prefix_cache_prefill_min_tokens: u32,
     prefix_cache_ram_enabled: bool,
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
@@ -1250,6 +1252,7 @@ pub const Scheduler = struct {
             .ctx_size_flag = params.ctx_size,
             .prefix_cache_capacity = params.prefix_cache_capacity,
             .prefix_cache_persist_min_tokens = params.prefix_cache_persist_min_tokens,
+            .prefix_cache_prefill_min_tokens = params.prefix_cache_prefill_min_tokens,
             .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
@@ -1780,6 +1783,7 @@ pub const Scheduler = struct {
             // which silently degraded warm reuse after every model switch.
             .prefix_cache_capacity = self.prefix_cache_capacity,
             .prefix_cache_persist_min_tokens = self.prefix_cache_persist_min_tokens,
+            .prefix_cache_prefill_min_tokens = self.prefix_cache_prefill_min_tokens,
             .prefix_cache_ram_enabled = self.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
@@ -3225,6 +3229,10 @@ fn writeThroughSpanReached(new_span: usize, chunk_tokens: u32) bool {
     return new_span >= chunk_tokens;
 }
 
+fn prefillWriteThroughThreshold(chunk_tokens: u32, configured_minimum: u32, eligible: bool) u32 {
+    return if (eligible) @max(chunk_tokens, configured_minimum) else chunk_tokens;
+}
+
 var write_through_span_declined_logged = std.atomic.Value(bool).init(false);
 /// The one gate for the write-through: SSD-first + a live writer + a disk tier + a new span
 /// worth at least one chunk.
@@ -3235,9 +3243,11 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     if (d.writer == null) return false;
     // A DeepSeek restore point is a full copy of the state: it goes to SSD however short the new span.
     if (slot.model.transformer) |t| if (t.dsv41 != null) return true;
-    if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
+    const qwen_ram_ssd = if (slot.model.config) |cfg| cfg.isQwen4() and hc.ram_enabled else false;
+    const required_tokens = prefillWriteThroughThreshold(d.chunk_tokens, hc.prefill_min_tokens, qwen_ram_ssd);
+    if (!writeThroughSpanReached(new_span, required_tokens)) {
         if (!write_through_span_declined_logged.swap(true, .monotonic)) {
-            log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
+            log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under the required span ({d}) — the end-of-request commit persists this turn\n", .{ new_span, required_tokens });
         }
         return false;
     }
@@ -5264,6 +5274,14 @@ test "writeThroughSpanReached: a sub-chunk warm turn never persists inside the p
     try testing.expect(writeThroughSpanReached(65_665, chunk));
     try testing.expect(writeThroughSpanReached(4096, 4096));
     try testing.expect(!writeThroughSpanReached(4095, 4096));
+}
+
+test "prefill write-through threshold: default preserves chunk gate; opt-in raises only Qwen RAM path" {
+    try testing.expectEqual(@as(u32, 1024), prefillWriteThroughThreshold(1024, 0, true));
+    try testing.expectEqual(@as(u32, 8192), prefillWriteThroughThreshold(1024, 8192, true));
+    try testing.expectEqual(@as(u32, 1024), prefillWriteThroughThreshold(1024, 8192, false));
+    try testing.expect(!writeThroughSpanReached(8191, prefillWriteThroughThreshold(1024, 8192, true)));
+    try testing.expect(writeThroughSpanReached(8192, prefillWriteThroughThreshold(1024, 8192, true)));
 }
 
 test "prefix-cache commit declines a pad-only generation, never a zero-token one" {

@@ -626,6 +626,7 @@ pub const HotPrefixCache = struct {
     disk_dirty: bool = false,
     /// Qwen completion snapshot interval; zero preserves every completion write.
     persist_min_tokens: u32 = 0,
+    prefill_min_tokens: u32 = 0,
     /// `last_used` of the entry the current request restored from; `evictLruToAdmit` refuses to evict it.
     last_restored_used: ?u64 = null,
     /// The raw prefix that restore matched, before a hybrid clamp (`checkoutRestored`).

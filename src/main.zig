@@ -323,6 +323,7 @@ fn printUsage(io: std.Io) void {
         \\                      Pass 0 (or off) to keep RAM retention off.
         \\  --prefix-cache-disk <n>{{KB,MB,GB}}
         \\  --prefix-cache-persist-min-tokens <n>  Minimum Qwen SSD completion interval (0 = every turn)
+        \\  --prefix-cache-prefill-min-tokens <n>  Minimum new Qwen prefill span before SSD write-through (0 = unchanged)
         \\                      SSD tier byte budget for the prefix cache
         \\                        (default: on, min(entries x context x bytes
         \\                        per token + 2GB, 20GB, free disk - 4GB)).
@@ -843,6 +844,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-persist-min-tokens") and i + 1 < args.len) {
             i += 1;
             server_mod.prefix_cache_persist_min_tokens = flagInt(u32, "--prefix-cache-persist-min-tokens", args[i], 0);
+        } else if (std.mem.eql(u8, args[i], "--prefix-cache-prefill-min-tokens") and i + 1 < args.len) {
+            i += 1;
+            server_mod.prefix_cache_prefill_min_tokens = flagInt(u32, "--prefix-cache-prefill-min-tokens", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts
@@ -1510,6 +1514,7 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
             .prefix_cache_persist_min_tokens = server_mod.prefix_cache_persist_min_tokens,
+            .prefix_cache_prefill_min_tokens = server_mod.prefix_cache_prefill_min_tokens,
             .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
             .ssd_budget_bytes = ssd_budget_bytes,
             .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
@@ -1793,6 +1798,7 @@ fn runHeadlessServe(
         // `serve` path). Mirrors the LoadParams built in `main()`.
         .prefix_cache_capacity = server_mod.prefix_cache_capacity,
         .prefix_cache_persist_min_tokens = server_mod.prefix_cache_persist_min_tokens,
+        .prefix_cache_prefill_min_tokens = server_mod.prefix_cache_prefill_min_tokens,
         .prefix_cache_ram_enabled = server_mod.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
