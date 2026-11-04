@@ -341,6 +341,8 @@ fn printUsage(io: std.Io) void {
         \\                        thins the restore points on SSD, which keep
         \\                        every 8192 tokens and each prompt's end
         \\                        (--prefix-cache-disk sizes them).
+        \\  --ssm-checkpoint-retention <min-span-recency|lru>
+        \\                      RAM-only Qwen checkpoint policy (default: automatic).
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 1, integers 1..32).
@@ -875,6 +877,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
             server_mod.ssm_checkpoint_max = flagInt(u32, "--ssm-checkpoint-max", args[i], 0);
+        } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-retention") and i + 1 < args.len) {
+            i += 1;
+            server_mod.ssm_checkpoint_retention = server_mod.parseSsmCheckpointRetention(args[i]) orelse {
+                log.err("--ssm-checkpoint-retention: expected 'min-span-recency' or 'lru'; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
@@ -1520,6 +1528,7 @@ pub fn main(init: std.process.Init) !void {
             .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
             .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
+            .ssm_checkpoint_retention = server_mod.ssm_checkpoint_retention,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .metrics = metrics_mod.current(),
         };
@@ -1807,6 +1816,7 @@ fn runHeadlessServe(
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
         .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
+        .ssm_checkpoint_retention = server_mod.ssm_checkpoint_retention,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .metrics = metrics_mod.current(),
     };

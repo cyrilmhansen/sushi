@@ -930,6 +930,62 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
+    /// Completion-side lifecycle summary. It scans only the bounded retained checkpoint list,
+    /// never the token buffer; ordinary small-gap completions stay quiet.
+    fn logCheckpointCommit(self: *const HotPrefixCache, e: *const Entry, prompt_end: usize, last_capture: ?usize) void {
+        if (!self.hybrid) return;
+        const cps = e.ssm_checkpoints orelse &.{};
+        var facts: [SHED_SIM_MAX]CheckpointFact = undefined;
+        var fact_n: usize = 0;
+        var retained_count: usize = 0;
+        var retained_bytes: u64 = 0;
+        var latest_restorable: ?usize = null;
+        var list: [768]u8 = undefined;
+        var used: usize = 0;
+        appendTrimFmt(&list, &used, "[", .{});
+        for (cps) |*cp| {
+            if (cp.layers.len == 0 or cp.isReleased()) continue;
+            const src = qsaHistorySource(cps, cp) orelse cp;
+            const restorable = transformer_mod.checkpointQsaCoversPos(cp, src, cp.pos);
+            retained_count += 1;
+            if (restorable and cp.pos <= e.tokens.len) latest_restorable = cp.pos;
+            if (fact_n < facts.len) {
+                facts[fact_n] = .{ .pos = cp.pos, .restorable = restorable };
+                fact_n += 1;
+            }
+            retained_bytes += ssmCheckpointBytes(cp);
+            if (used > 1) appendTrimFmt(&list, &used, ",", .{});
+            appendTrimFmt(&list, &used, "{d}:{s}", .{ cp.pos, if (restorable) "qsa-ok" else "qsa-gap" });
+        }
+        appendTrimFmt(&list, &used, "]", .{});
+        const restored = latest_restorable;
+        const restored_pos = restored orelse 0;
+        const lost = e.tokens.len -| restored_pos;
+        if (lost < 1024 and !(last_capture != null and last_capture.? >= prompt_end)) return;
+        const reason = if (retained_count > fact_n) ReuseGapReason.unknown else reuseGapReason(
+            e.tokens.len,
+            restored_pos,
+            facts[0..fact_n],
+            e.checkpoint_prune_reason,
+            e.checkpoint_pruned_pos,
+            e.snapshot.step,
+        );
+        var line: [1536]u8 = undefined;
+        var n: usize = 0;
+        appendTrimFmt(&line, &n, "[hot-cache] checkpoint-commit prompt_end={d} generated={d} committed_end={d} last_capture=", .{ prompt_end, e.tokens.len -| prompt_end, e.tokens.len });
+        if (last_capture) |pos| appendTrimFmt(&line, &n, "{d}", .{pos}) else appendTrimFmt(&line, &n, "none", .{});
+        appendTrimFmt(&line, &n, " last_restorable=", .{});
+        if (restored) |pos| appendTrimFmt(&line, &n, "{d}", .{pos}) else appendTrimFmt(&line, &n, "none", .{});
+        appendTrimFmt(&line, &n, " lost={d} reason={s} retained={s} removed=", .{ lost, reuseGapReasonName(reason), list[0..used] });
+        if (e.checkpoint_pruned_pos > 0 and e.checkpoint_prune_reason != .none) {
+            appendTrimFmt(&line, &n, "cp@{d}:{s}", .{ e.checkpoint_pruned_pos, @tagName(e.checkpoint_prune_reason) });
+        } else {
+            appendTrimFmt(&line, &n, "unknown", .{});
+        }
+        appendTrimFmt(&line, &n, " count={d} policy={s} checkpoint_bytes={d} memory_bytes={d}\n", .{ retained_count, @tagName(self.cp_thin), retained_bytes, e.kv_bytes });
+        log.info("{s}", .{line[0..n]});
+    }
+
     /// Material, successful hybrid reuse gaps are uncommon and expensive; report enough of the
     /// retained state to explain them without an allocation, tensor copy, or GPU evaluation.
     fn logReuseGap(e: *const Entry, raw_match: usize, restored: usize) void {
@@ -959,10 +1015,10 @@ pub const HotPrefixCache = struct {
                 nearest_after = cp.pos;
             }
             if (n > 1) appendTrimFmt(&buf, &n, ",", .{});
-            appendTrimFmt(&buf, &n, "{d}{s}", .{ cp.pos, if (restorable) "" else "?" });
+            appendTrimFmt(&buf, &n, "{d}:{s}", .{ cp.pos, if (restorable) "qsa-ok" else "qsa-gap" });
         };
         appendTrimFmt(&buf, &n, "]", .{});
-        const reason = reuseGapReason(
+        const reason = if (retained > fact_n) ReuseGapReason.unknown else reuseGapReason(
             raw_match,
             restored,
             facts[0..fact_n],
@@ -1330,7 +1386,10 @@ pub const HotPrefixCache = struct {
         if (cps) |list| {
             if (list.len > 0) {
                 // Arch gate: the ungated arm prices every lower checkpoint, as before.
-                if (self.cp_thin == .min_span) return trimLenBillingAllLower(budget, limit, row_bytes, list);
+                // The admission forecast has only positions/byte prices, not a mutable LRU
+                // access list. Price every lower checkpoint conservatively; the real byte shed
+                // later uses the per-checkpoint access stamps and the selected LRU policy.
+                if (self.cp_thin == .min_span or self.cp_thin == .lru) return trimLenBillingAllLower(budget, limit, row_bytes, list);
                 if (list.len > SHED_SIM_MAX) return trimLenBillingAllLower(budget, limit, row_bytes, list);
                 var pos_buf: [SHED_SIM_MAX]usize = undefined;
                 var byte_buf: [SHED_SIM_MAX]u64 = undefined;
@@ -1865,6 +1924,7 @@ pub const HotPrefixCache = struct {
         // The two MUST stay in sync, so we rewind KV further too.
         var dump = restore_dump.RestoreDumpMeta{ .kind = "restore", .pos = 0 };
         var effective_matched: usize = restore_cap;
+        var selected_checkpoint: ?*const SSMCheckpoint = null;
         if (rec == .glm) {
             effective_matched = 0;
             if (e.glm) |*rows| if (e.ssm_checkpoints) |cps| if (highestCheckpointAtOrBelow(cps, @min(restore_cap, rows.len))) |cp| {
@@ -1912,6 +1972,8 @@ pub const HotPrefixCache = struct {
                     if (self.qsa_history_required and !(entriesHaveQsaHistory(entries) and qsaRestoreSatisfiesForward(entries, effective_matched))) {
                         resetSsmEntries(entries);
                         effective_matched = 0;
+                    } else {
+                        selected_checkpoint = cp;
                     }
                 } else {
                     // No checkpoint at or before this prefix length — reset
@@ -1979,6 +2041,9 @@ pub const HotPrefixCache = struct {
             e.last_used = used_before_restore;
             return .{ .matched = 0, .full_match = false };
         };
+        // Recency is a successful checkpoint restore, not an entry lookup or a capture-time
+        // proxy. Stamp only after both recurrent restore and KV clamp have succeeded.
+        if (selected_checkpoint) |cp| transformer_mod.touchCheckpoint(@constCast(cp));
 
         const full_reuse = full_match and effective_matched > 1;
         const matched = if (full_reuse) effective_matched - 1 else effective_matched;
@@ -2221,6 +2286,7 @@ pub const HotPrefixCache = struct {
         var new_glm_bytes: u64 = if (new_glm) |*rows| rows.bytes() else 0;
         const quant_config = source_cache.config;
         var ssm_cps = all_cps;
+        const last_capture = if (ssm_cps) |cps| if (cps.len > 0) @as(?usize, cps[cps.len - 1].pos) else null else null;
 
         // An entry's pixel key applies only to rows it actually covers. When the committed range
         // ends before the request's first media row — a cancelled prefill that forwarded less than
@@ -2783,6 +2849,12 @@ pub const HotPrefixCache = struct {
             }
             if (self.disk != null and !skip_completion) self.disk_dirty = true;
             self.logResident();
+            for (self.entries.items) |*entry| {
+                if (entry.cache_key == cache_key and entry.tokens.len == eff_tokens.len and std.mem.eql(u32, entry.tokens, eff_tokens)) {
+                    self.logCheckpointCommit(entry, prompt_len, last_capture);
+                    break;
+                }
+            }
             return .{ .ok = eff_tokens.len };
         }
 
@@ -2827,6 +2899,10 @@ pub const HotPrefixCache = struct {
         if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
         if (self.disk != null and !skip_completion) self.disk_dirty = true;
         self.logResident();
+        if (self.entries.items.len > 0) {
+            const entry = &self.entries.items[self.entries.items.len - 1];
+            self.logCheckpointCommit(entry, prompt_len, last_capture);
+        }
         return .{ .ok = eff_tokens.len };
     }
 

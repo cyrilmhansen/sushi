@@ -703,6 +703,22 @@ pub var ssm_checkpoint_stride: u32 = SSM_CHECKPOINT_STRIDE_DEFAULT;
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
 pub var ssm_checkpoint_max: u32 = 16;
 
+/// Optional checkpoint thinning override. Only RAM-only Qwen uses this; other
+/// architectures and SSD retention retain their configured/default policies.
+pub var ssm_checkpoint_retention: ?transformer_mod.ThinPolicy = null;
+
+pub fn parseSsmCheckpointRetention(word: []const u8) ?transformer_mod.ThinPolicy {
+    if (std.mem.eql(u8, word, "min-span-recency")) return .min_span_recency;
+    if (std.mem.eql(u8, word, "lru")) return .lru;
+    return null;
+}
+
+test "SSM checkpoint retention CLI accepts only the explicit RAM experiment policies" {
+    try std.testing.expectEqual(@as(?transformer_mod.ThinPolicy, .min_span_recency), parseSsmCheckpointRetention("min-span-recency"));
+    try std.testing.expectEqual(@as(?transformer_mod.ThinPolicy, .lru), parseSsmCheckpointRetention("lru"));
+    try std.testing.expectEqual(@as(?transformer_mod.ThinPolicy, null), parseSsmCheckpointRetention("fifo"));
+}
+
 /// SSM checkpoints feed reusable prefix tiers; zero capacity disables all reuse.
 pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32, ram_enabled: bool, disk_bytes: u64) u32 {
     if (cache_capacity == 0 or (!ram_enabled and disk_bytes == 0)) return 0;

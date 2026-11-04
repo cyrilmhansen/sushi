@@ -314,6 +314,7 @@ const ssmConcatAxis0 = qwen4_ssm_group.ssmConcatAxis0;
 pub const ssmDetachFromGroup = qwen4_ssm_group.ssmDetachFromGroup;
 pub const ssmCheckpointBytes = ssm_cache.ssmCheckpointBytes;
 pub const ssmCheckpointDropIndex = ssm_cache.ssmCheckpointDropIndex;
+pub const touchCheckpoint = ssm_cache.touchCheckpoint;
 pub const ssmEntryBytes = ssm_cache.ssmEntryBytes;
 pub const ssmEvalHandles = ssm_cache.ssmEvalHandles;
 pub const ssmFreeMergedLayer = ssm_cache.ssmFreeMergedLayer;

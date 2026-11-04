@@ -144,6 +144,8 @@ pub const LoadParams = struct {
     ssm_checkpoint_stride: u32 = 0,
     /// Phase 1: cap on snapshots retained per request.
     ssm_checkpoint_max: u32 = 16,
+    /// Optional retention-policy override; applied only to RAM-only Qwen checkpoints.
+    ssm_checkpoint_retention: ?transformer_mod.ThinPolicy = null,
     /// Iteration 2 (perf-plan Phase 4 #3): per-LoadedModel LRU cache
     /// of chat-template render+tokenize results. 0 disables the cache
     /// (useful for ablation benches / debugging). Default 4 matches
@@ -2593,11 +2595,14 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
         entry.prefix_cache.?.cp_thin = if (params.config.isQwen4() and ram_prefix_cache and !disk_prefix_cache)
-            .min_span_recent_tail
+            (params.ssm_checkpoint_retention orelse .min_span_recent_tail)
         else if (params.config.longCtxGated() or params.config.isGlm5() or params.config.isDsv41())
             .min_span_recency
         else
             .min_span;
+        if (params.config.isQwen4() and ram_prefix_cache and !disk_prefix_cache) {
+            log.info("[hot-cache] RAM-only Qwen checkpoint retention: {s}\n", .{@tagName(entry.prefix_cache.?.cp_thin)});
+        }
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         entry.prefix_cache.?.hybrid = has_ssm_layers or params.config.isGlm5() or params.config.isDsv41();
         if (disk_tier) |tier| {

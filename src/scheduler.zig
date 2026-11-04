@@ -954,6 +954,7 @@ pub const LoadRequest = struct {
     /// dropped front-first when the buffer would grow past this. 0 = no cap
     /// beyond the prefix-cache byte budget.
     ssm_checkpoint_max: u32 = 16,
+    ssm_checkpoint_retention: ?transformer_mod.ThinPolicy = null,
     /// Iteration 2: tokenize cache LRU capacity. Mirrored on
     /// `LoadParams.tokenize_cache_entries`; both paths feed
     /// `doLoadOnInferenceThread`.
@@ -1051,6 +1052,7 @@ pub const Scheduler = struct {
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
+    ssm_checkpoint_retention: ?transformer_mod.ThinPolicy = null,
     /// Launch-flag MTP settings, retained (same rationale as the prefix-cache
     /// fields above) so COLD-LOADED models — on-demand `/v1/load-model`, model
     /// switches — honor `--no-mtp` / `--mtp-max-depth` like the `--model` primary.
@@ -1261,6 +1263,7 @@ pub const Scheduler = struct {
             .expert_cache_fit_resolver = params.expert_cache_fit_resolver,
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
             .ssm_checkpoint_max = params.ssm_checkpoint_max,
+            .ssm_checkpoint_retention = params.ssm_checkpoint_retention,
             .mtp_enabled = params.mtp_enabled,
             .mtp_explicit = params.mtp_explicit,
             .mtp_head_kv_quant = params.mtp_head_kv_quant,
@@ -1793,6 +1796,7 @@ pub const Scheduler = struct {
             .expert_cache_fit_resolver = self.expert_cache_fit_resolver,
             .ssm_checkpoint_stride = cold_disk.stride,
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
+            .ssm_checkpoint_retention = self.ssm_checkpoint_retention,
             // Cold loads honor the launch-flag MTP settings too (same reason
             // as prefix-cache above) — pre-plumbing these were LoadRequest
             // defaults, so --no-mtp / --mtp-max-depth were silently dropped on
@@ -2870,6 +2874,104 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
     return n_gen > 0 and all_pad;
 }
 
+pub const DecodeEndCheckpointGate = enum { ready, cache_position_mismatch, mtp_history_gap };
+
+pub fn decodeEndCheckpointGate(cache_step: usize, committed_end: usize, mtp_active: bool, mtp_base: usize, mtp_committed: usize) DecodeEndCheckpointGate {
+    if (cache_step != committed_end) return .cache_position_mismatch;
+    if (mtp_active and mtp_base +| mtp_committed != committed_end) return .mtp_history_gap;
+    return .ready;
+}
+
+/// Capture an additional decode-end restore point only when the committed token
+/// boundary is unambiguous. The existing cache admission and merge paths still
+/// enforce checkpoint count and byte budgets.
+fn captureQwenDecodeEndCheckpoint(
+    slot: *Slot,
+    gen: *generate_mod.Generator,
+    hc: *prefix_cache_mod.HotPrefixCache,
+    total_len: usize,
+) ?usize {
+    const cfg = slot.model.config orelse return null;
+    if (!cfg.isQwen4() or !hc.ram_enabled or hc.disk != null) return null;
+    const refuse = struct {
+        fn write(reason: []const u8) void {
+            log.info("[hot-cache] decode-end checkpoint skipped: {s}\n", .{reason});
+        }
+    }.write;
+    if (!gen.done or (!std.mem.eql(u8, gen.finish_reason, "stop") and !std.mem.eql(u8, gen.finish_reason, "length"))) {
+        refuse("request_not_naturally_completed");
+        return null;
+    }
+    if (slot.vision_key != 0 or slot.media_chain.len != 0) {
+        refuse("media_state_not_supported");
+        return null;
+    }
+    const mtp_committed = if (gen.mtp_cache != null) gen.mtpCommittedHistoryLen() else 0;
+    const gate = decodeEndCheckpointGate(slot.cache.step, total_len, gen.mtp_cache != null, gen.mtp_position_base, mtp_committed);
+    if (gate == .cache_position_mismatch) {
+        log.info("[hot-cache] decode-end checkpoint skipped: cache_position_mismatch cache={d} committed={d}\n", .{ slot.cache.step, total_len });
+        return null;
+    }
+    const entries = slot.ssm_entries orelse {
+        refuse("no_live_ssm_state");
+        return null;
+    };
+    if (entries.len == 0) {
+        refuse("no_live_ssm_state");
+        return null;
+    }
+    const xfm = slot.model.transformer orelse {
+        refuse("transformer_unavailable");
+        return null;
+    };
+    if (gen.mtp_cache != null) {
+        if (gen.mtpModuleHeadReleased()) {
+            refuse("mtp_head_released");
+            return null;
+        }
+        if (gate == .mtp_history_gap) {
+            const mtp_end = gen.mtp_position_base +| mtp_committed;
+            log.info("[hot-cache] decode-end checkpoint skipped: mtp_history_gap head_end={d} committed_end={d}\n", .{ mtp_end, total_len });
+            return null;
+        }
+        const mc = &gen.mtp_cache.?;
+        mc.truncate(mtp_committed, xfm.s) catch |err| {
+            log.info("[hot-cache] decode-end checkpoint skipped: mtp_history_trim_failed {s}\n", .{@errorName(err)});
+            return null;
+        };
+        mc.activate();
+        const head = mc.head() orelse {
+            refuse("mtp_head_unavailable");
+            return null;
+        };
+        if (head.qwen4_mtp) |*hm| {
+            if (hm.cache.step != hm.seq_offset) {
+                log.info("[hot-cache] decode-end checkpoint skipped: mtp_head_step_gap cache={d} history={d}\n", .{ hm.cache.step, hm.seq_offset });
+                return null;
+            }
+        } else {
+            refuse("mtp_qsa_state_unavailable");
+            return null;
+        }
+    }
+    const allocator = gen.ssm_checkpoint_alloc orelse {
+        refuse("checkpoint_allocator_unavailable");
+        return null;
+    };
+    if (gen.ssm_checkpoints.items.len > 0 and gen.ssm_checkpoints.items[gen.ssm_checkpoints.items.len - 1].pos == total_len) return null;
+    var cp = transformer_mod.captureSsmCheckpoint(allocator, entries, total_len, xfm.s) catch |err| {
+        log.info("[hot-cache] decode-end checkpoint skipped: capture_failed {s}\n", .{@errorName(err)});
+        return null;
+    };
+    gen.ssm_checkpoints.append(allocator, cp) catch |err| {
+        cp.deinit(allocator);
+        log.info("[hot-cache] decode-end checkpoint skipped: list_allocation_failed {s}\n", .{@errorName(err)});
+        return null;
+    };
+    log.info("[hot-cache] decode-end checkpoint captured cp@{d} generated={d} policy={s}\n", .{ total_len, gen.generated_ids.items.len, @tagName(hc.cp_thin) });
+    return total_len;
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -2918,8 +3020,9 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
     settleThoughtPoint(slot, gen_ptr);
-    const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
-    const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
+    const decode_end_checkpoint = captureQwenDecodeEndCheckpoint(slot, gen_ptr, hc, total_len);
+    var ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
+    var ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
         // Empty list — free the (zero-length) slice we got back so the
         // allocator's bookkeeping stays clean.
@@ -2943,6 +3046,26 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
                         log.warn("[hot-cache] QSA history handoff failed: {s} — committing without it\n", .{@errorName(err)});
                     };
                 }
+            }
+        }
+        if (decode_end_checkpoint) |pos| {
+            const cp = &cps[cps.len - 1];
+            if (cp.pos == pos and !transformer_mod.checkpointQsaCoversPos(cp, cp, pos)) {
+                log.info("[hot-cache] decode-end checkpoint skipped: qsa_history_incomplete cp@{d}\n", .{pos});
+                var rejected = ssm_cps_slice[ssm_cps_slice.len - 1];
+                rejected.deinit(gen_ptr.ssm_checkpoint_alloc.?);
+                ssm_cps_slice = ssm_cps_slice[0 .. ssm_cps_slice.len - 1];
+                ssm_cps_opt = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
+            } else if (hc.ssm_checkpoint_max > 0) {
+                while (ssm_cps_slice.len > hc.ssm_checkpoint_max) {
+                    const drop = transformer_mod.ssmCheckpointDropIndex(ssm_cps_slice, hc.cp_thin, null);
+                    var removed = ssm_cps_slice[drop];
+                    log.debug("[hot-cache] checkpoint removed cp@{d}: count_policy={s}\n", .{ removed.pos, @tagName(hc.cp_thin) });
+                    removed.deinit(gen_ptr.ssm_checkpoint_alloc.?);
+                    if (drop + 1 < ssm_cps_slice.len) std.mem.copyForwards(transformer_mod.SSMCheckpoint, ssm_cps_slice[drop .. ssm_cps_slice.len - 1], ssm_cps_slice[drop + 1 ..]);
+                    ssm_cps_slice = ssm_cps_slice[0 .. ssm_cps_slice.len - 1];
+                }
+                ssm_cps_opt = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
             }
         }
     }
@@ -2974,6 +3097,11 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
             break :blk null;
         };
+        if (decode_end_checkpoint != null and gen_ptr.mtp_position_base +| committed == total_len) {
+            slot.model.transformer.?.qwen4MtpMarkQsaLeftover(total_len -| gen_ptr.mtp_position_base) catch |err| {
+                log.debug("[qwen4] decode-end MTP QSA mark unavailable: {s}\n", .{@errorName(err)});
+            };
+        }
         // The qwen4_exp in-checkpoint head also commits its QSA half.
         mc.activate();
         const head = mc.head();
@@ -3870,6 +3998,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .dspark_enabled = use_dspark,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
+            .ssm_checkpoint_retention = if (slot.model.prefix_cache) |*cache| cache.cp_thin else null,
             .ssm_checkpoint_pos_offset = hot_matched,
             // The encoded rows start at the first block the restore does not cover: the splice
             // resumes at the placeholder rows the restored prefix holds of them.
@@ -5298,6 +5427,13 @@ test "prefix-cache commit declines a pad-only generation, never a zero-token one
     try testing.expect(!commitDeclinesPadOnly(0, false));
     try testing.expect(commitDeclinesPadOnly(3, true));
     try testing.expect(!commitDeclinesPadOnly(3, false));
+}
+
+test "decode-end checkpoint gate requires exact KV and MTP committed boundaries" {
+    try testing.expectEqual(DecodeEndCheckpointGate.ready, decodeEndCheckpointGate(64_148, 64_148, false, 0, 0));
+    try testing.expectEqual(DecodeEndCheckpointGate.cache_position_mismatch, decodeEndCheckpointGate(64_149, 64_148, false, 0, 0));
+    try testing.expectEqual(DecodeEndCheckpointGate.ready, decodeEndCheckpointGate(64_148, 64_148, true, 32_768, 31_380));
+    try testing.expectEqual(DecodeEndCheckpointGate.mtp_history_gap, decodeEndCheckpointGate(64_148, 64_148, true, 32_768, 31_379));
 }
 
 test "a speculative block ending on EOS records the stop token and leaves it out of the count" {

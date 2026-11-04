@@ -1567,6 +1567,7 @@ pub const Generator = struct {
         /// Cap on retained checkpoints. Past it the list is thinned span-preservingly
         /// (`transformer.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
         ssm_checkpoint_max: u32 = 16,
+        ssm_checkpoint_retention: ?transformer_mod.ThinPolicy = null,
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
         /// scheduler restored some prefix and now forwards only the tail),
@@ -1945,8 +1946,8 @@ pub const Generator = struct {
             // far (~7.75 GB at 458k on qwen4_exp, #353). Same number the admission guard billed
             // (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after
             // a prefix-cache hit. `cp_thin` names this site's previous retention policy.
-            const cp_thin: transformer_mod.ThinPolicy =
-                if (xfm.config.longCtxGated() or glm_request != null) .min_span_recency else .oldest;
+            const cp_thin: transformer_mod.ThinPolicy = options.ssm_checkpoint_retention orelse
+                (if (xfm.config.longCtxGated() or glm_request != null) .min_span_recency else .oldest);
 
             const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, s);
             // The arch's own per-request buffers reserve at the same length.
@@ -2173,6 +2174,7 @@ pub const Generator = struct {
                         doomed.deinit(allocator);
                         return e;
                     };
+                    log.debug("  [hot-cache] checkpoint captured cp@{d} origin=prefill\n", .{abs_end_for_cp2});
                     ssm_cp_peak = @max(ssm_cp_peak, @as(u32, @intCast(ssm_checkpoints.items.len)));
                     // The head's own QSA leftover at this position: its ring is 32 rows and
                     // the clamp back to this checkpoint comes a whole generated tail later.
@@ -2287,6 +2289,7 @@ pub const Generator = struct {
                         doomed.deinit(allocator);
                         return e;
                     };
+                    log.debug("  [hot-cache] checkpoint captured cp@{d} origin=prefill_end\n", .{final_abs});
                     // DeepSeek's shared point leaves before the final span appends to the rows it views.
                     if (xfm.dsv41 != null) if (options.write_through_hook) |wt| wt.call(wt.ctx, final_abs, ssm_checkpoints.items);
                     ssm_cp_peak = @max(ssm_cp_peak, @as(u32, @intCast(ssm_checkpoints.items.len)));

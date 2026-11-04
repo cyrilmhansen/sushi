@@ -790,6 +790,9 @@ pub const SSMCheckpoint = struct {
     /// the SSM state, so the model behaves as if it had only seen the first
     /// `pos` tokens of the prompt.
     pos: usize,
+    /// Monotonic process-local recency stamp. Updated only when this exact checkpoint
+    /// successfully restores; new checkpoints are stamped at capture. Metadata only.
+    last_used: u64 = 0,
     /// Per-layer SSM snapshots — same length as `ctx.ssm_entries`. Non-SSM
     /// layers (plain attention) get a null-handle snapshot which is a no-op
     /// in `ssmRestore`.
@@ -822,6 +825,16 @@ pub const SSMCheckpoint = struct {
         self.released_bytes = 0;
     }
 };
+
+var checkpoint_recency_clock = std.atomic.Value(u64).init(1);
+
+fn nextCheckpointRecency() u64 {
+    return checkpoint_recency_clock.fetchAdd(1, .monotonic) + 1;
+}
+
+pub fn touchCheckpoint(cp: *SSMCheckpoint) void {
+    cp.last_used = nextCheckpointRecency();
+}
 
 /// Checkpoint states one Qwen request holds in RAM when an SSD tier backs its cache: a write-through prefill
 /// holds two (the one before the newest, until its file is written, and the one just captured); a request
@@ -913,7 +926,7 @@ pub fn captureSsmCheckpoint(
         }
         if (count > 0) _ = mlx.mlx_eval(vec);
     }
-    return .{ .pos = pos, .layers = layers };
+    return .{ .pos = pos, .last_used = nextCheckpointRecency(), .layers = layers };
 }
 
 /// Force a REAL copy of `x` into a freshly allocated buffer. `mlx_copy` and
@@ -1007,7 +1020,7 @@ pub fn shareSsmCheckpoint(allocator: std.mem.Allocator, cp: *const SSMCheckpoint
         layers[i] = out;
         built = i + 1;
     }
-    return .{ .pos = cp.pos, .layers = layers, .released_bytes = cp.released_bytes };
+    return .{ .pos = cp.pos, .last_used = cp.last_used, .layers = layers, .released_bytes = cp.released_bytes };
 }
 
 /// Restore every layer of `ssm_entries` from `cp`. Mirrors the per-layer
@@ -1041,8 +1054,9 @@ pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
 /// behaviour: `.oldest` (prefill capture, disk tier), `.min_span` (hot-cache merge/shed),
 /// `.min_span_recency` (`.min_span` plus a dense newest quarter; long-context models),
 /// `.min_span_recent_tail` also keeps the newest two interior positions dense in short lists
-/// (RAM-only Qwen, where a thought checkpoint can sit just beyond the next prompt's match).
-pub const ThinPolicy = enum { oldest, min_span, min_span_recency, min_span_recent_tail };
+/// (RAM-only Qwen, where a thought checkpoint can sit just beyond the next prompt's match),
+/// `.lru` drops the least recently restored checkpoint; equal stamps drop lower positions first.
+pub const ThinPolicy = enum { oldest, min_span, min_span_recency, min_span_recent_tail, lru };
 
 /// The checkpoint index to drop when a retention list is over its cap: the interior position
 /// whose removal widens the coverage gap least; index 0 and the last are always kept. One
@@ -1070,7 +1084,7 @@ pub fn spanPreservingDropIndex(
             items.len - 2
         else
             items.len,
-        .oldest, .min_span => items.len,
+        .oldest, .min_span, .lru => items.len,
     };
     var best_at: usize = 1;
     var best_span: usize = std.math.maxInt(usize);
@@ -1104,6 +1118,19 @@ fn usizePosOf(p: *const usize) usize {
 
 /// `spanPreservingDropIndex` over a checkpoint list.
 pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy, protect: ?usize) usize {
+    if (policy == .lru) {
+        var picked: ?usize = null;
+        for (cps, 0..) |cp, i| {
+            if (protect != null and i == protect.?) continue;
+            const current = picked orelse {
+                picked = i;
+                continue;
+            };
+            if (cp.last_used < cps[current].last_used or
+                (cp.last_used == cps[current].last_used and cp.pos < cps[current].pos)) picked = i;
+        }
+        return picked orelse 0;
+    }
     return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect);
 }
 
@@ -1397,6 +1424,33 @@ test "ssm retention: RAM-only Qwen policy keeps the nearest recent checkpoint un
     try testing.expect(recent_tail[recent_tail_n - 2] - 32_768 > standard[standard_n - 2] - 32_768);
     try testing.expectEqual(@as(usize, 32_768), recent_tail[0]);
     try testing.expectEqual(@as(usize, 63_320), recent_tail[recent_tail_n - 1]);
+}
+
+test "ssm retention: LRU follows successful checkpoint access, not position or creation order" {
+    const created = [_]u64{ nextCheckpointRecency(), nextCheckpointRecency(), nextCheckpointRecency(), nextCheckpointRecency() };
+    var cps = [_]SSMCheckpoint{
+        .{ .pos = 10, .last_used = created[0], .layers = &.{} },
+        .{ .pos = 20, .last_used = created[1], .layers = &.{} },
+        .{ .pos = 90, .last_used = created[2], .layers = &.{} },
+        .{ .pos = 91, .last_used = created[3], .layers = &.{} },
+    };
+    touchCheckpoint(&cps[0]); // old position, but most recently restored
+    try testing.expect(cps[0].last_used > cps[3].last_used);
+    try testing.expectEqual(@as(usize, 1), ssmCheckpointDropIndex(&cps, .lru, null));
+    try testing.expectEqual(@as(usize, 0), ssmCheckpointDropIndex(&cps, .oldest, null));
+    try testing.expectEqual(@as(usize, 2), ssmCheckpointDropIndex(&cps, .min_span_recency, null));
+
+    const created_a = nextCheckpointRecency();
+    const created_b = nextCheckpointRecency();
+    try testing.expect(created_b > created_a); // never-restored captures still have an age
+
+    const t = testing.allocator;
+    const shared = try shareSsmCheckpoint(t, &cps[0]);
+    defer {
+        var owned = shared;
+        owned.deinit(t);
+    }
+    try testing.expectEqual(cps[0].last_used, shared.last_used);
 }
 
 test "hidden capture: a verify's stays lazy for its one dispatch, a prefill chunk's is settled" {
