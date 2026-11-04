@@ -116,6 +116,25 @@ pub fn mtpCommittedLen(cache_step: usize, pre_draft_off0: ?usize, stash_off0: ?u
     return committed;
 }
 
+/// Request-boundary plan for making only verified MTP history eligible for a
+/// snapshot. A pending pre-draft is discarded at its origin; a verified stash
+/// may be forwarded once. `committed_len` never includes either speculative
+/// draft rows or a stash that has not yet been applied.
+pub const MtpHistoryFinalizePlan = struct {
+    committed_len: usize,
+    discard_pre_draft: bool,
+    apply_stash: bool,
+};
+
+pub fn mtpHistoryFinalizePlan(cache_step: usize, pre_draft_off0: ?usize, stash_off0: ?usize, head_released: bool) ?MtpHistoryFinalizePlan {
+    if (head_released) return null;
+    return .{
+        .committed_len = mtpCommittedLen(cache_step, pre_draft_off0, stash_off0),
+        .discard_pre_draft = pre_draft_off0 != null,
+        .apply_stash = stash_off0 != null,
+    };
+}
+
 /// `mtpCommittedLen` over this Generator's live state; 0 when MTP is
 /// not active.
 pub fn mtpCommittedHistoryLen(self: *const Generator) usize {
@@ -2916,6 +2935,23 @@ test "mtpCommittedLen: speculative tails (pre-draft, stash) bound the committabl
     try testing.expectEqual(@as(usize, 43), Generator.mtpCommittedLen(47, 43, null));
     // Both live: the min wins.
     try testing.expectEqual(@as(usize, 40), Generator.mtpCommittedLen(47, 43, 40));
+}
+
+test "MTP request-boundary finalize plan excludes speculative tails and only applies verified stash" {
+    const stash = Generator.mtpHistoryFinalizePlan(46, null, 40, false).?;
+    try testing.expectEqual(@as(usize, 40), stash.committed_len);
+    try testing.expect(!stash.discard_pre_draft);
+    try testing.expect(stash.apply_stash);
+
+    const pre_draft = Generator.mtpHistoryFinalizePlan(47, 43, null, false).?;
+    try testing.expectEqual(@as(usize, 43), pre_draft.committed_len);
+    try testing.expect(pre_draft.discard_pre_draft);
+    try testing.expect(!pre_draft.apply_stash);
+
+    const accepted = Generator.mtpHistoryFinalizePlan(42, null, null, false).?;
+    try testing.expectEqual(@as(usize, 42), accepted.committed_len);
+    try testing.expect(!accepted.discard_pre_draft and !accepted.apply_stash);
+    try testing.expect(Generator.mtpHistoryFinalizePlan(42, null, 40, true) == null);
 }
 
 test "mtpRoundOff0: a pending history stash overrides the stale cache length" {

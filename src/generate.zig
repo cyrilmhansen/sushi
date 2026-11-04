@@ -3842,6 +3842,7 @@ pub const Generator = struct {
     pub const mtpChainDispatchBatched = mtp_round.mtpChainDispatchBatched;
     pub const mtpChainInit = mtp_round.mtpChainInit;
     pub const mtpCommittedHistoryLen = mtp_round.mtpCommittedHistoryLen;
+    pub const mtpHistoryFinalizePlan = mtp_round.mtpHistoryFinalizePlan;
     pub const mtpCommittedLen = mtp_round.mtpCommittedLen;
     pub const mtpDetachHead = mtp_round.mtpDetachHead;
     pub const mtpDraftActiveRows = mtp_round.mtpDraftActiveRows;

@@ -2874,14 +2874,13 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
     return n_gen > 0 and all_pad;
 }
 
-pub const DecodeEndCheckpointGate = enum { ready, trunk_position_mismatch, mtp_history_gap };
+pub const DecodeEndCheckpointGate = enum { ready, trunk_position_mismatch };
 
 /// For Qwen GDN the logical position advances independently of `KVCache.step`:
 /// layer zero is linear and does not maintain that counter. `trunk_position`
 /// must therefore be the model's forwarded recurrent offset (`moe_seq_offset`).
-pub fn decodeEndCheckpointGate(trunk_position: usize, committed_end: usize, mtp_active: bool, mtp_base: usize, mtp_committed: usize) DecodeEndCheckpointGate {
+pub fn decodeEndCheckpointGate(trunk_position: usize, committed_end: usize) DecodeEndCheckpointGate {
     if (trunk_position != committed_end) return .trunk_position_mismatch;
-    if (mtp_active and mtp_base +| mtp_committed != committed_end) return .mtp_history_gap;
     return .ready;
 }
 
@@ -2890,16 +2889,23 @@ pub fn decodeEndCompletionAllowed(reason: []const u8, mlx_error: bool, cancelled
     return std.mem.eql(u8, reason, "stop") or std.mem.eql(u8, reason, "length");
 }
 
+pub const DecodeEndCheckpoint = struct {
+    pos: usize,
+    mtp_snapshot_safe: bool = false,
+    mtp_history_complete: bool = false,
+};
+
 /// Capture an additional decode-end restore point only when the committed token
 /// boundary is unambiguous. The existing cache admission and merge paths still
 /// enforce checkpoint count and byte budgets.
 fn captureQwenDecodeEndCheckpoint(
+    sch: *Scheduler,
     slot: *Slot,
     gen: *generate_mod.Generator,
     hc: *prefix_cache_mod.HotPrefixCache,
     total_len: usize,
     completion_reason: ?[]const u8,
-) ?usize {
+) ?DecodeEndCheckpoint {
     const cfg = slot.model.config orelse return null;
     if (!cfg.isQwen4() or !hc.ram_enabled or hc.disk != null) return null;
     const refuse = struct {
@@ -2920,11 +2926,34 @@ fn captureQwenDecodeEndCheckpoint(
         refuse("media_state_not_supported");
         return null;
     }
-    const mtp_committed = if (gen.mtp_cache != null) gen.mtpCommittedHistoryLen() else 0;
     const trunk_position = slot.moe_seq_offset;
-    const gate = decodeEndCheckpointGate(trunk_position, total_len, gen.mtp_cache != null, gen.mtp_position_base, mtp_committed);
+    const gate = decodeEndCheckpointGate(trunk_position, total_len);
     if (gate == .trunk_position_mismatch) {
-        log.info("[hot-cache] decode-end checkpoint skipped: trunk_position_mismatch forwarded={d} committed={d} kv_step={d}\n", .{ trunk_position, total_len, slot.cache.step });
+        const delta = if (trunk_position > total_len) trunk_position - total_len else total_len - trunk_position;
+        // Do not call mtpCommittedHistoryLen after sticky serial release: its
+        // step accessor activates the module head, which another slot may own.
+        const mtp_head_end: ?usize = if (gen.mtp_cache != null and !gen.mtpModuleHeadReleased())
+            gen.mtp_position_base +| gen.mtpCommittedHistoryLen()
+        else
+            null;
+        log.info("[hot-cache] decode-end checkpoint skipped: trunk_position_mismatch direction={s} forwarded={d} committed_end={d} delta={d} kv_step={d} generated={d} completion={d} gen_step={d} pending_token={} pending_logits={} mtp_head_end={any} mtp_pre_draft={} mtp_stash={} mtp_released={} spec_disabled={} serial_exit={s}\n", .{
+            if (trunk_position > total_len) "ahead" else "behind",
+            trunk_position,
+            total_len,
+            delta,
+            slot.cache.step,
+            gen.generated_ids.items.len,
+            slot.completion_tokens,
+            gen.step,
+            gen.has_pending_token,
+            gen.has_pending_logits,
+            mtp_head_end,
+            gen.mtp_pre_draft != null,
+            gen.mtp_hist_stash != null,
+            gen.mtpModuleHeadReleased(),
+            gen.spec_disabled_runtime,
+            @tagName(gen.mtp_serial_exit),
+        });
         return null;
     }
     const entries = slot.ssm_entries orelse {
@@ -2939,34 +2968,66 @@ fn captureQwenDecodeEndCheckpoint(
         refuse("transformer_unavailable");
         return null;
     };
-    if (gen.mtp_cache != null) {
+    var mtp_snapshot_safe = false;
+    var mtp_history_complete = false;
+    if (gen.mtp_cache) |*mc| {
         if (gen.mtpModuleHeadReleased()) {
-            refuse("mtp_head_released");
-            return null;
-        }
-        if (gate == .mtp_history_gap) {
-            const mtp_end = gen.mtp_position_base +| mtp_committed;
-            log.info("[hot-cache] decode-end checkpoint skipped: mtp_history_gap head_end={d} committed_end={d}\n", .{ mtp_end, total_len });
-            return null;
-        }
-        const mc = &gen.mtp_cache.?;
-        mc.truncate(mtp_committed, xfm.s) catch |err| {
-            log.info("[hot-cache] decode-end checkpoint skipped: mtp_history_trim_failed {s}\n", .{@errorName(err)});
-            return null;
-        };
-        mc.activate();
-        const head = mc.head() orelse {
-            refuse("mtp_head_unavailable");
-            return null;
-        };
-        if (head.qwen4_mtp) |*hm| {
-            if (hm.cache.step != hm.seq_offset) {
-                log.info("[hot-cache] decode-end checkpoint skipped: mtp_head_step_gap cache={d} history={d}\n", .{ hm.cache.step, hm.seq_offset });
-                return null;
+            log.info("[hot-cache] decode-end MTP snapshot unavailable: module_head_released; retaining trunk checkpoint\n", .{});
+        } else if (!generate_mod.mtpHeadPersistEnabled()) {
+            log.debug("[hot-cache] decode-end MTP snapshot disabled; retaining trunk checkpoint\n", .{});
+        } else if (generate_mod.Generator.mtpHistoryFinalizePlan(
+            mc.step(),
+            if (gen.mtp_pre_draft) |pd| pd.off0 else null,
+            if (gen.mtp_hist_stash) |stash| stash.off0 else null,
+            false,
+        )) |plan| {
+            var finalize_ok = true;
+            var finalize_ms: f32 = 0;
+            if (plan.discard_pre_draft or plan.apply_stash) {
+                var finalize_sw = io_util.Stopwatch.init(sch.io);
+                // A Qwen pre-draft has already appended its speculative rows to
+                // the head cache. Clamp to its recorded origin before freeing it;
+                // other architectures retain their existing detach semantics.
+                if (plan.discard_pre_draft and cfg.isQwen4()) {
+                    mc.truncate(plan.committed_len, xfm.s) catch |err| {
+                        log.info("[hot-cache] decode-end MTP pre-draft discard failed: {s}\n", .{@errorName(err)});
+                        finalize_ok = false;
+                    };
+                }
+                if (finalize_ok) gen.mtpDetachHead(slot.allocator, plan.apply_stash) catch |err| {
+                    log.info("[hot-cache] decode-end MTP history finalization failed: {s}\n", .{@errorName(err)});
+                    finalize_ok = false;
+                };
+                finalize_ms = @as(f32, @floatFromInt(finalize_sw.read())) / std.time.ns_per_ms;
+            }
+            if (finalize_ok and gen.mtp_hist_stash == null and gen.mtp_pre_draft == null) {
+                mc.activate();
+                const committed = gen.mtpCommittedHistoryLen();
+                if (mc.head()) |head| {
+                    if (head.qwen4_mtp) |*hm| {
+                        if (hm.cache.step == hm.seq_offset) {
+                            mtp_snapshot_safe = true;
+                            mtp_history_complete = gen.mtp_position_base +| committed == total_len;
+                            if (!mtp_history_complete) {
+                                const mtp_end = gen.mtp_position_base +| committed;
+                                log.info("[hot-cache] decode-end MTP history short head_end={d} trunk_end={d} missing={d}; keeping valid trunk checkpoint\n", .{ mtp_end, total_len, total_len -| mtp_end });
+                            }
+                            if (finalize_ms > 0) log.info("[hot-cache] decode-end MTP history finalized stash={} predraft={} ms={d:.2} head_end={d}\n", .{ plan.apply_stash, plan.discard_pre_draft, finalize_ms, gen.mtp_position_base +| committed });
+                        } else {
+                            log.info("[hot-cache] decode-end MTP snapshot unavailable: mtp_head_state_gap cache={d} history={d}; keeping valid trunk checkpoint\n", .{ hm.cache.step, hm.seq_offset });
+                        }
+                    } else {
+                        log.info("[hot-cache] decode-end MTP snapshot unavailable: qsa_head_unavailable; keeping valid trunk checkpoint\n", .{});
+                    }
+                } else {
+                    log.info("[hot-cache] decode-end MTP snapshot unavailable: mtp_head_unavailable; keeping valid trunk checkpoint\n", .{});
+                }
+            } else if (finalize_ok) {
+                const remaining_end = gen.mtp_position_base +| gen.mtpCommittedHistoryLen();
+                log.info("[hot-cache] decode-end MTP snapshot unavailable: deferred_history_remains stash={} predraft={} head_end={d} trunk_end={d} missing={d}; keeping valid trunk checkpoint\n", .{ gen.mtp_hist_stash != null, gen.mtp_pre_draft != null, remaining_end, total_len, total_len -| remaining_end });
             }
         } else {
-            refuse("mtp_qsa_state_unavailable");
-            return null;
+            log.info("[hot-cache] decode-end MTP snapshot unavailable: finalize_plan_unavailable; keeping valid trunk checkpoint\n", .{});
         }
     }
     const allocator = gen.ssm_checkpoint_alloc orelse {
@@ -2983,8 +3044,8 @@ fn captureQwenDecodeEndCheckpoint(
         log.info("[hot-cache] decode-end checkpoint skipped: list_allocation_failed {s}\n", .{@errorName(err)});
         return null;
     };
-    log.info("[hot-cache] decode-end checkpoint candidate pos={d} forwarded={d} committed={d} mtp_head={s} qsa=handoff_pending policy={s}\n", .{ total_len, trunk_position, gen.generated_ids.items.len, if (gen.mtp_cache != null) "aligned" else "inactive", @tagName(hc.cp_thin) });
-    return total_len;
+    log.info("[hot-cache] decode-end checkpoint candidate pos={d} forwarded={d} committed={d} mtp_head={s} qsa=handoff_pending policy={s}\n", .{ total_len, trunk_position, gen.generated_ids.items.len, if (mtp_snapshot_safe) "consistent" else "blind", @tagName(hc.cp_thin) });
+    return .{ .pos = total_len, .mtp_snapshot_safe = mtp_snapshot_safe, .mtp_history_complete = mtp_history_complete };
 }
 
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
@@ -3042,7 +3103,7 @@ pub fn commitSlotIfApplicableWithReason(sch: *Scheduler, slot: *Slot, completion
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
     settleThoughtPoint(slot, gen_ptr);
-    const decode_end_checkpoint = captureQwenDecodeEndCheckpoint(slot, gen_ptr, hc, total_len, completion_reason);
+    const decode_end_checkpoint = captureQwenDecodeEndCheckpoint(sch, slot, gen_ptr, hc, total_len, completion_reason);
     var ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
     var ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
@@ -3070,7 +3131,8 @@ pub fn commitSlotIfApplicableWithReason(sch: *Scheduler, slot: *Slot, completion
                 }
             }
         }
-        if (decode_end_checkpoint) |pos| {
+        if (decode_end_checkpoint) |checkpoint| {
+            const pos = checkpoint.pos;
             const cp = &cps[cps.len - 1];
             if (cp.pos == pos and !transformer_mod.checkpointQsaCoversPos(cp, cp, pos)) {
                 log.info("[hot-cache] decode-end checkpoint skipped: qsa_history_incomplete cp@{d}\n", .{pos});
@@ -3111,6 +3173,12 @@ pub fn commitSlotIfApplicableWithReason(sch: *Scheduler, slot: *Slot, completion
     // draft tail first (offset-only, cheap).
     const mtp_commit: ?prefix_cache_mod.DflashCommit = blk: {
         const mc = if (gen_ptr.mtp_cache) |*m| m else break :blk null;
+        if (decode_end_checkpoint) |checkpoint| {
+            if (!checkpoint.mtp_snapshot_safe) {
+                log.debug("[hot-cache] MTP sidecar omitted: checkpoint-boundary head state is unavailable or inconsistent\n", .{});
+                break :blk null;
+            }
+        }
         // A released module head is another slot's to read now; the history stopped
         // growing at the switch anyway.
         if (gen_ptr.mtpModuleHeadReleased()) break :blk null;
@@ -3120,9 +3188,10 @@ pub fn commitSlotIfApplicableWithReason(sch: *Scheduler, slot: *Slot, completion
             log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
             break :blk null;
         };
-        if (decode_end_checkpoint != null and gen_ptr.mtp_position_base +| committed == total_len) {
+        if (decode_end_checkpoint != null and decode_end_checkpoint.?.mtp_history_complete and gen_ptr.mtp_position_base +| committed == total_len) {
             slot.model.transformer.?.qwen4MtpMarkQsaLeftover(total_len -| gen_ptr.mtp_position_base) catch |err| {
-                log.debug("[qwen4] decode-end MTP QSA mark unavailable: {s}\n", .{@errorName(err)});
+                log.info("[hot-cache] MTP sidecar omitted: decode-end QSA mark unavailable ({s}); trunk checkpoint remains valid\n", .{@errorName(err)});
+                break :blk null;
             };
         }
         // The qwen4_exp in-checkpoint head also commits its QSA half.
@@ -5452,12 +5521,17 @@ test "prefix-cache commit declines a pad-only generation, never a zero-token one
     try testing.expect(!commitDeclinesPadOnly(3, false));
 }
 
-test "decode-end checkpoint gate uses forwarded hybrid trunk and exact MTP history boundaries" {
+test "decode-end checkpoint gate uses forwarded hybrid trunk independently of MTP restore coverage" {
     // Qwen GDN's cache.step may remain zero/stale; the forwarded offset is authoritative.
-    try testing.expectEqual(DecodeEndCheckpointGate.ready, decodeEndCheckpointGate(64_148, 64_148, false, 0, 0));
-    try testing.expectEqual(DecodeEndCheckpointGate.trunk_position_mismatch, decodeEndCheckpointGate(64_149, 64_148, false, 0, 0));
-    try testing.expectEqual(DecodeEndCheckpointGate.ready, decodeEndCheckpointGate(64_148, 64_148, true, 32_768, 31_380));
-    try testing.expectEqual(DecodeEndCheckpointGate.mtp_history_gap, decodeEndCheckpointGate(64_148, 64_148, true, 32_768, 31_379));
+    try testing.expectEqual(DecodeEndCheckpointGate.ready, decodeEndCheckpointGate(64_148, 64_148));
+    try testing.expectEqual(DecodeEndCheckpointGate.trunk_position_mismatch, decodeEndCheckpointGate(64_149, 64_148));
+    // A serial-fallback trunk two tokens ahead remains a hard refusal; no counter is rewritten.
+    try testing.expectEqual(DecodeEndCheckpointGate.trunk_position_mismatch, decodeEndCheckpointGate(70_628, 70_626));
+    // The same valid trunk point remains eligible when an optional MTP history is short.
+    try testing.expectEqual(DecodeEndCheckpointGate.ready, decodeEndCheckpointGate(64_148, 64_148));
+    const short_head = generate_mod.Generator.mtpHistoryFinalizePlan(31_379, null, null, false).?;
+    try testing.expectEqual(@as(usize, 31_379), short_head.committed_len);
+    try testing.expect(32_768 + short_head.committed_len < 64_148);
 }
 
 test "decode-end completion accepts speculative EOS before generator done, rejects unsafe endings" {
