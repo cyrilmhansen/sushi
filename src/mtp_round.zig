@@ -1348,7 +1348,12 @@ pub fn mtpSerialTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterSt
             },
         }
     }
-    const tok = try self.next(allocator) orelse return null;
+    // The ordinary Generator pipeline forwards a sampled successor before it
+    // resolves the pending token. In a serial block that puts EOS itself and
+    // its successor through the recurrent trunk before stop is observed. Keep
+    // the MTP exit ramp's drain/capture logic above unchanged; clean plain
+    // serial ticks use the terminal-checked path.
+    const tok = try self.nextMtpSerialChecked(allocator) orelse return null;
     self.observeSerialTick();
     if (self.mtp_serial_left > 0) {
         self.mtp_serial_left -= 1;

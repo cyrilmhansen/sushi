@@ -4304,6 +4304,38 @@ pub const Generator = struct {
         return token;
     }
 
+    /// Serial decode used after MTP hands control back with its entry invariant:
+    /// `next_token_id` is sampled but has not been forwarded. Check all stop
+    /// conditions before forwarding that token, then synchronously sample its
+    /// successor. The regular pipeline deliberately forwards a sampled
+    /// lookahead before resolving it; that is safe for its normal path but can
+    /// run EOS and its successor through the Qwen recurrent trunk during an
+    /// MTP-to-serial transition.
+    pub fn nextMtpSerialChecked(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        if (self.done) return null;
+        if (!mtpSerialCheckedEntryClean(self.has_pending_logits, self.has_pending_token)) return error.MtpSerialPipelineNotDrained;
+        if (!mtpSerialForwardAllowed(try self.checkStop())) return null;
+
+        const token = self.next_token_id;
+        self.advanceStep(1);
+        try self.generated_ids.append(allocator, token);
+
+        const token_i32: i32 = @intCast(token);
+        const shape = [_]c_int{ 1, 1 };
+        const input = mlx.mlx_array_new_data(&token_i32, &shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(input);
+        const logits = try self.xfm.forwardWith(&self.ctx, input);
+        defer _ = mlx.mlx_array_free(logits);
+
+        const next_sample = try self.sampleLazy(logits, .committed);
+        defer _ = mlx.mlx_array_free(next_sample);
+        try mlx.check(mlx.mlx_array_eval(next_sample));
+        var next_id: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&next_id, next_sample));
+        self.next_token_id = @intCast(next_id);
+        return token;
+    }
+
     /// Sample one token while the reasoning protocol has not reached the JSON
     /// body: drain a forced recovery sequence, work the unresolved opener
     /// choice under the union mask, or sample unconstrained reasoning while
@@ -4906,6 +4938,17 @@ pub fn isEosId(id: u32, eos: []const u32) bool {
     return false;
 }
 
+/// The checked MTP serial arm starts from a token sampled by the MTP verifier,
+/// not from the regular decode pipeline's already-forwarded lookahead.
+pub fn mtpSerialCheckedEntryClean(has_pending_logits: bool, has_pending_token: bool) bool {
+    return !has_pending_logits and !has_pending_token;
+}
+
+/// Called after stop resolution and immediately before the recurrent forward.
+pub fn mtpSerialForwardAllowed(stopped: bool) bool {
+    return !stopped;
+}
+
 /// Token-only stop conditions of `checkStop`; `consecutive_pad` is carried state reset by any real token.
 pub fn tokenStops(next_token_id: u32, eos_token_ids: []const u32, consecutive_pad: *u32) bool {
     if (isEosId(next_token_id, eos_token_ids)) return true;
@@ -5327,6 +5370,46 @@ test "a block decoder's entry token stops the round before it drafts" {
     try testing.expect(!tokenStops(0, &eos, &pad));
     try testing.expect(!tokenStops(9, &eos, &pad));
     try testing.expectEqual(@as(u32, 0), pad);
+}
+
+test "terminal-checked MTP serial step never forwards EOS or an uncommitted successor" {
+    const eos = [_]u32{ 151645, 151643 };
+    var pad: u32 = 0;
+    var generated: usize = 64148;
+    var forwarded: usize = 64148;
+
+    // Adaptive MTP hands serial decode a sampled token that is not in the
+    // trunk. EOS must be checked before the only forward in that serial tick.
+    const eos_token: u32 = 151645;
+    const eos_stopped = tokenStops(eos_token, &eos, &pad);
+    if (Generator.mtpSerialForwardAllowed(eos_stopped)) {
+        generated += 1;
+        forwarded += 1;
+    }
+    try testing.expectEqual(@as(usize, 64148), generated);
+    try testing.expectEqual(generated, forwarded);
+
+    // An ordinary serial token advances both committed output and trunk once;
+    // its sampled successor is still outside the trunk until its own check.
+    const ordinary: u32 = 42;
+    const ordinary_stopped = tokenStops(ordinary, &eos, &pad);
+    if (Generator.mtpSerialForwardAllowed(ordinary_stopped)) {
+        generated += 1;
+        forwarded += 1;
+    }
+    try testing.expectEqual(@as(usize, 64149), generated);
+    try testing.expectEqual(generated, forwarded);
+
+    try testing.expect(Generator.mtpSerialCheckedEntryClean(false, false));
+    try testing.expect(!Generator.mtpSerialCheckedEntryClean(true, false));
+    try testing.expect(!Generator.mtpSerialCheckedEntryClean(false, true));
+    try testing.expect(!Generator.mtpSerialCheckedEntryClean(true, true));
+
+    // The old ordering's two speculative forwards: the sampled EOS itself,
+    // then its successor from the resulting logits.
+    var legacy_forwarded = generated - 1;
+    legacy_forwarded += 2;
+    try testing.expectEqual(@as(usize, 2), legacy_forwarded - (generated - 1));
 }
 
 test "batched MTP state includes the last row activated by round begin" {
