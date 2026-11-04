@@ -1039,8 +1039,10 @@ pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
 /// where a warm turn restores from and was measured on qwen4_exp only, so the policy is chosen
 /// by `longCtxGated()` at each site and the ungated value names that site's previous
 /// behaviour: `.oldest` (prefill capture, disk tier), `.min_span` (hot-cache merge/shed),
-/// `.min_span_recency` (`.min_span` plus a dense newest quarter; qwen4_exp).
-pub const ThinPolicy = enum { oldest, min_span, min_span_recency };
+/// `.min_span_recency` (`.min_span` plus a dense newest quarter; long-context models),
+/// `.min_span_recent_tail` also keeps the newest two interior positions dense in short lists
+/// (RAM-only Qwen, where a thought checkpoint can sit just beyond the next prompt's match).
+pub const ThinPolicy = enum { oldest, min_span, min_span_recency, min_span_recent_tail };
 
 /// The checkpoint index to drop when a retention list is over its cap: the interior position
 /// whose removal widens the coverage gap least; index 0 and the last are always kept. One
@@ -1060,10 +1062,16 @@ pub fn spanPreservingDropIndex(
     if (items.len < 3) return 0;
     // Recency bias: the newest quarter stays at capture density (a warm turn that edits near
     // the end restores from there); everything below it is thinned span-preservingly.
-    const scan_end = if (policy == .min_span_recency and items.len >= RECENCY_DENSE_MIN)
-        items.len - items.len / 4
-    else
-        items.len;
+    const scan_end = switch (policy) {
+        .min_span_recency => if (items.len >= RECENCY_DENSE_MIN) items.len - items.len / 4 else items.len,
+        .min_span_recent_tail => if (items.len >= RECENCY_DENSE_MIN)
+            items.len - items.len / 4
+        else if (items.len >= 4)
+            items.len - 2
+        else
+            items.len,
+        .oldest, .min_span => items.len,
+    };
     var best_at: usize = 1;
     var best_span: usize = std.math.maxInt(usize);
     var k: usize = 1;
@@ -1362,6 +1370,33 @@ test "ssm retention: the span-preserving thin keeps both ends and spreads the su
             positionDropIndexUsize(pos12[0..7], .min_span_recency),
         );
     }
+}
+
+test "ssm retention: RAM-only Qwen policy keeps the nearest recent checkpoint under the same count cap" {
+    const Retain = struct {
+        fn toCap(positions: *[5]usize, n: *usize, cap: usize, policy: ThinPolicy) void {
+            while (n.* > cap) {
+                const drop = positionDropIndexUsize(positions[0..n.*], policy);
+                var k = drop;
+                while (k + 1 < n.*) : (k += 1) positions[k] = positions[k + 1];
+                n.* -= 1;
+            }
+        }
+    };
+    const input = [5]usize{ 32_768, 40_960, 49_152, 57_344, 63_320 };
+    var standard = input;
+    var standard_n: usize = input.len;
+    Retain.toCap(&standard, &standard_n, 4, .min_span_recency);
+    var recent_tail = input;
+    var recent_tail_n: usize = input.len;
+    Retain.toCap(&recent_tail, &recent_tail_n, 4, .min_span_recent_tail);
+
+    try testing.expectEqual(standard_n, recent_tail_n);
+    try testing.expectEqual(@as(usize, 49_152), standard[standard_n - 2]);
+    try testing.expectEqual(@as(usize, 57_344), recent_tail[recent_tail_n - 2]);
+    try testing.expect(recent_tail[recent_tail_n - 2] - 32_768 > standard[standard_n - 2] - 32_768);
+    try testing.expectEqual(@as(usize, 32_768), recent_tail[0]);
+    try testing.expectEqual(@as(usize, 63_320), recent_tail[recent_tail_n - 1]);
 }
 
 test "hidden capture: a verify's stays lazy for its one dispatch, a prefill chunk's is settled" {

@@ -145,8 +145,9 @@ fn checkpointDropIndex(items: []const SSMCheckpoint, policy: transformer_mod.Thi
 
 /// Drops checkpoints until at most `max` hold a state (`max` 0 = no cap). A released one is a restore point
 /// already on SSD and costs no memory, so it is never the one dropped nor counted.
-pub fn thinHeldCheckpoints(allocator: std.mem.Allocator, list: *std.ArrayList(SSMCheckpoint), max: u32, policy: transformer_mod.ThinPolicy) void {
-    if (max == 0) return;
+pub fn thinHeldCheckpoints(allocator: std.mem.Allocator, list: *std.ArrayList(SSMCheckpoint), max: u32, policy: transformer_mod.ThinPolicy) ?usize {
+    if (max == 0) return null;
+    var last_dropped: ?usize = null;
     while (true) {
         var held: usize = 0;
         var first: usize = list.items.len;
@@ -155,8 +156,9 @@ pub fn thinHeldCheckpoints(allocator: std.mem.Allocator, list: *std.ArrayList(SS
             held += 1;
             first = @min(first, i);
         }
-        if (held <= max) return;
+        if (held <= max) return last_dropped;
         var dropped = list.orderedRemove(first + checkpointDropIndex(list.items[first..], policy));
+        last_dropped = dropped.pos;
         dropped.deinit(allocator);
     }
 }
@@ -478,12 +480,12 @@ test "the held-state cap thins only states in memory: restore points already on 
     // 130 points written through (their states released), then the newest 20 still held.
     for (0..130) |i| try list.append(al, .{ .pos = 8192 * (i + 1), .layers = &.{}, .released_bytes = 1 });
     for (0..20) |i| try list.append(al, .{ .pos = 8192 * (131 + i), .layers = &.{} });
-    thinHeldCheckpoints(al, &list, 16, .min_span_recency);
+    _ = thinHeldCheckpoints(al, &list, 16, .min_span_recency);
     try testing.expectEqual(@as(usize, 146), list.items.len);
     for (list.items[0..130]) |cp| try testing.expect(cp.isReleased());
     try testing.expectEqual(@as(usize, 8192 * 150), list.items[list.items.len - 1].pos);
     // No cap, nothing thins.
-    thinHeldCheckpoints(al, &list, 0, .min_span_recency);
+    _ = thinHeldCheckpoints(al, &list, 0, .min_span_recency);
     try testing.expectEqual(@as(usize, 146), list.items.len);
 }
 

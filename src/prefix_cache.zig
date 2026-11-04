@@ -94,7 +94,84 @@ pub const MissKind = enum {
 /// how many key-compatible entries it considered and the longest RAW token
 /// match among them. The filter's `continue`s destroy both, which is why a
 /// hybrid miss could not name itself.
-pub const MatchProbe = struct { candidates: usize = 0, best_raw: usize = 0 };
+pub const MatchProbe = struct { candidates: usize = 0, best_raw: usize = 0, best_entry: ?usize = null };
+
+pub const CheckpointPruneReason = enum {
+    none,
+    prefill_limit,
+    checkpoint_limit,
+    memory_budget,
+    inherited_budget,
+    unknown,
+};
+
+pub const ReuseGapReason = enum {
+    none,
+    no_checkpoint_before_match,
+    qsa_history_incomplete,
+    checkpoint_thinned,
+    memory_budget,
+    inherited_budget,
+    snapshot_limit,
+    checkpoint_gap,
+    unknown,
+};
+
+pub const CheckpointFact = struct { pos: usize, restorable: bool };
+
+pub fn highestRestorableFact(facts: []const CheckpointFact, limit: usize) ?usize {
+    var selected: ?usize = null;
+    for (facts) |cp| if (cp.pos <= limit and cp.restorable) {
+        selected = cp.pos;
+    };
+    return selected;
+}
+
+/// Classify only from retained checkpoint facts and known retention provenance. A pruning
+/// reason is used only when its recorded position falls inside the actual reuse gap.
+pub fn reuseGapReason(
+    raw_match: usize,
+    restored: usize,
+    facts: []const CheckpointFact,
+    prune_reason: CheckpointPruneReason,
+    pruned_pos: usize,
+    snapshot_step: usize,
+) ReuseGapReason {
+    if (raw_match -| restored < 1024) return .none;
+    var has_before = false;
+    var qsa_gap = false;
+    var prune_pos_retained = false;
+    for (facts) |cp| {
+        if (cp.pos > raw_match) continue;
+        has_before = true;
+        if (cp.pos > restored and !cp.restorable) qsa_gap = true;
+        if (cp.pos == pruned_pos) prune_pos_retained = true;
+    }
+    if (qsa_gap) return .qsa_history_incomplete;
+    if (pruned_pos > restored and pruned_pos <= raw_match and !prune_pos_retained) return switch (prune_reason) {
+        .prefill_limit, .checkpoint_limit => .checkpoint_thinned,
+        .memory_budget => .memory_budget,
+        .inherited_budget => .inherited_budget,
+        .none, .unknown => .checkpoint_gap,
+    };
+    if (snapshot_step < raw_match and snapshot_step > restored) return .snapshot_limit;
+    if (!has_before) return .no_checkpoint_before_match;
+    return .checkpoint_gap;
+}
+
+fn reuseGapReasonName(reason: ReuseGapReason) []const u8 {
+    return switch (reason) {
+        .none => "none",
+        .no_checkpoint_before_match => "no_checkpoint_before_match",
+        .qsa_history_incomplete => "qsa_history_incomplete",
+        .checkpoint_thinned => "checkpoint_thinned",
+        .memory_budget => "memory_budget",
+        .inherited_budget => "inherited_budget",
+        .snapshot_limit => "snapshot_limit",
+        .checkpoint_gap => "checkpoint_gap",
+        .unknown => "unknown",
+    };
+}
 
 pub fn missKind(candidates: usize, best_raw: usize) MissKind {
     if (candidates == 0) return .cold;
@@ -405,6 +482,10 @@ const Entry = struct {
     /// layers). Folded into `kv_bytes` for the byte-budget accounting so the
     /// memory cap covers both KV and SSM state.
     ssm_bytes: u64 = 0,
+    /// Most recent known reason/position for a checkpoint pruned from this entry. This is
+    /// diagnostic provenance only; it never affects restore eligibility or retention.
+    checkpoint_prune_reason: CheckpointPruneReason = .none,
+    checkpoint_pruned_pos: usize = 0,
     /// DFlash assistant context for this prefix (dflash.zig). The assistant's
     /// K/V is built from trunk hiddens at `target_layer_ids`, and a restore
     /// forwards NOTHING — so without this the assistant starts every reused
@@ -849,6 +930,63 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
+    /// Material, successful hybrid reuse gaps are uncommon and expensive; report enough of the
+    /// retained state to explain them without an allocation, tensor copy, or GPU evaluation.
+    fn logReuseGap(e: *const Entry, raw_match: usize, restored: usize) void {
+        if (raw_match -| restored < 1024) return;
+        var facts: [SHED_SIM_MAX]CheckpointFact = undefined;
+        var fact_n: usize = 0;
+        var retained: usize = 0;
+        var retained_bytes: u64 = 0;
+        var nearest_before: ?usize = null;
+        var nearest_after: ?usize = null;
+        var buf: [1024]u8 = undefined;
+        var n: usize = 0;
+        appendTrimFmt(&buf, &n, "[", .{});
+        if (e.ssm_checkpoints) |cps| for (cps) |*cp| {
+            if (cp.layers.len == 0 or cp.isReleased()) continue;
+            retained += 1;
+            retained_bytes += ssmCheckpointBytes(cp);
+            const source = qsaHistorySource(cps, cp) orelse cp;
+            const restorable = transformer_mod.checkpointQsaCoversPos(cp, source, cp.pos);
+            if (fact_n < facts.len) {
+                facts[fact_n] = .{ .pos = cp.pos, .restorable = restorable };
+                fact_n += 1;
+            }
+            if (cp.pos <= raw_match) {
+                nearest_before = cp.pos;
+            } else if (nearest_after == null) {
+                nearest_after = cp.pos;
+            }
+            if (n > 1) appendTrimFmt(&buf, &n, ",", .{});
+            appendTrimFmt(&buf, &n, "{d}{s}", .{ cp.pos, if (restorable) "" else "?" });
+        };
+        appendTrimFmt(&buf, &n, "]", .{});
+        const reason = reuseGapReason(
+            raw_match,
+            restored,
+            facts[0..fact_n],
+            e.checkpoint_prune_reason,
+            e.checkpoint_pruned_pos,
+            e.snapshot.step,
+        );
+        var line: [1536]u8 = undefined;
+        var used: usize = 0;
+        appendTrimFmt(&line, &used, "  [hot-cache] reuse-gap matched={d} restored={d} lost={d} reason={s} checkpoint_selected={d} checkpoints={s} nearest_before=", .{
+            raw_match,
+            restored,
+            raw_match - restored,
+            reuseGapReasonName(reason),
+            restored,
+            buf[0..n],
+        });
+        if (nearest_before) |pos| appendTrimFmt(&line, &used, "{d}", .{pos}) else appendTrimFmt(&line, &used, "none", .{});
+        appendTrimFmt(&line, &used, " nearest_after=", .{});
+        if (nearest_after) |pos| appendTrimFmt(&line, &used, "{d}", .{pos}) else appendTrimFmt(&line, &used, "none", .{});
+        appendTrimFmt(&line, &used, " retained={d} checkpoint_bytes={d} entry_bytes={d}\n", .{ retained, retained_bytes, e.kv_bytes });
+        log.info("{s}", .{line[0..used]});
+    }
+
     /// Reset every SSM entry to the uninitialized (cold) state. Used on every
     /// miss / failed-restore path so a subsequent prefill starts from a clean
     /// recurrent state instead of stale conv/ssm buffers.
@@ -1263,7 +1401,10 @@ pub const HotPrefixCache = struct {
             // expensive miss, and the only place that fact still exists.
             if (probe) |p| {
                 p.candidates += 1;
-                if (shared > p.best_raw) p.best_raw = shared;
+                if (shared > p.best_raw) {
+                    p.best_raw = shared;
+                    p.best_entry = i;
+                }
             }
 
             // An un-restorable ringed candidate stays eligible at 0, so a lookup with nothing
@@ -1647,6 +1788,7 @@ pub const HotPrefixCache = struct {
             try target_cache.truncate(0, s);
             rec.reset();
             target_moe_seq_offset.* = 0;
+            if (probe.best_entry) |idx| logReuseGap(&self.entries.items[idx], probe.best_raw, 0);
             // The filter dropped every candidate. This arm used to be silent,
             // so a 393k-token prompt that the cache almost had cold-prefilled
             // for 560 s with no `[hot-cache]` line at all. Same phrasing as
@@ -1695,6 +1837,7 @@ pub const HotPrefixCache = struct {
         };
         if (e.ssm_checkpoints) |cps| {
             if (highestCoveringCheckpoint(cps, restore_cap) == null and highestCheckpointAtOrBelow(cps, restore_cap) != null) {
+                logReuseGap(e, m.shared, 0);
                 return error.QsaHistoryGap;
             }
         }
@@ -1801,9 +1944,12 @@ pub const HotPrefixCache = struct {
             // the admission pass. Promoted, the entry would make a usable one the next eviction victim.
             self.last_restored_used = null;
             e.last_used = used_before_restore;
+            logReuseGap(e, m.shared, 0);
             log.info("  [hot-cache] hybrid miss (no checkpoint ≤ {d} of {d}); cold prefill\n", .{ m.shared, prompt_ids.len });
             return .{ .matched = 0, .full_match = false };
         }
+
+        logReuseGap(e, m.shared, effective_matched);
 
         const full_match = effective_matched == prompt_ids.len;
         const final_len: usize = if (full_match and effective_matched > 1) effective_matched - 1 else effective_matched;
@@ -2420,6 +2566,9 @@ pub const HotPrefixCache = struct {
             return err;
         };
 
+        var checkpoint_prune_reason: CheckpointPruneReason = .none;
+        var checkpoint_pruned_pos: usize = 0;
+
         // A commit built on a RESTORED prefix must be at least as restorable
         // as the entry it restored from. The replace path below inherits from
         // the entry it overwrites; a commit that lands as a NEW entry had no
@@ -2452,7 +2601,7 @@ pub const HotPrefixCache = struct {
             }) orelse break :inherit;
             if (eff_cps) |own| {
                 // Consumes both on every path; on error neither survives.
-                const merged = self.mergeCheckpointLists(cloned, own) catch |err| {
+                const merged = self.mergeCheckpointLists(cloned, own, &checkpoint_prune_reason, &checkpoint_pruned_pos) catch |err| {
                     log.warn("  [hot-cache] checkpoint merge failed: {s}\n", .{@errorName(err)});
                     eff_cps = null;
                     new_bytes -= new_ssm_bytes;
@@ -2520,6 +2669,8 @@ pub const HotPrefixCache = struct {
 
         if (replace_idx) |idx| {
             const e = &self.entries.items[idx];
+            const previous_prune_reason = e.checkpoint_prune_reason;
+            const previous_pruned_pos = e.checkpoint_pruned_pos;
 
             // Phase 1: SSM checkpoint inheritance on prefix-extend. The
             // replace path triggers when the new entry's tokens fully
@@ -2541,7 +2692,7 @@ pub const HotPrefixCache = struct {
                 // not touch it.
                 e.ssm_checkpoints = null;
                 const new = eff_cps orelse break :blk old;
-                break :blk self.mergeCheckpointLists(old, new) catch |err| {
+                break :blk self.mergeCheckpointLists(old, new, &checkpoint_prune_reason, &checkpoint_pruned_pos) catch |err| {
                     // The merge consumed both lists, so the entry has no checkpoints to restore from: evict it.
                     self.allocator.free(tokens_owned);
                     var snap = new_snap;
@@ -2599,6 +2750,8 @@ pub const HotPrefixCache = struct {
             new_glm = null;
             e.ssm_checkpoints = merged_cps;
             e.ssm_bytes = merged_ssm_bytes;
+            e.checkpoint_prune_reason = if (checkpoint_prune_reason == .none) previous_prune_reason else checkpoint_prune_reason;
+            e.checkpoint_pruned_pos = if (checkpoint_prune_reason == .none) previous_pruned_pos else checkpoint_pruned_pos;
             e.dflash = new_dflash;
             e.dflash_bytes = new_dflash_bytes;
             e.mtp = new_mtp;
@@ -2657,6 +2810,8 @@ pub const HotPrefixCache = struct {
             .kv_bytes = new_bytes,
             .ssm_checkpoints = eff_cps,
             .ssm_bytes = new_ssm_bytes,
+            .checkpoint_prune_reason = checkpoint_prune_reason,
+            .checkpoint_pruned_pos = checkpoint_pruned_pos,
             .dflash = new_dflash,
             .dflash_bytes = new_dflash_bytes,
             .mtp = new_mtp,
@@ -3243,6 +3398,8 @@ pub const HotPrefixCache = struct {
         self: *HotPrefixCache,
         old: []SSMCheckpoint,
         new: []SSMCheckpoint,
+        prune_reason: *CheckpointPruneReason,
+        pruned_pos: *usize,
     ) !?[]SSMCheckpoint {
         var merged = std.ArrayList(SSMCheckpoint).empty;
         var i: usize = 0;
@@ -3291,6 +3448,9 @@ pub const HotPrefixCache = struct {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
             const drop = transformer_mod.ssmCheckpointDropIndex(merged.items, self.cp_thin, null);
+            prune_reason.* = .checkpoint_limit;
+            pruned_pos.* = merged.items[drop].pos;
+            log.debug("  [hot-cache] checkpoint retention dropped cp@{d}: checkpoint_limit; {d} before, {d} after\n", .{ pruned_pos.*, merged.items.len, merged.items.len - 1 });
             var dropped = merged.orderedRemove(drop);
             dropped.deinit(self.allocator);
         }
@@ -3668,7 +3828,10 @@ pub const HotPrefixCache = struct {
             if (cp.pos > limit) continue;
             const cost = ssmCheckpointBytes(cp);
             if (budget) |b| {
-                if (spent + cost > b) break;
+                if (spent + cost > b) {
+                    log.debug("  [hot-cache] checkpoint inheritance omitted cp@{d}: inherited_budget ({d} needed, {d} available)\n", .{ cp.pos, cost, b -| spent });
+                    break;
+                }
             }
             spent += cost;
             try out.ensureUnusedCapacity(allocator, 1);
@@ -3721,6 +3884,9 @@ pub const HotPrefixCache = struct {
         while (n > 1 and self.current_kv_bytes > self.max_kv_bytes) {
             const drop = transformer_mod.ssmCheckpointDropIndex(cps[0..n], self.cp_thin, null);
             const freed = ssmCheckpointBytes(&cps[drop]);
+            newest.checkpoint_prune_reason = .memory_budget;
+            newest.checkpoint_pruned_pos = cps[drop].pos;
+            log.debug("  [hot-cache] checkpoint retention dropped cp@{d}: memory_budget ({d} bytes)\n", .{ cps[drop].pos, freed });
             if (checkpointHasQsaPooled(&cps[drop])) {
                 if (drop > 0) {
                     sliceQsaHistoryOntoCheckpoint(&cps[drop - 1], &cps[drop], cps[drop - 1].pos, mlx.gpuStream()) catch |err| {
@@ -8016,6 +8182,37 @@ test "prefix cache: a hybrid miss with a raw token match names itself" {
     // At and above it, a cold prefill of that many tokens owes an explanation.
     try testing.expectEqual(MissKind.no_checkpoint, missKind(1, MIN_CANCELLED_COMMIT_TOKENS));
     try testing.expectEqual(MissKind.no_checkpoint, missKind(4, 393_000));
+}
+
+test "prefix cache: reuse-gap diagnosis distinguishes coverage, retention, and snapshot limits" {
+    const raw: usize = 62_798;
+    const full = [_]CheckpointFact{.{ .pos = 62_000, .restorable = true }};
+    try testing.expectEqual(ReuseGapReason.none, reuseGapReason(raw, 61_780, &full, .none, 0, raw));
+
+    const near = [_]CheckpointFact{
+        .{ .pos = 32_768, .restorable = true },
+        .{ .pos = 57_344, .restorable = true },
+        .{ .pos = 63_320, .restorable = true },
+    };
+    try testing.expectEqual(@as(?usize, 57_344), highestRestorableFact(&near, raw));
+    try testing.expectEqual(ReuseGapReason.checkpoint_gap, reuseGapReason(raw, 57_344, &near, .none, 0, 64_148));
+    // The thought point is retained, but it is after the matched text.
+    const thought_only = [_]CheckpointFact{.{ .pos = 63_320, .restorable = true }};
+    try testing.expectEqual(@as(?usize, null), highestRestorableFact(&thought_only, raw));
+    try testing.expectEqual(ReuseGapReason.no_checkpoint_before_match, reuseGapReason(raw, 0, &thought_only, .none, 0, 64_148));
+
+    const qsa_gap = [_]CheckpointFact{
+        .{ .pos = 32_768, .restorable = true },
+        .{ .pos = 57_344, .restorable = false },
+        .{ .pos = 63_320, .restorable = true },
+    };
+    try testing.expectEqual(@as(?usize, 32_768), highestRestorableFact(&qsa_gap, raw));
+    try testing.expectEqual(ReuseGapReason.qsa_history_incomplete, reuseGapReason(raw, 32_768, &qsa_gap, .none, 0, 64_148));
+    try testing.expectEqual(ReuseGapReason.checkpoint_thinned, reuseGapReason(raw, 32_768, &thought_only, .checkpoint_limit, 57_344, 64_148));
+    try testing.expectEqual(ReuseGapReason.memory_budget, reuseGapReason(raw, 32_768, &thought_only, .memory_budget, 57_344, 64_148));
+    try testing.expectEqual(ReuseGapReason.inherited_budget, reuseGapReason(raw, 32_768, &thought_only, .inherited_budget, 57_344, 64_148));
+    try testing.expectEqual(ReuseGapReason.snapshot_limit, reuseGapReason(raw, 32_768, &near, .none, 0, 49_152));
+    try testing.expectEqual(ReuseGapReason.no_checkpoint_before_match, reuseGapReason(raw, 0, &.{}, .none, 0, 64_148));
 }
 
 test "prefix cache: an inherited checkpoint SHARES the donor's buffers and is budget-bounded" {

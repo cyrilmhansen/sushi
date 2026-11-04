@@ -2592,7 +2592,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             entry.prefix_cache.?.prefill_min_tokens = params.prefix_cache_prefill_min_tokens;
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
-        entry.prefix_cache.?.cp_thin = if (params.config.longCtxGated() or params.config.isGlm5() or params.config.isDsv41()) .min_span_recency else .min_span;
+        entry.prefix_cache.?.cp_thin = if (params.config.isQwen4() and ram_prefix_cache and !disk_prefix_cache)
+            .min_span_recent_tail
+        else if (params.config.longCtxGated() or params.config.isGlm5() or params.config.isDsv41())
+            .min_span_recency
+        else
+            .min_span;
         entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
         entry.prefix_cache.?.hybrid = has_ssm_layers or params.config.isGlm5() or params.config.isDsv41();
         if (disk_tier) |tier| {

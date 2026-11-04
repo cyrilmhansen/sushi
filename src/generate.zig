@@ -2184,7 +2184,9 @@ pub const Generator = struct {
                     };
                     // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
                     // the last `max * stride` tokens and left no affordable trim point.
-                    prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
+                    if (prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin)) |dropped_pos| {
+                        log.debug("  [hot-cache] checkpoint retention dropped cp@{d}: prefill_checkpoint_limit ({d} held)\n", .{ dropped_pos, ssm_checkpoints.items.len });
+                    }
                 }
 
                 if (vision_chunked) {
@@ -2296,7 +2298,9 @@ pub const Generator = struct {
                     if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                         log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
-                    prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin);
+                    if (prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin)) |dropped_pos| {
+                        log.debug("  [hot-cache] checkpoint retention dropped cp@{d}: prefill_checkpoint_limit ({d} held)\n", .{ dropped_pos, ssm_checkpoints.items.len });
+                    }
                 }
             }
         }
