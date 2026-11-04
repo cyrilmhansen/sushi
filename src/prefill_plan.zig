@@ -2,6 +2,7 @@ const std = @import("std");
 const transformer_mod = @import("transformer.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const model_mod = @import("model.zig");
+const log = @import("log.zig");
 const SSMCheckpoint = transformer_mod.SSMCheckpoint;
 const testing = std.testing;
 const generate = @import("generate.zig");
@@ -139,13 +140,13 @@ pub fn requestPrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slidin
 /// whole, so a checkpoint past the first media row restores like any other and the generic
 /// span-preserving thinning decides; protecting the boundary's checkpoint instead dropped every
 /// one above it, which is exactly the state an image-bearing turn restores from next time.
-fn checkpointDropIndex(items: []const SSMCheckpoint, policy: transformer_mod.ThinPolicy) usize {
-    return transformer_mod.ssmCheckpointDropIndex(items, policy, null);
+fn checkpointDropIndex(items: []const SSMCheckpoint, policy: transformer_mod.ThinPolicy, anchor_tokens: usize, qsa_required: bool) usize {
+    return transformer_mod.ssmCheckpointDropIndexWithAnchor(items, policy, anchor_tokens, qsa_required);
 }
 
 /// Drops checkpoints until at most `max` hold a state (`max` 0 = no cap). A released one is a restore point
 /// already on SSD and costs no memory, so it is never the one dropped nor counted.
-pub fn thinHeldCheckpoints(allocator: std.mem.Allocator, list: *std.ArrayList(SSMCheckpoint), max: u32, policy: transformer_mod.ThinPolicy) ?usize {
+pub fn thinHeldCheckpoints(allocator: std.mem.Allocator, list: *std.ArrayList(SSMCheckpoint), max: u32, policy: transformer_mod.ThinPolicy, anchor_tokens: usize, qsa_required: bool) ?usize {
     if (max == 0) return null;
     var last_dropped: ?usize = null;
     while (true) {
@@ -157,7 +158,10 @@ pub fn thinHeldCheckpoints(allocator: std.mem.Allocator, list: *std.ArrayList(SS
             first = @min(first, i);
         }
         if (held <= max) return last_dropped;
-        var dropped = list.orderedRemove(first + checkpointDropIndex(list.items[first..], policy));
+        const relative_drop = checkpointDropIndex(list.items[first..], policy, anchor_tokens, qsa_required);
+        const anchor = if (policy == .anchored_lru) transformer_mod.ssmCheckpointAnchorIndex(list.items[first..], anchor_tokens, qsa_required) else null;
+        if (anchor != null and anchor.? == relative_drop) log.info("[hot-cache] anchor dropped: anchor_dropped_count_limit cp@{d}\n", .{list.items[first + relative_drop].pos});
+        var dropped = list.orderedRemove(first + relative_drop);
         last_dropped = dropped.pos;
         dropped.deinit(allocator);
     }
@@ -171,9 +175,9 @@ test "a capped list thins span-preserving whether or not the prompt carries medi
         .{ .pos = 768, .layers = &.{} },
         .{ .pos = 1536, .layers = &.{} },
     };
-    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency));
+    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency, 0, false));
     list = .{ .{ .pos = 768, .layers = &.{} }, .{ .pos = 1536, .layers = &.{} }, .{ .pos = 2048, .layers = &.{} } };
-    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency));
+    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency, 0, false));
 }
 
 /// `ssm_checkpoint_stride`'s default guards.
@@ -480,12 +484,12 @@ test "the held-state cap thins only states in memory: restore points already on 
     // 130 points written through (their states released), then the newest 20 still held.
     for (0..130) |i| try list.append(al, .{ .pos = 8192 * (i + 1), .layers = &.{}, .released_bytes = 1 });
     for (0..20) |i| try list.append(al, .{ .pos = 8192 * (131 + i), .layers = &.{} });
-    _ = thinHeldCheckpoints(al, &list, 16, .min_span_recency);
+    _ = thinHeldCheckpoints(al, &list, 16, .min_span_recency, 0, false);
     try testing.expectEqual(@as(usize, 146), list.items.len);
     for (list.items[0..130]) |cp| try testing.expect(cp.isReleased());
     try testing.expectEqual(@as(usize, 8192 * 150), list.items[list.items.len - 1].pos);
     // No cap, nothing thins.
-    _ = thinHeldCheckpoints(al, &list, 0, .min_span_recency);
+    _ = thinHeldCheckpoints(al, &list, 0, .min_span_recency, 0, false);
     try testing.expectEqual(@as(usize, 146), list.items.len);
 }
 

@@ -1056,7 +1056,7 @@ pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
 /// `.min_span_recent_tail` also keeps the newest two interior positions dense in short lists
 /// (RAM-only Qwen, where a thought checkpoint can sit just beyond the next prompt's match),
 /// `.lru` drops the least recently restored checkpoint; equal stamps drop lower positions first.
-pub const ThinPolicy = enum { oldest, min_span, min_span_recency, min_span_recent_tail, lru };
+pub const ThinPolicy = enum { oldest, min_span, min_span_recency, min_span_recent_tail, lru, anchored_lru };
 
 /// The checkpoint index to drop when a retention list is over its cap: the interior position
 /// whose removal widens the coverage gap least; index 0 and the last are always kept. One
@@ -1084,7 +1084,7 @@ pub fn spanPreservingDropIndex(
             items.len - 2
         else
             items.len,
-        .oldest, .min_span, .lru => items.len,
+        .oldest, .min_span, .lru, .anchored_lru => items.len,
     };
     var best_at: usize = 1;
     var best_span: usize = std.math.maxInt(usize);
@@ -1134,13 +1134,98 @@ pub fn ssmCheckpointDropIndex(cps: []const SSMCheckpoint, policy: ThinPolicy, pr
     return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect);
 }
 
+/// Anchored LRU keeps the closest live, QSA-restorable checkpoint at or below `target`,
+/// plus the newest checkpoint when capacity allows. Among the remaining candidates it drops
+/// the least recently restored checkpoint; ties drop the lower position. If only the two
+/// protected points remain but one must be removed (for example a cap of one), the anchor is
+/// sacrificed so continuation retains the newest point. `target` is an absolute prompt offset.
+pub fn ssmCheckpointAnchorIndex(cps: []const SSMCheckpoint, target: usize, qsa_required: bool) ?usize {
+    var qsa_source: ?*const SSMCheckpoint = null;
+    for (cps) |*cp| {
+        if (qwen4_qsa_state.checkpointHasQsaPooled(cp)) qsa_source = cp;
+    }
+    var anchor: ?usize = null;
+    for (cps, 0..) |*cp, i| {
+        if (cp.layers.len == 0 or cp.isReleased() or cp.pos > target) continue;
+        const src = qsa_source orelse cp;
+        if ((qsa_required and qwen4_qsa_state.checkpointQsaAuxRows(src) == 0) or
+            !qwen4_qsa_state.checkpointQsaCoversPos(cp, src, cp.pos)) continue;
+        if (anchor == null or cp.pos > cps[anchor.?].pos) anchor = i;
+    }
+    return anchor;
+}
+
+pub fn ssmCheckpointDropIndexAnchoredLru(cps: []const SSMCheckpoint, target: usize, qsa_required: bool) usize {
+    std.debug.assert(cps.len > 0);
+    var qsa_source: ?*const SSMCheckpoint = null;
+    for (cps) |*cp| {
+        if (qwen4_qsa_state.checkpointHasQsaPooled(cp)) qsa_source = cp;
+    }
+    const anchor = ssmCheckpointAnchorIndex(cps, target, qsa_required);
+    var newest: ?usize = null;
+    var first_invalid: ?usize = null;
+    for (cps, 0..) |*cp, i| {
+        if (cp.layers.len == 0 or cp.isReleased()) continue;
+        const src = qsa_source orelse cp;
+        if ((qsa_required and qwen4_qsa_state.checkpointQsaAuxRows(src) == 0) or
+            !qwen4_qsa_state.checkpointQsaCoversPos(cp, src, cp.pos))
+        {
+            if (first_invalid == null) first_invalid = i;
+            continue;
+        }
+        newest = i;
+    }
+    // A live snapshot without the QSA history needed to restore its position has no retention
+    // value. Remove it before spending capacity on any valid point.
+    if (first_invalid) |i| return i;
+    // Select true LRU among unprotected candidates.
+    var picked: ?usize = null;
+    for (cps, 0..) |cp, i| {
+        if (cp.layers.len == 0 or cp.isReleased()) continue;
+        if ((anchor != null and i == anchor.?) or (newest != null and i == newest.?)) continue;
+        const current = picked orelse {
+            picked = i;
+            continue;
+        };
+        if (cp.last_used < cps[current].last_used or
+            (cp.last_used == cps[current].last_used and cp.pos < cps[current].pos)) picked = i;
+    }
+    if (picked) |i| return i;
+    // Cap one (or a byte shed with only two protected states): favor the newest useful state.
+    if (anchor) |a| if (newest) |n| if (a != n) return a;
+    // No distinct anchor; keep the newest and drop the LRU/oldest remaining item.
+    if (newest) |n| {
+        if (cps.len == 1) return n;
+        picked = null;
+        for (cps, 0..) |cp, i| {
+            if (cp.layers.len == 0 or cp.isReleased()) continue;
+            if (i == n) continue;
+            const current = picked orelse {
+                picked = i;
+                continue;
+            };
+            if (cp.last_used < cps[current].last_used or
+                (cp.last_used == cps[current].last_used and cp.pos < cps[current].pos)) picked = i;
+        }
+        return picked orelse n;
+    }
+    return 0;
+}
+
+pub fn ssmCheckpointDropIndexWithAnchor(cps: []const SSMCheckpoint, policy: ThinPolicy, target: usize, qsa_required: bool) usize {
+    return if (policy == .anchored_lru)
+        ssmCheckpointDropIndexAnchoredLru(cps, target, qsa_required)
+    else
+        ssmCheckpointDropIndex(cps, policy, null);
+}
+
 /// `spanPreservingDropIndex` over a bare ascending position list.
 pub fn positionDropIndex(positions: []const u32, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null);
+    return spanPreservingDropIndex(u32, positions, u32PosOf, if (policy == .anchored_lru) .lru else policy, null);
 }
 
 pub fn positionDropIndexUsize(positions: []const usize, policy: ThinPolicy) usize {
-    return spanPreservingDropIndex(usize, positions, usizePosOf, policy, null);
+    return spanPreservingDropIndex(usize, positions, usizePosOf, if (policy == .anchored_lru) .lru else policy, null);
 }
 
 test "splitSpecCaptures: spec_ple_input row view is the rollback shape" {
@@ -1424,6 +1509,40 @@ test "ssm retention: RAM-only Qwen policy keeps the nearest recent checkpoint un
     try testing.expect(recent_tail[recent_tail_n - 2] - 32_768 > standard[standard_n - 2] - 32_768);
     try testing.expectEqual(@as(usize, 32_768), recent_tail[0]);
     try testing.expectEqual(@as(usize, 63_320), recent_tail[recent_tail_n - 1]);
+}
+
+test "anchored LRU preserves the closest valid early point and newest, then uses restore LRU" {
+    const t = std.testing;
+    var layers = [_]SSMCacheEntrySnapshot{.{
+        .conv_state = .{ .ctx = null },
+        .ssm_state = .{ .ctx = null },
+        .initialized = true,
+    }};
+    var cps = [_]SSMCheckpoint{
+        .{ .pos = 2048, .last_used = 1, .layers = &layers },
+        .{ .pos = 4096, .last_used = 2, .layers = &layers },
+        .{ .pos = 32768, .last_used = 30, .layers = &layers },
+        .{ .pos = 65536, .last_used = 20, .layers = &layers },
+        .{ .pos = 98304, .last_used = 10, .layers = &layers },
+        .{ .pos = 131072, .last_used = 40, .layers = &layers },
+    };
+    var n: usize = cps.len;
+    while (n > 4) {
+        const drop = ssmCheckpointDropIndexAnchoredLru(cps[0..n], 4096, false);
+        var k = drop;
+        while (k + 1 < n) : (k += 1) cps[k] = cps[k + 1];
+        n -= 1;
+    }
+    try t.expectEqual(@as(usize, 4), n);
+    try t.expectEqualSlices(usize, &.{ 4096, 32768, 65536, 131072 }, &.{ cps[0].pos, cps[1].pos, cps[2].pos, cps[3].pos });
+    // The 2048 and 98304 points were the least recently restored unprotected checkpoints.
+    try t.expectEqual(@as(usize, 0), ssmCheckpointDropIndexAnchoredLru(cps[0..2], 4096, false)); // cap one keeps newest
+
+    // No captured point below the target: keep newest and use ordinary LRU for the rest.
+    try t.expectEqual(@as(usize, 0), ssmCheckpointDropIndexAnchoredLru(cps[0..4], 1000, false));
+    // Required QSA history is part of checkpoint validity; these metadata-only fixtures cannot
+    // become an anchor or newest survivor for a QSA-enabled cache.
+    try t.expectEqual(@as(usize, 0), ssmCheckpointDropIndexAnchoredLru(cps[0..4], 4096, true));
 }
 
 test "ssm retention: LRU follows successful checkpoint access, not position or creation order" {

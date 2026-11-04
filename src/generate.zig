@@ -1568,6 +1568,8 @@ pub const Generator = struct {
         /// (`transformer.ssmCheckpointDropIndex`): lowest and newest always survive. 0 = unlimited.
         ssm_checkpoint_max: u32 = 16,
         ssm_checkpoint_retention: ?transformer_mod.ThinPolicy = null,
+        ssm_checkpoint_anchor_tokens: u32 = 0,
+        ssm_checkpoint_qsa_required: bool = false,
         /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
         /// On a cold prefill this is 0. On the warm path (where the
         /// scheduler restored some prefix and now forwards only the tail),
@@ -2186,7 +2188,7 @@ pub const Generator = struct {
                     };
                     // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
                     // the last `max * stride` tokens and left no affordable trim point.
-                    if (prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin)) |dropped_pos| {
+                    if (prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin, options.ssm_checkpoint_anchor_tokens, options.ssm_checkpoint_qsa_required)) |dropped_pos| {
                         log.debug("  [hot-cache] checkpoint retention dropped cp@{d}: prefill_checkpoint_limit ({d} held)\n", .{ dropped_pos, ssm_checkpoints.items.len });
                     }
                 }
@@ -2301,7 +2303,7 @@ pub const Generator = struct {
                     if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                         log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                     };
-                    if (prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin)) |dropped_pos| {
+                    if (prefill_plan.thinHeldCheckpoints(allocator, &ssm_checkpoints, options.ssm_checkpoint_max, cp_thin, options.ssm_checkpoint_anchor_tokens, options.ssm_checkpoint_qsa_required)) |dropped_pos| {
                         log.debug("  [hot-cache] checkpoint retention dropped cp@{d}: prefill_checkpoint_limit ({d} held)\n", .{ dropped_pos, ssm_checkpoints.items.len });
                     }
                 }

@@ -727,6 +727,8 @@ pub const HotPrefixCache = struct {
     /// Checkpoint-retention policy, mirrored once at wiring from `ModelConfig.longCtxGated()`
     /// (this struct never sees a ModelConfig). The default is the previous behaviour.
     cp_thin: transformer_mod.ThinPolicy = .min_span,
+    /// Absolute prompt position protected by anchored-LRU; zero means no anchor configured.
+    cp_anchor_tokens: u32 = 0,
     /// Whether completed requests retain reusable KV in RAM. The live slot still owns its
     /// working KV; false keeps reusable prefixes only on the SSD tier.
     ram_enabled: bool = true,
@@ -940,15 +942,17 @@ pub const HotPrefixCache = struct {
         var retained_count: usize = 0;
         var retained_bytes: u64 = 0;
         var latest_restorable: ?usize = null;
+        var anchor_restorable: ?usize = null;
         var list: [768]u8 = undefined;
         var used: usize = 0;
         appendTrimFmt(&list, &used, "[", .{});
         for (cps) |*cp| {
             if (cp.layers.len == 0 or cp.isReleased()) continue;
             const src = qsaHistorySource(cps, cp) orelse cp;
-            const restorable = transformer_mod.checkpointQsaCoversPos(cp, src, cp.pos);
+            const restorable = (!self.qsa_history_required or transformer_mod.checkpointQsaAuxRows(src) > 0) and transformer_mod.checkpointQsaCoversPos(cp, src, cp.pos);
             retained_count += 1;
             if (restorable and cp.pos <= e.tokens.len) latest_restorable = cp.pos;
+            if (restorable and cp.pos <= self.cp_anchor_tokens and (anchor_restorable == null or cp.pos > anchor_restorable.?)) anchor_restorable = cp.pos;
             if (fact_n < facts.len) {
                 facts[fact_n] = .{ .pos = cp.pos, .restorable = restorable };
                 fact_n += 1;
@@ -982,7 +986,12 @@ pub const HotPrefixCache = struct {
         } else {
             appendTrimFmt(&line, &n, "unknown", .{});
         }
-        appendTrimFmt(&line, &n, " count={d} policy={s} checkpoint_bytes={d} memory_bytes={d}\n", .{ retained_count, @tagName(self.cp_thin), retained_bytes, e.kv_bytes });
+        appendTrimFmt(&line, &n, " count={d} policy={s} checkpoint_bytes={d} memory_bytes={d}", .{ retained_count, @tagName(self.cp_thin), retained_bytes, e.kv_bytes });
+        if (self.cp_thin == .anchored_lru) {
+            appendTrimFmt(&line, &n, " anchor_target={d} anchor_retained=", .{self.cp_anchor_tokens});
+            if (anchor_restorable) |pos| appendTrimFmt(&line, &n, "{d}", .{pos}) else appendTrimFmt(&line, &n, "none:anchor_unavailable", .{});
+        }
+        appendTrimFmt(&line, &n, "\n", .{});
         log.info("{s}", .{line[0..n]});
     }
 
@@ -1389,7 +1398,7 @@ pub const HotPrefixCache = struct {
                 // The admission forecast has only positions/byte prices, not a mutable LRU
                 // access list. Price every lower checkpoint conservatively; the real byte shed
                 // later uses the per-checkpoint access stamps and the selected LRU policy.
-                if (self.cp_thin == .min_span or self.cp_thin == .lru) return trimLenBillingAllLower(budget, limit, row_bytes, list);
+                if (self.cp_thin == .min_span or self.cp_thin == .lru or self.cp_thin == .anchored_lru) return trimLenBillingAllLower(budget, limit, row_bytes, list);
                 if (list.len > SHED_SIM_MAX) return trimLenBillingAllLower(budget, limit, row_bytes, list);
                 var pos_buf: [SHED_SIM_MAX]usize = undefined;
                 var byte_buf: [SHED_SIM_MAX]u64 = undefined;
@@ -3523,7 +3532,9 @@ pub const HotPrefixCache = struct {
         {
             // Under three there is no interior to thin; honour the cap by
             // dropping the oldest, which is also the cheapest to redo.
-            const drop = transformer_mod.ssmCheckpointDropIndex(merged.items, self.cp_thin, null);
+            const anchor = if (self.cp_thin == .anchored_lru) transformer_mod.ssmCheckpointAnchorIndex(merged.items, self.cp_anchor_tokens, self.qsa_history_required) else null;
+            const drop = transformer_mod.ssmCheckpointDropIndexWithAnchor(merged.items, self.cp_thin, self.cp_anchor_tokens, self.qsa_history_required);
+            if (anchor != null and anchor.? == drop) log.info("  [hot-cache] anchor dropped: anchor_dropped_count_limit cp@{d}\n", .{merged.items[drop].pos});
             prune_reason.* = .checkpoint_limit;
             pruned_pos.* = merged.items[drop].pos;
             log.debug("  [hot-cache] checkpoint retention dropped cp@{d}: checkpoint_limit; {d} before, {d} after\n", .{ pruned_pos.*, merged.items.len, merged.items.len - 1 });
@@ -3958,7 +3969,9 @@ pub const HotPrefixCache = struct {
         var n = cps.len;
         var shed: usize = 0;
         while (n > 1 and self.current_kv_bytes > self.max_kv_bytes) {
-            const drop = transformer_mod.ssmCheckpointDropIndex(cps[0..n], self.cp_thin, null);
+            const anchor = if (self.cp_thin == .anchored_lru) transformer_mod.ssmCheckpointAnchorIndex(cps[0..n], self.cp_anchor_tokens, self.qsa_history_required) else null;
+            const drop = transformer_mod.ssmCheckpointDropIndexWithAnchor(cps[0..n], self.cp_thin, self.cp_anchor_tokens, self.qsa_history_required);
+            if (anchor != null and anchor.? == drop) log.info("  [hot-cache] anchor dropped: anchor_dropped_memory_budget cp@{d}\n", .{cps[drop].pos});
             const freed = ssmCheckpointBytes(&cps[drop]);
             newest.checkpoint_prune_reason = .memory_budget;
             newest.checkpoint_pruned_pos = cps[drop].pos;
@@ -4070,6 +4083,13 @@ pub const HotPrefixCache = struct {
 
     pub fn evictAt(self: *HotPrefixCache, lru_idx: usize, reason: []const u8) void {
         var evicted = self.entries.swapRemove(lru_idx);
+        if (self.cp_thin == .anchored_lru) {
+            if (evicted.ssm_checkpoints) |cps| {
+                if (transformer_mod.ssmCheckpointAnchorIndex(cps, self.cp_anchor_tokens, self.qsa_history_required)) |anchor| {
+                    log.info("  [hot-cache] anchor entry evicted: anchor_entry_evicted cp@{d}\n", .{cps[anchor].pos});
+                }
+            }
+        }
         const tokens_len = evicted.tokens.len;
         const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
         const had_ssm = evicted.ssm_checkpoints != null;
@@ -8040,7 +8060,9 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     }
 
     var hc = HotPrefixCache.initWithMem(testing.allocator, 2, 0);
-    hc.ssm_checkpoint_max = 8;
+    hc.ssm_checkpoint_max = 2;
+    hc.cp_thin = .anchored_lru;
+    hc.cp_anchor_tokens = 16;
     defer hc.deinit();
 
     // Entry A: the MTP arm's cold prefill. Checkpoints at 8 and 16 (inside
@@ -8069,10 +8091,9 @@ test "HotPrefixCache: a commit from a restored prefix inherits the donor's check
     // only A's own generated tail ever reached).
     const b_idx: usize = if (hc.entries.items[0].tokens[20] == 210) 0 else 1;
     const b_merged = hc.entries.items[b_idx].ssm_checkpoints.?;
-    try testing.expectEqual(@as(usize, 3), b_merged.len);
-    try testing.expectEqual(@as(usize, 8), b_merged[0].pos);
-    try testing.expectEqual(@as(usize, 16), b_merged[1].pos);
-    try testing.expectEqual(@as(usize, 20), b_merged[2].pos);
+    try testing.expectEqual(@as(usize, 2), b_merged.len);
+    try testing.expectEqual(@as(usize, 16), b_merged[0].pos);
+    try testing.expectEqual(@as(usize, 20), b_merged[1].pos);
 
     // The count cap evicts A (the byte budget is the same mechanism).
     var c_cache = try KVCache.init(testing.allocator, 3);

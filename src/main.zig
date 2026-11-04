@@ -341,8 +341,10 @@ fn printUsage(io: std.Io) void {
         \\                        thins the restore points on SSD, which keep
         \\                        every 8192 tokens and each prompt's end
         \\                        (--prefix-cache-disk sizes them).
-        \\  --ssm-checkpoint-retention <min-span-recency|lru>
+        \\  --ssm-checkpoint-retention <min-span-recency|lru|anchored-lru>
         \\                      RAM-only Qwen checkpoint policy (default: automatic).
+        \\  --ssm-checkpoint-anchor-tokens <n>
+        \\                      Absolute prompt position to preserve with anchored-lru (required, > 0).
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 1, integers 1..32).
@@ -880,9 +882,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-retention") and i + 1 < args.len) {
             i += 1;
             server_mod.ssm_checkpoint_retention = server_mod.parseSsmCheckpointRetention(args[i]) orelse {
-                log.err("--ssm-checkpoint-retention: expected 'min-span-recency' or 'lru'; got '{s}'\n", .{args[i]});
+                log.err("--ssm-checkpoint-retention: expected 'min-span-recency', 'lru' or 'anchored-lru'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-anchor-tokens") and i + 1 < args.len) {
+            i += 1;
+            server_mod.ssm_checkpoint_anchor_tokens = flagInt(u32, "--ssm-checkpoint-anchor-tokens", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
@@ -992,6 +997,10 @@ pub fn main(init: std.process.Init) !void {
             log.err("unrecognized argument '{s}' — {s}\n", .{ args[i], reason.hint() });
             std.process.exit(1);
         }
+    }
+    if (server_mod.ssm_checkpoint_retention == .anchored_lru and server_mod.ssm_checkpoint_anchor_tokens == 0) {
+        log.err("--ssm-checkpoint-retention anchored-lru requires --ssm-checkpoint-anchor-tokens <positive n>\n", .{});
+        std.process.exit(1);
     }
     model_settings_mod.vision_flag = model_settings_mod.visionFlagFrom(vision, no_vision) catch {
         log.err("--vision and --no-vision conflict; pass one\n", .{});
@@ -1529,6 +1538,7 @@ pub fn main(init: std.process.Init) !void {
             .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .ssm_checkpoint_retention = server_mod.ssm_checkpoint_retention,
+            .ssm_checkpoint_anchor_tokens = server_mod.ssm_checkpoint_anchor_tokens,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .metrics = metrics_mod.current(),
         };
@@ -1817,6 +1827,7 @@ fn runHeadlessServe(
         .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .ssm_checkpoint_retention = server_mod.ssm_checkpoint_retention,
+        .ssm_checkpoint_anchor_tokens = server_mod.ssm_checkpoint_anchor_tokens,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .metrics = metrics_mod.current(),
     };

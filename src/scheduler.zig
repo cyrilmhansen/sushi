@@ -955,6 +955,7 @@ pub const LoadRequest = struct {
     /// beyond the prefix-cache byte budget.
     ssm_checkpoint_max: u32 = 16,
     ssm_checkpoint_retention: ?transformer_mod.ThinPolicy = null,
+    ssm_checkpoint_anchor_tokens: u32 = 0,
     /// Iteration 2: tokenize cache LRU capacity. Mirrored on
     /// `LoadParams.tokenize_cache_entries`; both paths feed
     /// `doLoadOnInferenceThread`.
@@ -1053,6 +1054,7 @@ pub const Scheduler = struct {
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
     ssm_checkpoint_retention: ?transformer_mod.ThinPolicy = null,
+    ssm_checkpoint_anchor_tokens: u32 = 0,
     /// Launch-flag MTP settings, retained (same rationale as the prefix-cache
     /// fields above) so COLD-LOADED models — on-demand `/v1/load-model`, model
     /// switches — honor `--no-mtp` / `--mtp-max-depth` like the `--model` primary.
@@ -1264,6 +1266,7 @@ pub const Scheduler = struct {
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
             .ssm_checkpoint_max = params.ssm_checkpoint_max,
             .ssm_checkpoint_retention = params.ssm_checkpoint_retention,
+            .ssm_checkpoint_anchor_tokens = params.ssm_checkpoint_anchor_tokens,
             .mtp_enabled = params.mtp_enabled,
             .mtp_explicit = params.mtp_explicit,
             .mtp_head_kv_quant = params.mtp_head_kv_quant,
@@ -1797,6 +1800,7 @@ pub const Scheduler = struct {
             .ssm_checkpoint_stride = cold_disk.stride,
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
             .ssm_checkpoint_retention = self.ssm_checkpoint_retention,
+            .ssm_checkpoint_anchor_tokens = self.ssm_checkpoint_anchor_tokens,
             // Cold loads honor the launch-flag MTP settings too (same reason
             // as prefix-cache above) — pre-plumbing these were LoadRequest
             // defaults, so --no-mtp / --mtp-max-depth were silently dropped on
@@ -3143,8 +3147,10 @@ pub fn commitSlotIfApplicableWithReason(sch: *Scheduler, slot: *Slot, completion
             } else if (cp.pos == pos and hc.ssm_checkpoint_max > 0) {
                 log.info("[hot-cache] decode-end checkpoint QSA covered pos={d}; applying retention\n", .{pos});
                 while (ssm_cps_slice.len > hc.ssm_checkpoint_max) {
-                    const drop = transformer_mod.ssmCheckpointDropIndex(ssm_cps_slice, hc.cp_thin, null);
+                    const anchor = if (hc.cp_thin == .anchored_lru) transformer_mod.ssmCheckpointAnchorIndex(ssm_cps_slice, hc.cp_anchor_tokens, hc.qsa_history_required) else null;
+                    const drop = transformer_mod.ssmCheckpointDropIndexWithAnchor(ssm_cps_slice, hc.cp_thin, hc.cp_anchor_tokens, hc.qsa_history_required);
                     var removed = ssm_cps_slice[drop];
+                    if (anchor != null and anchor.? == drop) log.info("[hot-cache] anchor dropped: anchor_dropped_count_limit cp@{d}\n", .{removed.pos});
                     log.info("[hot-cache] checkpoint removed cp@{d}: count_policy={s}\n", .{ removed.pos, @tagName(hc.cp_thin) });
                     removed.deinit(gen_ptr.ssm_checkpoint_alloc.?);
                     if (drop + 1 < ssm_cps_slice.len) std.mem.copyForwards(transformer_mod.SSMCheckpoint, ssm_cps_slice[drop .. ssm_cps_slice.len - 1], ssm_cps_slice[drop + 1 ..]);
@@ -4091,6 +4097,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_retention = if (slot.model.prefix_cache) |*cache| cache.cp_thin else null,
+            .ssm_checkpoint_anchor_tokens = if (slot.model.prefix_cache) |*cache| cache.cp_anchor_tokens else 0,
+            .ssm_checkpoint_qsa_required = if (slot.model.prefix_cache) |*cache| cache.qsa_history_required else false,
             .ssm_checkpoint_pos_offset = hot_matched,
             // The encoded rows start at the first block the restore does not cover: the splice
             // resumes at the placeholder rows the restored prefix holds of them.

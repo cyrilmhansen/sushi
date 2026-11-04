@@ -706,16 +706,19 @@ pub var ssm_checkpoint_max: u32 = 16;
 /// Optional checkpoint thinning override. Only RAM-only Qwen uses this; other
 /// architectures and SSD retention retain their configured/default policies.
 pub var ssm_checkpoint_retention: ?transformer_mod.ThinPolicy = null;
+pub var ssm_checkpoint_anchor_tokens: u32 = 0;
 
 pub fn parseSsmCheckpointRetention(word: []const u8) ?transformer_mod.ThinPolicy {
     if (std.mem.eql(u8, word, "min-span-recency")) return .min_span_recency;
     if (std.mem.eql(u8, word, "lru")) return .lru;
+    if (std.mem.eql(u8, word, "anchored-lru")) return .anchored_lru;
     return null;
 }
 
 test "SSM checkpoint retention CLI accepts only the explicit RAM experiment policies" {
     try std.testing.expectEqual(@as(?transformer_mod.ThinPolicy, .min_span_recency), parseSsmCheckpointRetention("min-span-recency"));
     try std.testing.expectEqual(@as(?transformer_mod.ThinPolicy, .lru), parseSsmCheckpointRetention("lru"));
+    try std.testing.expectEqual(@as(?transformer_mod.ThinPolicy, .anchored_lru), parseSsmCheckpointRetention("anchored-lru"));
     try std.testing.expectEqual(@as(?transformer_mod.ThinPolicy, null), parseSsmCheckpointRetention("fifo"));
 }
 
