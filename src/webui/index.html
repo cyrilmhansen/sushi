@@ -3919,7 +3919,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       ] : [['Not reported by this server', '-']]),
     ];
     kv($('writes'), writeRows);
-    renderWriteOrigins($('dashWriteOrigins'), writes?.origins);
+    renderWriteOrigins($('write-origins'), writes?.origins);
     const locationRows = $('writes').querySelectorAll('span');
     if (locationRows.length > 1) locationRows[1].title = ssdVolume?.path || '';
     hist('ttft', h.time_to_first_token_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
