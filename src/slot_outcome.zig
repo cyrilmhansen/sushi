@@ -16,7 +16,6 @@ const testing = std.testing;
 const scheduler_mod = @import("scheduler.zig");
 const Scheduler = scheduler_mod.Scheduler;
 const Slot = scheduler_mod.Slot;
-const commitSlotIfApplicable = scheduler_mod.commitSlotIfApplicable;
 const expectOutcomes = scheduler_mod.expectOutcomes;
 const publishHotCacheResidency = scheduler_mod.publishHotCacheResidency;
 const releaseNativeState = scheduler_mod.releaseNativeState;
@@ -297,7 +296,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     }
     if (slot.completion_tokens <= 2) logShortGen(slot, reason);
     if (latched == null) logStop(slot, reason);
-    commitSlotIfApplicable(sch, slot);
+    scheduler_mod.commitSlotIfApplicableWithReason(sch, slot, reason);
     // Restore by move: a slot that ended without committing still holds its checkout, and
     // the record now describes bytes that die with `slot.cache`. Above every early return.
     if (slot.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(slot), reason);

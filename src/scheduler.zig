@@ -2874,12 +2874,20 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
     return n_gen > 0 and all_pad;
 }
 
-pub const DecodeEndCheckpointGate = enum { ready, cache_position_mismatch, mtp_history_gap };
+pub const DecodeEndCheckpointGate = enum { ready, trunk_position_mismatch, mtp_history_gap };
 
-pub fn decodeEndCheckpointGate(cache_step: usize, committed_end: usize, mtp_active: bool, mtp_base: usize, mtp_committed: usize) DecodeEndCheckpointGate {
-    if (cache_step != committed_end) return .cache_position_mismatch;
+/// For Qwen GDN the logical position advances independently of `KVCache.step`:
+/// layer zero is linear and does not maintain that counter. `trunk_position`
+/// must therefore be the model's forwarded recurrent offset (`moe_seq_offset`).
+pub fn decodeEndCheckpointGate(trunk_position: usize, committed_end: usize, mtp_active: bool, mtp_base: usize, mtp_committed: usize) DecodeEndCheckpointGate {
+    if (trunk_position != committed_end) return .trunk_position_mismatch;
     if (mtp_active and mtp_base +| mtp_committed != committed_end) return .mtp_history_gap;
     return .ready;
+}
+
+pub fn decodeEndCompletionAllowed(reason: []const u8, mlx_error: bool, cancelled: bool, slot_error: bool) bool {
+    if (mlx_error or cancelled or slot_error) return false;
+    return std.mem.eql(u8, reason, "stop") or std.mem.eql(u8, reason, "length");
 }
 
 /// Capture an additional decode-end restore point only when the committed token
@@ -2890,6 +2898,7 @@ fn captureQwenDecodeEndCheckpoint(
     gen: *generate_mod.Generator,
     hc: *prefix_cache_mod.HotPrefixCache,
     total_len: usize,
+    completion_reason: ?[]const u8,
 ) ?usize {
     const cfg = slot.model.config orelse return null;
     if (!cfg.isQwen4() or !hc.ram_enabled or hc.disk != null) return null;
@@ -2898,8 +2907,13 @@ fn captureQwenDecodeEndCheckpoint(
             log.info("[hot-cache] decode-end checkpoint skipped: {s}\n", .{reason});
         }
     }.write;
-    if (!gen.done or (!std.mem.eql(u8, gen.finish_reason, "stop") and !std.mem.eql(u8, gen.finish_reason, "length"))) {
-        refuse("request_not_naturally_completed");
+    if (!decodeEndCompletionAllowed(
+        completion_reason orelse "",
+        mlx.errorPending(),
+        slot.cancelled.load(.acquire),
+        slot.error_code != null,
+    )) {
+        refuse("not_a_natural_completion");
         return null;
     }
     if (slot.vision_key != 0 or slot.media_chain.len != 0) {
@@ -2907,9 +2921,10 @@ fn captureQwenDecodeEndCheckpoint(
         return null;
     }
     const mtp_committed = if (gen.mtp_cache != null) gen.mtpCommittedHistoryLen() else 0;
-    const gate = decodeEndCheckpointGate(slot.cache.step, total_len, gen.mtp_cache != null, gen.mtp_position_base, mtp_committed);
-    if (gate == .cache_position_mismatch) {
-        log.info("[hot-cache] decode-end checkpoint skipped: cache_position_mismatch cache={d} committed={d}\n", .{ slot.cache.step, total_len });
+    const trunk_position = slot.moe_seq_offset;
+    const gate = decodeEndCheckpointGate(trunk_position, total_len, gen.mtp_cache != null, gen.mtp_position_base, mtp_committed);
+    if (gate == .trunk_position_mismatch) {
+        log.info("[hot-cache] decode-end checkpoint skipped: trunk_position_mismatch forwarded={d} committed={d} kv_step={d}\n", .{ trunk_position, total_len, slot.cache.step });
         return null;
     }
     const entries = slot.ssm_entries orelse {
@@ -2968,7 +2983,7 @@ fn captureQwenDecodeEndCheckpoint(
         log.info("[hot-cache] decode-end checkpoint skipped: list_allocation_failed {s}\n", .{@errorName(err)});
         return null;
     };
-    log.info("[hot-cache] decode-end checkpoint captured cp@{d} generated={d} policy={s}\n", .{ total_len, gen.generated_ids.items.len, @tagName(hc.cp_thin) });
+    log.info("[hot-cache] decode-end checkpoint candidate pos={d} forwarded={d} committed={d} mtp_head={s} qsa=handoff_pending policy={s}\n", .{ total_len, trunk_position, gen.generated_ids.items.len, if (gen.mtp_cache != null) "aligned" else "inactive", @tagName(hc.cp_thin) });
     return total_len;
 }
 
@@ -2978,6 +2993,13 @@ fn captureQwenDecodeEndCheckpoint(
 /// `waitNext`). Skipped for pad-only generations, vision-bearing slots
 /// (stale embeddings would be reused), and slots with no generated tokens.
 pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
+    commitSlotIfApplicableWithReason(sch, slot, null);
+}
+
+/// `finishSlot` owns the reliable wire completion classification. Other commit
+/// paths (notably cancellation salvage) deliberately pass no natural reason and
+/// cannot create a decode-end checkpoint.
+pub fn commitSlotIfApplicableWithReason(sch: *Scheduler, slot: *Slot, completion_reason: ?[]const u8) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
     if (slot.error_code != null) return;
@@ -3020,7 +3042,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
     settleThoughtPoint(slot, gen_ptr);
-    const decode_end_checkpoint = captureQwenDecodeEndCheckpoint(slot, gen_ptr, hc, total_len);
+    const decode_end_checkpoint = captureQwenDecodeEndCheckpoint(slot, gen_ptr, hc, total_len, completion_reason);
     var ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
     var ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
@@ -3056,11 +3078,12 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
                 rejected.deinit(gen_ptr.ssm_checkpoint_alloc.?);
                 ssm_cps_slice = ssm_cps_slice[0 .. ssm_cps_slice.len - 1];
                 ssm_cps_opt = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
-            } else if (hc.ssm_checkpoint_max > 0) {
+            } else if (cp.pos == pos and hc.ssm_checkpoint_max > 0) {
+                log.info("[hot-cache] decode-end checkpoint QSA covered pos={d}; applying retention\n", .{pos});
                 while (ssm_cps_slice.len > hc.ssm_checkpoint_max) {
                     const drop = transformer_mod.ssmCheckpointDropIndex(ssm_cps_slice, hc.cp_thin, null);
                     var removed = ssm_cps_slice[drop];
-                    log.debug("[hot-cache] checkpoint removed cp@{d}: count_policy={s}\n", .{ removed.pos, @tagName(hc.cp_thin) });
+                    log.info("[hot-cache] checkpoint removed cp@{d}: count_policy={s}\n", .{ removed.pos, @tagName(hc.cp_thin) });
                     removed.deinit(gen_ptr.ssm_checkpoint_alloc.?);
                     if (drop + 1 < ssm_cps_slice.len) std.mem.copyForwards(transformer_mod.SSMCheckpoint, ssm_cps_slice[drop .. ssm_cps_slice.len - 1], ssm_cps_slice[drop + 1 ..]);
                     ssm_cps_slice = ssm_cps_slice[0 .. ssm_cps_slice.len - 1];
@@ -5429,11 +5452,22 @@ test "prefix-cache commit declines a pad-only generation, never a zero-token one
     try testing.expect(!commitDeclinesPadOnly(3, false));
 }
 
-test "decode-end checkpoint gate requires exact KV and MTP committed boundaries" {
+test "decode-end checkpoint gate uses forwarded hybrid trunk and exact MTP history boundaries" {
+    // Qwen GDN's cache.step may remain zero/stale; the forwarded offset is authoritative.
     try testing.expectEqual(DecodeEndCheckpointGate.ready, decodeEndCheckpointGate(64_148, 64_148, false, 0, 0));
-    try testing.expectEqual(DecodeEndCheckpointGate.cache_position_mismatch, decodeEndCheckpointGate(64_149, 64_148, false, 0, 0));
+    try testing.expectEqual(DecodeEndCheckpointGate.trunk_position_mismatch, decodeEndCheckpointGate(64_149, 64_148, false, 0, 0));
     try testing.expectEqual(DecodeEndCheckpointGate.ready, decodeEndCheckpointGate(64_148, 64_148, true, 32_768, 31_380));
     try testing.expectEqual(DecodeEndCheckpointGate.mtp_history_gap, decodeEndCheckpointGate(64_148, 64_148, true, 32_768, 31_379));
+}
+
+test "decode-end completion accepts speculative EOS before generator done, rejects unsafe endings" {
+    // The scheduler can finish after a speculative EOS while gen.done remains false.
+    try testing.expect(decodeEndCompletionAllowed("stop", false, false, false));
+    try testing.expect(decodeEndCompletionAllowed("length", false, false, false));
+    try testing.expect(!decodeEndCompletionAllowed("cancelled", false, true, false));
+    try testing.expect(!decodeEndCompletionAllowed("stop", true, false, false));
+    try testing.expect(!decodeEndCompletionAllowed("length", false, false, true));
+    try testing.expect(!decodeEndCompletionAllowed("error", false, false, false));
 }
 
 test "a speculative block ending on EOS records the stop token and leaves it out of the count" {
