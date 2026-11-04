@@ -11087,3 +11087,37 @@ test "a write-through under other pixels never extends the record that holds the
     try testing.expect(res.matched > at);
     for (0..3) |li| try pcExpectRowsEqual(s, dst.entries[li].keys, rows_b.entries[li].keys, res.matched);
 }
+
+test "hybrid renewal selects the handed-off QSA anchor at raw match 5614" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    const al = testing.allocator;
+    var cps: [2]SSMCheckpoint = .{ undefined, undefined };
+    for (&cps, 0..) |*cp, i| {
+        const pos: usize = if (i == 0) 4096 else 53_248;
+        const layers = try al.alloc(transformer_mod.SSMCacheEntrySnapshot, 1);
+        layers[0] = .{
+            .conv_state = mlx.mlx_array_new(),
+            .ssm_state = mlx.mlx_array_new(),
+            .initialized = true,
+            .qsa_ratio = 4,
+            .qsa_rows = @intCast(pos),
+        };
+        cp.* = .{ .pos = pos, .layers = layers };
+    }
+    defer for (&cps) |*cp| cp.deinit(al);
+
+    var live = [_]transformer_mod.SSMCacheEntry{.{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = true,
+        .qsa_ratio = 4,
+        .qsa_hist_rows = 53_248,
+    }};
+    defer @import("qwen4/qwen4_qsa_state.zig").ssmFreeQsaState(&live[0]);
+    try mlx.check(mlx.mlx_ones(&live[0].qsa_pooled, &[_]c_int{ 1, 13_312, 1 }, 3, .float32, s));
+    try transformer_mod.handoffQsaHistoryToLatest(&cps, &live, s);
+
+    const selected = HotPrefixCache.highestCoveringCheckpoint(&cps, 5614) orelse return error.ExpectedQsaAnchor;
+    try testing.expectEqual(@as(usize, 4096), selected.pos);
+}

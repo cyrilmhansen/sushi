@@ -1212,6 +1212,70 @@ pub fn ssmCheckpointDropIndexAnchoredLru(cps: []const SSMCheckpoint, target: usi
     return 0;
 }
 
+/// Prefill-only variant of anchored LRU. Before the deferred QSA handoff, captured QSA
+/// checkpoints have a verified local leftover but no pooled bank, so full restore eligibility
+/// cannot yet be established. Preserve the closest metadata-compatible point at/below the anchor
+/// and the newest provisional point while the caller's count cap permits it. This is only a
+/// retention choice: the ordinary post-handoff coverage predicate remains authoritative for
+/// restore, merge and byte shedding.
+pub fn ssmCheckpointDropIndexAnchoredLruPrefill(cps: []const SSMCheckpoint, target: usize, max: u32) usize {
+    std.debug.assert(cps.len > 0);
+    var has_pooled = false;
+    for (cps) |*cp| has_pooled = has_pooled or qwen4_qsa_state.checkpointHasQsaPooled(cp);
+    if (has_pooled) return ssmCheckpointDropIndexAnchoredLru(cps, target, true);
+
+    // If an early point is already fully restorable from its local raw history, retain it under
+    // the normal policy. The provisional path is specifically for deferred-bank captures.
+    if (ssmCheckpointAnchorIndex(cps, target, true) != null) {
+        return ssmCheckpointDropIndexAnchoredLru(cps, target, true);
+    }
+
+    var anchor: ?usize = null;
+    var provisional_newest: ?usize = null;
+    var newest_restorable: ?usize = null;
+    for (cps, 0..) |*cp, i| {
+        if (cp.layers.len == 0 or cp.isReleased()) continue;
+        if (qwen4_qsa_state.checkpointHasProvisionalQsaPoint(cp, cp.pos)) {
+            provisional_newest = i;
+            if (cp.pos <= target and (anchor == null or cp.pos > cps[anchor.?].pos)) anchor = i;
+        }
+        if (qwen4_qsa_state.checkpointQsaAuxRows(cp) > 0 and
+            qwen4_qsa_state.checkpointQsaCoversPos(cp, cp, cp.pos))
+        {
+            newest_restorable = i;
+        }
+    }
+    const newest = newest_restorable orelse provisional_newest;
+    // Cap one cannot preserve a distinct anchor and continuation point. Match finalized
+    // anchored-LRU semantics: keep the newest useful state.
+    if (max <= 1 and anchor != null and newest != null and anchor.? != newest.?) anchor = null;
+
+    for (cps, 0..) |*cp, i| {
+        if (cp.layers.len == 0 or cp.isReleased()) continue;
+        if ((anchor != null and i == anchor.?) or (newest != null and i == newest.?)) continue;
+        const restorable = qwen4_qsa_state.checkpointQsaAuxRows(cp) > 0 and
+            qwen4_qsa_state.checkpointQsaCoversPos(cp, cp, cp.pos);
+        if (!restorable) return i;
+    }
+
+    // All remaining candidates are restorable. Apply actual checkpoint access recency with a
+    // stable position tie-break, preserving both protected points.
+    var picked: ?usize = null;
+    for (cps, 0..) |cp, i| {
+        if (cp.layers.len == 0 or cp.isReleased()) continue;
+        if ((anchor != null and i == anchor.?) or (newest != null and i == newest.?)) continue;
+        const current = picked orelse {
+            picked = i;
+            continue;
+        };
+        if (cp.last_used < cps[current].last_used or
+            (cp.last_used == cps[current].last_used and cp.pos < cps[current].pos)) picked = i;
+    }
+    if (picked) |i| return i;
+    if (anchor) |a| if (newest) |n| if (a != n) return a;
+    return 0;
+}
+
 pub fn ssmCheckpointDropIndexWithAnchor(cps: []const SSMCheckpoint, policy: ThinPolicy, target: usize, qsa_required: bool) usize {
     return if (policy == .anchored_lru)
         ssmCheckpointDropIndexAnchoredLru(cps, target, qsa_required)

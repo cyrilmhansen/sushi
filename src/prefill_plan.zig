@@ -140,7 +140,10 @@ pub fn requestPrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slidin
 /// whole, so a checkpoint past the first media row restores like any other and the generic
 /// span-preserving thinning decides; protecting the boundary's checkpoint instead dropped every
 /// one above it, which is exactly the state an image-bearing turn restores from next time.
-fn checkpointDropIndex(items: []const SSMCheckpoint, policy: transformer_mod.ThinPolicy, anchor_tokens: usize, qsa_required: bool) usize {
+fn checkpointDropIndex(items: []const SSMCheckpoint, policy: transformer_mod.ThinPolicy, anchor_tokens: usize, qsa_required: bool, max: u32) usize {
+    if (policy == .anchored_lru and qsa_required) {
+        return transformer_mod.ssmCheckpointDropIndexAnchoredLruPrefill(items, anchor_tokens, max);
+    }
     return transformer_mod.ssmCheckpointDropIndexWithAnchor(items, policy, anchor_tokens, qsa_required);
 }
 
@@ -158,7 +161,7 @@ pub fn thinHeldCheckpoints(allocator: std.mem.Allocator, list: *std.ArrayList(SS
             first = @min(first, i);
         }
         if (held <= max) return last_dropped;
-        const relative_drop = checkpointDropIndex(list.items[first..], policy, anchor_tokens, qsa_required);
+        const relative_drop = checkpointDropIndex(list.items[first..], policy, anchor_tokens, qsa_required, max);
         const anchor = if (policy == .anchored_lru) transformer_mod.ssmCheckpointAnchorIndex(list.items[first..], anchor_tokens, qsa_required) else null;
         if (anchor != null and anchor.? == relative_drop) log.info("[hot-cache] anchor dropped: anchor_dropped_count_limit cp@{d}\n", .{list.items[first + relative_drop].pos});
         var dropped = list.orderedRemove(first + relative_drop);
@@ -175,9 +178,9 @@ test "a capped list thins span-preserving whether or not the prompt carries medi
         .{ .pos = 768, .layers = &.{} },
         .{ .pos = 1536, .layers = &.{} },
     };
-    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency, 0, false));
+    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency, 0, false, 16));
     list = .{ .{ .pos = 768, .layers = &.{} }, .{ .pos = 1536, .layers = &.{} }, .{ .pos = 2048, .layers = &.{} } };
-    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency, 0, false));
+    try testing.expectEqual(transformer_mod.ssmCheckpointDropIndex(&list, .min_span_recency, null), checkpointDropIndex(&list, .min_span_recency, 0, false, 16));
 }
 
 /// `ssm_checkpoint_stride`'s default guards.
@@ -491,6 +494,73 @@ test "the held-state cap thins only states in memory: restore points already on 
     // No cap, nothing thins.
     _ = thinHeldCheckpoints(al, &list, 0, .min_span_recency, 0, false);
     try testing.expectEqual(@as(usize, 146), list.items.len);
+}
+
+test "anchored prefill keeps a provisional QSA anchor and newest through 53k" {
+    const al = testing.allocator;
+    var list = std.ArrayList(SSMCheckpoint).empty;
+    defer {
+        for (list.items) |*cp| cp.deinit(al);
+        list.deinit(al);
+    }
+
+    for (1..27) |stride_index| {
+        const pos = stride_index * 2048;
+        const layers = try al.alloc(transformer_mod.SSMCacheEntrySnapshot, 1);
+        layers[0] = .{
+            .conv_state = .{ .ctx = null },
+            .ssm_state = .{ .ctx = null },
+            .initialized = true,
+            .qsa_ratio = 4,
+            .qsa_rows = @intCast(pos),
+        };
+        try list.append(al, .{ .pos = pos, .layers = layers });
+
+        if (list.items.len > 4) {
+            _ = thinHeldCheckpoints(al, &list, 4, .anchored_lru, 4096, true);
+        }
+    }
+
+    // The aligned checkpoints model the cold-prefill snapshots before handoff:
+    // no pooled bank and no local leftover rows at these QSA block boundaries.
+    var anchor_survived = false;
+    for (list.items) |cp| anchor_survived = anchor_survived or cp.pos == 4096;
+    try testing.expect(anchor_survived);
+    try testing.expectEqualSlices(usize, &.{ 4096, 49_152, 51_200, 53_248 }, &.{
+        list.items[0].pos,
+        list.items[1].pos,
+        list.items[2].pos,
+        list.items[3].pos,
+    });
+}
+
+test "anchored prefill cap one keeps newest and cap two keeps anchor plus newest" {
+    const al = testing.allocator;
+    for ([_]u32{ 1, 2 }) |cap| {
+        var list = std.ArrayList(SSMCheckpoint).empty;
+        defer {
+            for (list.items) |*cp| cp.deinit(al);
+            list.deinit(al);
+        }
+        for (1..5) |stride_index| {
+            const pos = stride_index * 2048;
+            const layers = try al.alloc(transformer_mod.SSMCacheEntrySnapshot, 1);
+            layers[0] = .{
+                .conv_state = .{ .ctx = null },
+                .ssm_state = .{ .ctx = null },
+                .initialized = true,
+                .qsa_ratio = 4,
+                .qsa_rows = @intCast(pos),
+            };
+            try list.append(al, .{ .pos = pos, .layers = layers });
+            if (list.items.len > cap) _ = thinHeldCheckpoints(al, &list, cap, .anchored_lru, 4096, true);
+        }
+        if (cap == 1) {
+            try testing.expectEqualSlices(usize, &.{8192}, &.{list.items[0].pos});
+        } else {
+            try testing.expectEqualSlices(usize, &.{ 4096, 8192 }, &.{ list.items[0].pos, list.items[1].pos });
+        }
+    }
 }
 
 test "every ladder rung the adaptive width can take divides the checkpoint stride" {

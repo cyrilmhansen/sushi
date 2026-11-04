@@ -401,6 +401,28 @@ pub fn checkpointQsaCoversPos(cp: *const SSMCheckpoint, src: *const SSMCheckpoin
     return qsaSourceHoldsRowsAt(cp, p, want_lv) or qsaSourceHoldsRowsAt(src, p, want_lv);
 }
 
+/// A prefill checkpoint can be protected before the pooled bank is handed off, but only when
+/// its captured QSA metadata agrees with the exact checkpoint position. This proves the local
+/// leftover is suitable for a later bank handoff; it does not prove restorability by itself.
+pub fn checkpointHasProvisionalQsaPoint(cp: *const SSMCheckpoint, pos: usize) bool {
+    if (cp.layers.len == 0 or cp.isReleased() or cp.pos != pos) return false;
+    const qsa_pos: c_int = @intCast(pos);
+    var found_qsa = false;
+    for (cp.layers) |*l| {
+        if (l.qsa_ratio <= 0) continue;
+        found_qsa = true;
+        if (l.qsa_rows != qsa_pos) return false;
+        const want_leftover = @rem(qsa_pos, l.qsa_ratio);
+        const held_leftover: c_int = if (l.aux_state.ctx == null) 0 else blk: {
+            const shape = mlx.getShape(l.aux_state);
+            if (shape.len < 2) return false;
+            break :blk shape[1];
+        };
+        if (held_leftover != want_leftover) return false;
+    }
+    return found_qsa;
+}
+
 pub fn qsaEntrySatisfiesForward(e: *const SSMCacheEntry, pos: c_int) bool {
     if (!ssmAuxIsQsaHistory(e)) return true;
     if (qsaHistoryRows(e) != pos) return false;
@@ -1748,6 +1770,76 @@ test "handoffQsaHistoryToLatest: the newest snap takes a VIEW of the live buffer
     try testing.expectEqual(QSA_RING_ROWS, mlx.getShape(live[0].aux_state)[1]);
     ssmFreeQsaState(&live[0]);
     try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got.qsa_pooled, ref[0].layers[0].qsa_pooled, s));
+}
+
+test "anchored prefill retains 4096 provisionally, then only a complete handoff makes it restorable" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    const al = testing.allocator;
+    var cps = std.ArrayList(SSMCheckpoint).empty;
+    defer {
+        for (cps.items) |*cp| cp.deinit(al);
+        cps.deinit(al);
+    }
+
+    // Exercise the same selector used by prefill thinning across a cold 53,248-token run.
+    for (1..27) |stride_index| {
+        const pos = stride_index * 2048;
+        const layers = try al.alloc(SSMCacheEntrySnapshot, 1);
+        layers[0] = .{
+            .conv_state = mlx.mlx_array_new(),
+            .ssm_state = mlx.mlx_array_new(),
+            .initialized = true,
+            .qsa_ratio = 4,
+            .qsa_rows = @intCast(pos),
+        };
+        try cps.append(al, .{ .pos = pos, .layers = layers });
+        if (cps.items.len > 4) {
+            const drop = trf.ssmCheckpointDropIndexAnchoredLruPrefill(cps.items, 4096, 4);
+            var removed = cps.orderedRemove(drop);
+            removed.deinit(al);
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), cps.items.len);
+    try testing.expectEqualSlices(usize, &.{ 4096, 49_152, 51_200, 53_248 }, &.{
+        cps.items[0].pos,
+        cps.items[1].pos,
+        cps.items[2].pos,
+        cps.items[3].pos,
+    });
+    try testing.expectEqual(@as(c_int, 0), checkpointQsaAuxRows(&cps.items[0]));
+
+    // Supply the live full-history bank only at the commit boundary, as production does.
+    var live = [_]SSMCacheEntry{.{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = true,
+        .qsa_ratio = 4,
+        .qsa_hist_rows = 53_248,
+    }};
+    defer ssmFreeQsaState(&live[0]);
+    try mlx.check(mlx.mlx_ones(&live[0].qsa_pooled, &[_]c_int{ 1, 13_312, 1 }, 3, .float32, s));
+    try handoffQsaHistoryToLatest(cps.items, &live, s);
+
+    const anchor = &cps.items[0];
+    const source = &cps.items[cps.items.len - 1];
+    try testing.expect(checkpointHasQsaPooled(source));
+    try testing.expect(checkpointQsaCoversPos(anchor, source, 4096));
+    try testing.expect(checkpointQsaCoversPos(source, source, 53_248));
+    try testing.expectEqual(@as(?usize, 0), trf.ssmCheckpointAnchorIndex(cps.items, 5614, true));
+
+    // The single pooled bank, not a copy attached at every stride, now covers the anchor.
+    var pooled_count: usize = 0;
+    for (cps.items) |*cp| pooled_count += @intFromBool(checkpointHasQsaPooled(cp));
+    try testing.expectEqual(@as(usize, 1), pooled_count);
+
+    // Model a failed/incomplete deferred handoff. The candidate remains ineligible and cannot
+    // be advertised as the anchored restore point.
+    _ = mlx.mlx_array_free(source.layers[0].qsa_pooled);
+    source.layers[0].qsa_pooled = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_ones(&source.layers[0].qsa_pooled, &[_]c_int{ 1, 1023, 1 }, 3, .float32, s));
+    try testing.expect(!checkpointQsaCoversPos(anchor, source, 4096));
+    try testing.expect(trf.ssmCheckpointAnchorIndex(cps.items, 5614, true) == null);
 }
 
 test "handoffQsaHistoryToLatest materializes when the buffer's slack past the snap exceeds QSA_HANDOFF_MAX_SLACK_ROWS" {
