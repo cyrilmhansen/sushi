@@ -84,11 +84,12 @@ function installStubs(config) {
     if (url.origin !== location.origin) return realFetch(input, init);
     if (stub.down) throw new TypeError('Failed to fetch');
     const headers = new Headers(init.headers ?? {});
-    stub.calls.push({ path: url.pathname, search: url.search, auth: headers.get('authorization'), method: init.method ?? 'GET' });
+    stub.calls.push({ path: url.pathname, search: url.search, auth: headers.get('authorization'), method: init.method ?? 'GET', body: init.body });
     switch (url.pathname) {
       case '/health': return json({ status: 'ok' });
       case '/v1/models': return json({ data: stub.noModels ? [] : [{ id: stub.modelId ?? 'org/test-model', state: 'ready', loaded: true, capabilities: ['chat'], context_length: 8192, bytes_resident: 3e9, meta: { kv_quant: 8 } }] });
       case '/props': return json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: { disk_bytes: 20 * 2 ** 30, disk_used_bytes: 2 * 2 ** 30, disk_written_bytes: 4 * 2 ** 30, disk_entries: 3 } }, memory: { available_bytes: 5e9, total_bytes: 128 * 2 ** 30 }, batching: { supported: true, max_group: 4 }, default_generation_settings: { n_ctx: 8192 } });
+      case '/v1/slots/cancel': return stub.cancelStatus === 404 ? json({ error: { message: 'No in-flight request matches that id' } }, 404) : json({ ok: true });
       case '/v1/tools': return json({ edit_default: false });
       case '/metrics/enable':
         if (stub.enableStatus !== 200) return json({ error: { message: 'refused' } }, stub.enableStatus);
@@ -123,7 +124,7 @@ function installStubs(config) {
           const clock = stub.noClock ? { gpu_clock_mhz: 0, gpu_clock_max_mhz: 0 } : { gpu_clock_mhz: 1200, gpu_clock_max_mhz: 1620 };
           return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, gpu_utilization_pct: 50, ...clock }, histograms: {}, sessions: [], history: { interval_ms: 2000, capacity: 1800, fields, samples } });
         }
-        return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, prefill_tokens_live: stub.prefillTick = (stub.prefillTick ?? 0) + (stub.prefillStep ?? 0), gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: [], prefix_cache_writes: { written_bytes: { kv: 2 ** 30 * stub.metricsTick, ssm: 2 ** 20, qsa: 0, spec: 0, ring: 0, meta: 1024 }, failed_bytes: 3 * 2 ** 20 } });
+        return json({ counters: { prompt_tokens_total: 10 }, gauges: { requests_running: 1, generation_tokens_live: stub.metricsTick = (stub.metricsTick ?? 0) + 40, prefill_tokens_live: stub.prefillTick = (stub.prefillTick ?? 0) + (stub.prefillStep ?? 0), gpu_utilization_pct: 55, memory_mb: 4096 }, histograms: {}, sessions: stub.sessions ?? [], prefix_cache_writes: { written_bytes: { kv: 2 ** 30 * stub.metricsTick, ssm: 2 ** 20, qsa: 0, spec: 0, ring: 0, meta: 1024 }, failed_bytes: 3 * 2 ** 20 } });
       case '/v1/chat/completions': {
         stub.streams += 1;
         const signal = init.signal;
@@ -378,6 +379,20 @@ async function dashboardBugs(browser) {
     assert.equal((await metricsCalls(page)).length, m + 1, 'one refresh at once, then the new interval');
     await context.close();
   }
+  for (const height of [720, 600]) {
+    // A tile's fly-over opens below the top bar and inside the window, whatever the window height.
+    const { page, context } = await openPage(browser, '/dashboard', { contextOptions: { viewport: { width: 1280, height } } });
+    await page.waitForSelector('[data-tile="mem"]');
+    for (const tile of ['mem', 'cache']) {
+      await page.hover(`[data-tile="${tile}"]`);
+      await page.waitForFunction(() => getComputedStyle(document.getElementById('dashTip')).display === 'block', null, { timeout: 5000 });
+      const box = await page.evaluate(() => { const b = document.getElementById('dashTip').getBoundingClientRect(); return { top: b.top, bottom: b.bottom, left: b.left, right: b.right, bar: document.getElementById('appTopbar').getBoundingClientRect().bottom, w: innerWidth, h: innerHeight }; });
+      assert.ok(box.top >= box.bar, `${tile} at ${height}px: the fly-over starts below the top bar (${JSON.stringify(box)})`);
+      assert.ok(box.bottom <= box.h && box.left >= 0 && box.right <= box.w, `${tile} at ${height}px: and stays inside the window (${JSON.stringify(box)})`);
+      await page.mouse.move(2, height - 2);
+    }
+    await context.close();
+  }
   {
     // Charts answer a tap and the keyboard, not only a mouse.
     const { page, context } = await simPage(browser, { contextOptions: { hasTouch: true } });
@@ -483,6 +498,28 @@ async function main() {
   }
   try {
     await dashboardBugs(browser);
+    {
+      // A running request has a Cancel button that posts its id; a cached conversation has none.
+      const row = (request_id, phase) => ({ request_id, model: 'org/test-model', phase, context_length: 8192, context_tokens: 100, cached_tokens: 0, generated_tokens: 5, elapsed_seconds: 3, state_bytes: 1 << 20 });
+      const sessions = [row(7, 'decode'), row(8, 'cached')];
+      const { page, errors, context } = await openPage(browser, '/dashboard', { sessions });
+      await page.waitForSelector('#dashSessions button[data-cancel]');
+      assert.equal(await page.locator('#dashSessions button').count(), 1, 'only the decode row has a button');
+      await page.click('#dashSessions button[data-cancel="7"]');
+      await page.waitForFunction(() => document.querySelector('#dashSessions button')?.textContent === 'Cancelled');
+      const posts = await page.evaluate(() => window.__stub.calls.filter((c) => c.path === '/v1/slots/cancel'));
+      assert.deepEqual(posts.map((c) => [c.method, JSON.parse(c.body)]), [['POST', { id: 7 }]]);
+      assert.equal(await page.isDisabled('#dashSessions button'), true, 'the button stays off once clicked');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+    {
+      const { page, context } = await openPage(browser, '/dashboard', { sessions: [{ request_id: 9, model: 'org/test-model', phase: 'prefill', context_length: 8192 }], cancelStatus: 404 });
+      await page.click('#dashSessions button[data-cancel="9"]');
+      await page.waitForFunction(() => document.querySelector('#dashSessions button')?.textContent === 'Failed');
+      assert.equal(await page.getAttribute('#dashSessions button', 'title'), 'No in-flight request matches that id', 'the server\'s message rides the title');
+      await context.close();
+    }
     {
       const { page, errors, context } = await openPage(browser, '/chat');
       await page.waitForSelector('#modelSelect option', { state: 'attached' });
@@ -754,9 +791,13 @@ async function main() {
       const rows = () => page.evaluate(() => Object.fromEntries([...document.querySelectorAll('#dashWrites span')].reduce((acc, el, i, all) => (i % 2 ? acc : [...acc, [el.textContent, all[i + 1].textContent]]), [])));
       await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
       // The rate needs two polls and the ratio needs /props: wait for both, then read one consistent render.
-      await page.waitForFunction(() => /\/s$/.test(document.querySelector('#dashWrites span:nth-child(4)')?.textContent ?? '') && /x$/.test(document.querySelector('#dashWrites span:nth-child(6)')?.textContent ?? ''), null, { timeout: 15000 });
+      await page.waitForFunction(() => {
+        const spans = [...document.querySelectorAll('#dashWrites span')];
+        const value = (label) => spans[spans.findIndex((el) => el.textContent === label) + 1]?.textContent ?? '';
+        return /\/s$/.test(value('Write rate')) && /x$/.test(value('Written per byte on disk'));
+      }, null, { timeout: 15000 });
       const card = await rows();
-      for (const label of ['Written', 'Write rate', 'Written per byte on disk', 'KV chunks', 'Restore points', 'QSA history', 'Speculative state', 'Ring points', 'Manifests and token records', 'Failed or dropped']) {
+      for (const label of ['Cache location', 'Written', 'Write rate', 'Written per byte on disk', 'KV chunks', 'Restore points', 'QSA history', 'Speculative state', 'Ring points', 'Manifests and token records', 'Failed or dropped']) {
         assert.ok(label in card, `the card has a ${label} row`);
       }
       assert.equal(card['Failed or dropped'], '3.0 MiB', 'failed bytes are named apart from the written ones');

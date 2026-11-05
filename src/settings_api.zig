@@ -4,6 +4,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const model_settings = @import("model_settings.zig");
+const default_port = @import("default_port.zig");
 const model_registry_mod = @import("model_registry.zig");
 const disk_placement = @import("disk_placement.zig");
 const http_conn = @import("http_conn.zig");
@@ -15,6 +16,9 @@ const model_load = @import("model_load.zig");
 const models_api = @import("models_api.zig");
 const expert_stream = @import("expert_stream.zig");
 const chat = @import("chat.zig");
+const kv_quant_mod = @import("kv_quant.zig");
+const update_mod = @import("update.zig");
+const pack_update = @import("pack_update.zig");
 
 const Edit = model_settings.Edit;
 
@@ -32,6 +36,8 @@ pub const ModelRow = struct {
     index_complete: bool = false,
     /// The file values a ready model's load stamped; null for a model that is not loaded.
     loaded: ?model_settings.Override = null,
+    /// What each key resolves to with no flag and no file value, for a ready model; a null field = not knowable.
+    defaults: ?model_settings.Override = null,
     tier: ?TierView = null,
 };
 
@@ -55,6 +61,7 @@ fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
     if (eql(u8, name, "preserve_thinking")) return if (o.preserve_thinking) |v| .{ .bool = v } else null;
     if (eql(u8, name, "think_penalty")) return if (o.think_penalty) |v| .{ .float = v } else null;
     if (eql(u8, name, "vision")) return if (o.vision) |v| .{ .bool = v } else null;
+    if (eql(u8, name, "max_tokens")) return if (o.max_tokens) |v| .{ .integer = v } else null;
     return null;
 }
 
@@ -71,6 +78,26 @@ fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
         .preserve_thinking = config.preserve_thinking_override,
         .think_penalty = config.think_penalty_override,
         .vision = config.vision_override,
+        .max_tokens = config.max_tokens_override,
+    };
+}
+
+/// What a loaded model's keys resolve to when the file and the launch flags say nothing, read from the loader's own
+/// resolvers on a config with its overrides cleared. `ctx_size` and `ssd_budget_gb` stay null: they are measured at load.
+pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Override {
+    var bare = config.*;
+    model_load.applyModelSettings(&bare, .{});
+    bare.ssd_prefetch = null;
+    return .{
+        .kv_quant = server.kvCacheForLaunch(&bare, kv_quant_mod.KVQuantConfig.engine_default, false).config,
+        .mtp = model_load.mtpChoiceFor(false, false, &bare).on,
+        .mtp_acceptance = model_settings.default_mtp_acceptance,
+        .mtp_greedy_tail = model_settings.default_mtp_greedy_tail,
+        .ssd_prefetch = bare.ssdPrefetchPct(),
+        .preserve_thinking = model_settings.default_preserve_thinking,
+        .think_penalty = model_settings.default_think_penalty,
+        .vision = model_settings.VisionChoice.resolve(null, null, model_load.visionDefaultOn(&bare, bare.expert_streaming)).on,
+        .max_tokens = bare.defaultMaxTokens(),
     };
 }
 
@@ -142,6 +169,19 @@ fn writeLimits(w: *std.Io.Writer, fit: model_settings.Fit) !void {
     try w.writeAll("}");
 }
 
+const port_applies = "the next start; a running server keeps its port";
+
+/// A server-wide on/off key: the file's value, the pinning flag, and the default it falls back to.
+fn writeAutoCheck(w: *std.Io.Writer, name: []const u8, file: ?bool, lock: *const model_settings.Lock) !void {
+    try w.print(",\"{s}\":{{\"file\":", .{name});
+    try writeJson(w, file);
+    try w.writeAll(",\"flag\":");
+    if (lock.set) try writeJson(w, lock.text()) else try w.writeAll("null");
+    try w.print(",\"default\":true,\"source\":\"{s}\",\"locked\":{},\"applies\":\"applies at once\"}}", .{
+        if (lock.set) "flag" else if (file != null) "file" else "default", lock.set,
+    });
+}
+
 pub fn render(
     allocator: std.mem.Allocator,
     file_path: []const u8,
@@ -199,7 +239,18 @@ pub fn render(
         try writeJson(w, row.id);
         try w.print(",\"cap_bytes\":{d},\"used_bytes\":{d}}}", .{ t.cap_bytes, t.used_bytes });
     };
-    try w.writeAll("],\"applies\":\"a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load\"}}");
+    try w.writeAll("],\"applies\":\"a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load\"}");
+    try writeAutoCheck(w, "update_check", srv.update_check, &locks.update_check);
+    try writeAutoCheck(w, "pack_update_check", srv.pack_update_check, &locks.pack_update_check);
+    const port_pinned = locks.port.set;
+    try w.writeAll(",\"port\":{\"file\":");
+    try writeJson(w, srv.port);
+    try w.writeAll(",\"flag\":");
+    if (port_pinned) try writeJson(w, locks.port.text()) else try w.writeAll("null");
+    try w.print(",\"default\":{d},\"source\":\"{s}\",\"locked\":{},\"applies\":\"{s}\"}}", .{
+        default_port.port, if (port_pinned) "flag" else if (srv.port != null) "file" else "default", port_pinned, port_applies,
+    });
+    try w.writeAll("}");
 
     try w.writeAll(",\"models\":[");
     for (rows, 0..) |row, i| {
@@ -227,6 +278,18 @@ pub fn render(
                 try w.print("\"{s}\":", .{k.name});
                 try writeJson(w, overrideValue(o, k.name));
             }
+            try w.writeAll("}");
+        } else try w.writeAll("null");
+        try w.writeAll(",\"defaults\":");
+        if (row.defaults) |o| {
+            try w.writeAll("{");
+            var first_default = true;
+            for (model_settings.model_keys) |k| if (overrideValue(o, k.name)) |v| {
+                if (!first_default) try w.writeAll(",");
+                first_default = false;
+                try w.print("\"{s}\":", .{k.name});
+                try writeJson(w, v);
+            };
             try w.writeAll("}");
         } else try w.writeAll("null");
         try w.writeAll(",\"settings\":{");
@@ -356,6 +419,7 @@ fn heldRow(e: *model_registry_mod.LoadedModel) ModelRow {
         const c = e.config.?;
         row.fit = server.settingsFit(c);
         row.loaded = loadedWith(c);
+        row.defaults = resolvedDefaults(c);
         if (e.chat_config) |cc| {
             row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(cc.chat_template);
             row.fit.template_thinks = chat.templateHasThinkSpan(cc.chat_template);
@@ -490,6 +554,10 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
         try w.print("\"{s}\":", .{e.key});
         if (std.mem.eql(u8, e.key, "prefix_cache_disk_gb")) {
             try writeJson(w, applyCacheBudget(sch, e.value));
+        } else if (std.mem.eql(u8, e.key, "update_check") or std.mem.eql(u8, e.key, "pack_update_check")) {
+            try writeJson(w, applyUpdateCheck(&model_settings.launch_locks, e.key, e.value));
+        } else if (std.mem.eql(u8, e.key, "port")) {
+            try writeJson(w, portMessage(&model_settings.launch_locks));
         } else {
             try writeJson(w, applyModelsDir(sch, &message_buf));
         }
@@ -541,6 +609,19 @@ fn applyCacheBudget(sch: *@import("scheduler.zig").Scheduler, value: ?std.json.V
     return cacheBudgetMessage(resized);
 }
 
+/// The loops read the published value before each look, so a toggle needs no restart; null (key removed) is the default, on.
+fn applyUpdateCheck(locks: *const model_settings.LaunchLocks, key: []const u8, value: ?std.json.Value) []const u8 {
+    const is_sushi = std.mem.eql(u8, key, "update_check");
+    if ((if (is_sushi) locks.update_check else locks.pack_update_check).set) return "saved; --no-update-check still keeps it off until a start without it";
+    const on = if (value) |v| v.bool else true;
+    if (is_sushi) update_mod.setAutoCheck(on) else pack_update.setAuto(on);
+    return "applies at once";
+}
+
+fn portMessage(locks: *const model_settings.LaunchLocks) []const u8 {
+    return if (locks.port.set) "saved; the --port flag still sets the port until a start without it" else "saved; applies at the next start";
+}
+
 fn modelsDirMessage(buf: []u8, rescan: anyerror!u32) []const u8 {
     const added = rescan catch return "saved; the rescan failed, use /v1/models/rescan";
     return std.fmt.bufPrint(buf, "saved; models rescanned, {d} added", .{added}) catch "saved; models rescanned";
@@ -579,7 +660,7 @@ test "settings api: a request names real keys with valid values, or is refused w
     try testing.expectEqualStrings("m", ok.ok.model_id.?);
 
     try expectRejected("{\"model\":\"m\",\"set\":{\"temperature\":1}}", 400, "unknown_setting");
-    try expectRejected("{\"server\":{\"port\":1}}", 400, "unknown_setting");
+    try expectRejected("{\"server\":{\"colour\":1}}", 400, "unknown_setting");
     try expectRejected("{\"model\":\"m\",\"set\":{\"ssd_prefetch\":101}}", 400, "invalid_setting");
     try expectRejected("{\"server\":{\"models_dir\":\"relative\"}}", 400, "invalid_setting");
     try expectRejected("{\"set\":{\"mtp\":true}}", 400, "invalid_request_error");
@@ -587,6 +668,115 @@ test "settings api: a request names real keys with valid values, or is refused w
     try expectRejected("{}", 400, "invalid_request_error");
     try expectRejected("[1]", 400, "invalid_request_error");
     try expectRejected("nope", 400, "invalid_request_error");
+}
+
+test "settings api: the update-check keys take a boolean and nothing else" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const ok = parseRequest(arena_state.allocator(), "{\"server\":{\"update_check\":false,\"pack_update_check\":null}}");
+    try testing.expectEqual(@as(usize, 2), ok.ok.server_edits.len);
+    try testing.expect(!ok.ok.server_edits[0].value.?.bool);
+    try testing.expect(ok.ok.server_edits[1].value == null);
+    try expectRejected("{\"server\":{\"update_check\":\"off\"}}", 400, "invalid_setting");
+    try expectRejected("{\"server\":{\"pack_update_check\":0}}", 400, "invalid_setting");
+}
+
+test "settings api: render reports both update-check keys with their default, file value, and the flag that pins them" {
+    var file = try model_settings.parse(testing.allocator, "{\"server\": {\"update_check\": false}}");
+    defer file.deinit();
+    var locks: model_settings.LaunchLocks = .{};
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
+    {
+        const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+        defer testing.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        const srv = parsed.value.object.get("server").?.object;
+        const u = srv.get("update_check").?.object;
+        try testing.expect(!u.get("file").?.bool);
+        try testing.expect(u.get("default").?.bool);
+        try testing.expectEqualStrings("file", u.get("source").?.string);
+        try testing.expect(!u.get("locked").?.bool);
+        try testing.expect(u.get("flag").? == .null);
+        const p = srv.get("pack_update_check").?.object;
+        try testing.expect(p.get("file").? == .null);
+        try testing.expectEqualStrings("default", p.get("source").?.string);
+    }
+    locks.update_check.pin("--no-update-check", .{});
+    locks.pack_update_check.pin("--no-update-check", .{});
+    const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    for ([_][]const u8{ "update_check", "pack_update_check" }) |k| {
+        const o = parsed.value.object.get("server").?.object.get(k).?.object;
+        try testing.expectEqualStrings("flag", o.get("source").?.string);
+        try testing.expect(o.get("locked").?.bool);
+        try testing.expectEqualStrings("--no-update-check", o.get("flag").?.string);
+    }
+}
+
+test "settings api: render reports the default port with the file's value, the pinning flag and when it applies" {
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
+    var locks: model_settings.LaunchLocks = .{};
+    {
+        var file = try model_settings.parse(testing.allocator, "{\"server\": {\"port\": 8080}}");
+        defer file.deinit();
+        const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+        defer testing.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        const p = parsed.value.object.get("server").?.object.get("port").?.object;
+        try testing.expectEqual(@as(i64, 8080), p.get("file").?.integer);
+        try testing.expectEqual(@as(i64, 12345), p.get("default").?.integer);
+        try testing.expectEqualStrings("file", p.get("source").?.string);
+        try testing.expect(!p.get("locked").?.bool);
+        try testing.expect(std.mem.indexOf(u8, p.get("applies").?.string, "next start") != null);
+    }
+    var empty = try model_settings.parse(testing.allocator, "{}");
+    defer empty.deinit();
+    locks.port.pin("9000", .{});
+    const body = try render(testing.allocator, "/h/s.json", &empty, &.{}, &locks, view);
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const p = parsed.value.object.get("server").?.object.get("port").?.object;
+    try testing.expect(p.get("file").? == .null);
+    try testing.expectEqualStrings("flag", p.get("source").?.string);
+    try testing.expect(p.get("locked").?.bool);
+    try testing.expectEqualStrings("9000", p.get("flag").?.string);
+}
+
+test "settings api: server.port takes a whole port from 1 to 65535 or null, and says a flag still wins" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const ok = parseRequest(arena_state.allocator(), "{\"server\":{\"port\":8080}}");
+    try testing.expectEqual(@as(i64, 8080), ok.ok.server_edits[0].value.?.integer);
+    try testing.expect(parseRequest(arena_state.allocator(), "{\"server\":{\"port\":null}}").ok.server_edits[0].value == null);
+    for ([_][]const u8{ "0", "65536", "-1", "\"80\"", "80.5", "true" }) |bad| {
+        const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"server\":{{\"port\":{s}}}}}", .{bad});
+        try expectRejected(body, 400, "invalid_setting");
+    }
+    var locks: model_settings.LaunchLocks = .{};
+    try testing.expect(std.mem.indexOf(u8, portMessage(&locks), "next start") != null);
+    locks.port.pin("9000", .{});
+    try testing.expect(std.mem.indexOf(u8, portMessage(&locks), "--port flag still sets") != null);
+}
+
+test "settings api: a toggle reaches the loops at once, and a pinning flag keeps the key off" {
+    defer update_mod.setAutoCheck(true);
+    defer pack_update.setAuto(true);
+    var locks: model_settings.LaunchLocks = .{};
+    try testing.expectEqualStrings("applies at once", applyUpdateCheck(&locks, "update_check", .{ .bool = false }));
+    try testing.expect(!update_mod.autoCheckOn());
+    try testing.expect(pack_update.autoOn());
+    _ = applyUpdateCheck(&locks, "update_check", null);
+    try testing.expect(update_mod.autoCheckOn());
+    _ = applyUpdateCheck(&locks, "pack_update_check", .{ .bool = false });
+    try testing.expect(!pack_update.autoOn());
+    locks.pack_update_check.pin("--no-update-check", .{});
+    _ = applyUpdateCheck(&locks, "pack_update_check", .{ .bool = true });
+    try testing.expect(!pack_update.autoOn());
 }
 
 test "settings api: a kv_quant request in any spelling is stored as its choice name; a value the loader would not read is refused" {
@@ -735,4 +925,60 @@ test "settings api: render reports the file's value, the pinning flag and the wi
     try testing.expect(mtp.get("locked").?.bool);
     try testing.expect(!mtp.get("file").?.bool);
     try testing.expectEqual(@as(usize, model_settings.model_keys.len), root.get("model_keys").?.array.items.len);
+}
+
+test "settings api: a ready model reports the default each key resolves to; an unloaded one reports none" {
+    var file = try model_settings.parse(testing.allocator, "{}");
+    defer file.deinit();
+    const locks: model_settings.LaunchLocks = .{};
+    const dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 1_048_576, .serve_defaults = @import("dsv41/dsv41_config.zig").Config.serveDefaults(model_mod.ServeDefaults) };
+    const rows = [_]ModelRow{
+        .{ .id = "ready", .path = "/m/a", .state = "ready", .bytes = 5, .defaults = resolvedDefaults(&dsv41) },
+        .{ .id = "cold", .path = "/m/b", .state = "unloaded", .bytes = 5 },
+    };
+    const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const models = parsed.value.object.get("models").?.array.items;
+    const d = models[0].object.get("defaults").?.object;
+    try testing.expectEqual(@as(i64, 256_000), d.get("max_tokens").?.integer);
+    try testing.expectEqualStrings("exact", d.get("mtp_acceptance").?.string);
+    try testing.expect(d.get("mtp").?.bool);
+    try testing.expect(d.get("preserve_thinking").?.bool);
+    try testing.expectEqual(@as(i64, 0), d.get("think_penalty").?.integer);
+    try testing.expectEqual(@as(i64, 0), d.get("ssd_prefetch").?.integer);
+    // Measured at load, so never guessed.
+    try testing.expect(d.get("ctx_size") == null);
+    try testing.expect(d.get("ssd_budget_gb") == null);
+    try testing.expect(models[1].object.get("defaults").? == .null);
+}
+
+test "settings api: the resolved defaults ignore the file's values the config was stamped with" {
+    var stamped = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 262_144 };
+    model_load.applyModelSettings(&stamped, .{ .max_tokens = 999, .mtp = false, .kv_quant = kv_quant_mod.KVQuantConfig.affine(4), .vision = false, .ssd_prefetch = 40 });
+    const d = resolvedDefaults(&stamped);
+    try testing.expectEqual(@as(?u32, 0), d.max_tokens);
+    try testing.expectEqual(@as(?bool, true), d.mtp);
+    try testing.expectEqual(@as(u8, 8), d.kv_quant.?.bits);
+    try testing.expectEqual(@as(?bool, true), d.vision);
+    try testing.expectEqual(@as(?u8, 0), d.ssd_prefetch);
+    // What it was stamped with is still what the model loaded with.
+    try testing.expectEqual(@as(?u32, 999), loadedWith(&stamped).max_tokens);
+}
+
+test "settings api: max_tokens round-trips as a positive integer and is refused above the context window" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const ok = parseRequest(arena_state.allocator(), "{\"model\":\"m\",\"set\":{\"max_tokens\":32000}}");
+    try testing.expectEqual(@as(i64, 32000), ok.ok.model_edits[0].value.?.integer);
+    try expectRejected("{\"model\":\"m\",\"set\":{\"max_tokens\":0}}", 400, "invalid_setting");
+    try expectRejected("{\"model\":\"m\",\"set\":{\"max_tokens\":\"big\"}}", 400, "invalid_setting");
+    try expectRejected("{\"model\":\"m\",\"set\":{\"max_tokens\":1.5}}", 400, "invalid_setting");
+    const fit: model_settings.Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .context_cap = 131072 };
+    const edit = [_]Edit{.{ .key = "max_tokens", .value = .{ .integer = 200_000 } }};
+    const msg = refusalMessage(arena_state.allocator(), fit, null, &edit).?;
+    try testing.expect(std.mem.indexOf(u8, msg, "\"max_tokens\"") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "131072") != null);
+    try testing.expect(refusalMessage(arena_state.allocator(), fit, null, &.{.{ .key = "max_tokens", .value = .{ .integer = 131072 } }}) == null);
 }

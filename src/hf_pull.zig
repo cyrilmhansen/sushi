@@ -154,6 +154,79 @@ pub fn removeManifest(io: std.Io, dir_path: []const u8) void {
     dir.deleteFile(io, manifest_name) catch {};
 }
 
+pub const FileEvent = struct { index: usize, path: []const u8, size: u64, skip: bool };
+
+/// What a pull reports beside its lines, for a caller that draws progress (the web page's Available list).
+pub const PullEvent = union(enum) {
+    /// The files and bytes the pack downloads, and how many of those bytes are on disk already (`bytesPresent`),
+    /// before anything is written.
+    listed: struct { files: usize, bytes: u64, present: u64 },
+    /// Hashing the files already on disk.
+    checking,
+    /// File `index` (from 1) starts; `skip` when it is already complete.
+    file: FileEvent,
+    /// The curl process of the file in flight, still unreaped; null once it exited.
+    child: ?std.posix.pid_t,
+    /// The file is down; its checksum is being checked.
+    verifying,
+};
+
+/// The listed bytes a download need not fetch: files on disk at their listed size, and the partials of the others.
+pub fn bytesPresent(io: std.Io, dir_path: []const u8, files: []const RepoFile) u64 {
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return 0;
+    defer dir.close(io);
+    var total: u64 = 0;
+    for (files) |f| {
+        const whole = if (dir.statFile(io, f.path, .{})) |st| st.size == f.size else |_| false;
+        if (whole) {
+            total += f.size;
+            continue;
+        }
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const partial = std.fmt.bufPrint(&buf, "{s}.partial", .{f.path}) catch continue;
+        const size = (dir.statFile(io, partial, .{}) catch continue).size;
+        if (partialKeyed(dir, io, partial, f)) total += @min(size, f.size);
+    }
+    return total;
+}
+
+/// A `.partial` resumes only for the remote file it was started for: `<file>.partial.oid` holds "<oid> <size>".
+/// A partial with no key, or another one, is from a pull before keys or of another revision.
+pub fn keyMatches(sidecar: []const u8, f: RepoFile) bool {
+    if (f.oid.len == 0) return false;
+    var buf: [128]u8 = undefined;
+    const want = std.fmt.bufPrint(&buf, "{s} {d}", .{ f.oid, f.size }) catch return false;
+    return std.mem.eql(u8, std.mem.trim(u8, sidecar, " \r\n"), want);
+}
+
+fn partialKeyed(dir: std.Io.Dir, io: std.Io, partial: []const u8, f: RepoFile) bool {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const key_path = std.fmt.bufPrint(&path_buf, "{s}.oid", .{partial}) catch return false;
+    var buf: [128]u8 = undefined;
+    const got = dir.readFile(io, key_path, &buf) catch return false;
+    return keyMatches(got, f);
+}
+
+/// Before curl resumes `partial`: keeps it when it is keyed to `f`, else deletes it, and records `f`'s key.
+pub fn claimPartial(io: std.Io, partial: []const u8, f: RepoFile) !void {
+    if (f.oid.len == 0) return;
+    const cwd = std.Io.Dir.cwd();
+    if (!partialKeyed(cwd, io, partial, f)) cwd.deleteFile(io, partial) catch {};
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const key_path = try std.fmt.bufPrint(&path_buf, "{s}.oid", .{partial});
+    var buf: [128]u8 = undefined;
+    try cwd.writeFile(io, .{ .sub_path = key_path, .data = try std.fmt.bufPrint(&buf, "{s} {d}\n", .{ f.oid, f.size }) });
+}
+
+/// Removes `partial` and its key.
+pub fn dropPartial(io: std.Io, partial: []const u8) void {
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteFile(io, partial) catch {};
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const key_path = std.fmt.bufPrint(&path_buf, "{s}.oid", .{partial}) catch return;
+    cwd.deleteFile(io, key_path) catch {};
+}
+
 pub const Action = enum { skip, download, hash };
 
 /// What to do with one wanted file. `old` is the previous manifest's row for it (null: no manifest, or not named),
@@ -221,10 +294,12 @@ const HashJob = struct {
     dir_path: []const u8,
     files: []const RepoFile,
     match: []bool,
+    stop: ?*const std.atomic.Value(bool),
     next: std.atomic.Value(usize) = .init(0),
 
     fn run(self: *HashJob) void {
         while (true) {
+            if (self.stop) |s| if (s.load(.monotonic)) return;
             const i = self.next.fetchAdd(1, .monotonic);
             if (i >= self.files.len) return;
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -234,10 +309,11 @@ const HashJob = struct {
     }
 };
 
-/// Hashes the files in parallel; `match[i]` is whether `files[i]` on disk has its listed content id.
-pub fn hashMatches(io: std.Io, dir_path: []const u8, files: []const RepoFile, match: []bool) void {
+/// Hashes the files in parallel; `match[i]` is whether `files[i]` on disk has its listed content id. Once `stop` is
+/// set no further file starts (the rest read as not matching).
+pub fn hashMatches(io: std.Io, dir_path: []const u8, files: []const RepoFile, match: []bool, stop: ?*const std.atomic.Value(bool)) void {
     @memset(match, false);
-    var job = HashJob{ .io = io, .dir_path = dir_path, .files = files, .match = match };
+    var job = HashJob{ .io = io, .dir_path = dir_path, .files = files, .match = match, .stop = stop };
     var threads: [7]std.Thread = undefined;
     var spawned: usize = 0;
     const want = @min(threads.len, files.len -| 1);
@@ -342,8 +418,60 @@ test "hf pull: digests are the listing's sha256 and git blob sha1" {
         .{ .path = @constCast("missing"), .size = 6, .oid = @constCast("0000") },
     };
     var match: [3]bool = undefined;
-    hashMatches(testing.io, p[0..n], &files, &match);
+    hashMatches(testing.io, p[0..n], &files, &match, null);
     try testing.expectEqualSlices(bool, &.{ true, false, false }, &match);
+    const stopped = std.atomic.Value(bool).init(true);
+    hashMatches(testing.io, p[0..n], &files, &match, &stopped);
+    try testing.expectEqualSlices(bool, &.{ false, false, false }, &match);
+}
+
+test "hf pull: the bytes present are whole files at their listed size and the partials of the rest" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "whole", .data = "12345" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "old", .data = "123" }); // an older revision beside its partial
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "old.partial", .data = "12" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "old.partial.oid", .data = "abc 9\n" });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "legacy.partial", .data = "1234" }); // unkeyed: will not resume
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &p);
+    const files = [_]RepoFile{
+        .{ .path = @constCast("whole"), .size = 5 },
+        .{ .path = @constCast("old"), .size = 9, .oid = @constCast("abc") },
+        .{ .path = @constCast("legacy"), .size = 9, .oid = @constCast("def") },
+        .{ .path = @constCast("missing"), .size = 7 },
+    };
+    try testing.expectEqual(@as(u64, 7), bytesPresent(testing.io, p[0..n], &files));
+}
+
+test "hf pull: a partial resumes only under the key of its own remote file" {
+    const f: RepoFile = .{ .path = @constCast("m"), .size = 4096, .oid = @constCast("abc") };
+    try testing.expect(keyMatches("abc 4096\n", f));
+    try testing.expect(!keyMatches("abd 4096\n", f));
+    try testing.expect(!keyMatches("abc 4095\n", f));
+    try testing.expect(!keyMatches("", f));
+    try testing.expect(!keyMatches("abc 4096", .{ .path = f.path, .size = 4096 }));
+}
+
+test "hf pull: claiming a partial discards an unkeyed or foreign one and keeps its own" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &p);
+    const partial = try std.fmt.allocPrint(testing.allocator, "{s}/m.partial", .{p[0..n]});
+    defer testing.allocator.free(partial);
+    const f: RepoFile = .{ .path = @constCast("m"), .size = 4, .oid = @constCast("abc") };
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.partial", .data = "xx" });
+    try claimPartial(testing.io, partial, f);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "m.partial", .{}));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.partial", .data = "xx" });
+    try claimPartial(testing.io, partial, f);
+    _ = try tmp.dir.statFile(testing.io, "m.partial", .{});
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.partial.oid", .data = "other 4\n" });
+    try claimPartial(testing.io, partial, f);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "m.partial", .{}));
+    dropPartial(testing.io, partial);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "m.partial.oid", .{}));
 }
 
 test "hf pull: only files the old manifest named and the repo dropped are removed" {

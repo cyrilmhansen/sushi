@@ -23,9 +23,10 @@ const KEYS = [
   { name: 'mtp', type: 'bool' }, { name: 'mtp_acceptance', type: 'choice', choices: ['exact', 'typical', 'tokenv3'] }, { name: 'mtp_greedy_tail', type: 'bool' },
   { name: 'ssd_budget_gb', type: 'int', min: 1, max: 512 }, { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 },
   { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' },
+  { name: 'max_tokens', type: 'int', min: 1, max: 4294967295 },
 ];
 const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
-const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'mtp_acceptance', 'mtp_greedy_tail', 'preserve_thinking', 'think_penalty'];
+const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'mtp_acceptance', 'mtp_greedy_tail', 'preserve_thinking', 'think_penalty', 'max_tokens'];
 const allKeys = (over = {}) => Object.fromEntries(KEYS.map((k) => [k.name, over[k.name] ?? keyState()]));
 
 // A stub server: its state lives here in node, every call is recorded, and a test can hold a response back.
@@ -37,12 +38,15 @@ function makeServer(opts = {}) {
     models: [
       { id: 'Qwen-A', state: 'ready', bytes_on_disk: 38 * GiB, bytes_resident: 40 * GiB, context_length: 262144, input_modalities: ['text', 'image'], keys: [...BASE_KEYS, 'vision'], settings: allKeys({ ctx_size: keyState({ file: 65536, source: 'file' }), kv_quant: keyState({ flag: '8', source: 'flag', locked: true }) }) },
       { id: 'GLM-B', state: 'unloaded', bytes_on_disk: 61 * GiB, context_length: 131072, input_modalities: ['text'], keys: BASE_KEYS, settings: allKeys({ kv_quant: keyState({ file: 'off', source: 'file' }) }) },
-      { id: 'Deep-C', state: 'unloaded', bytes_on_disk: 96 * GiB, bytes_linked: 40 * GiB, pack_update: { current: '1.0', latest: '2.0', command: 'sushi pull deepseek-v4.1-flash' }, streaming: true, context_length: 131072, input_modalities: ['text'], keys: [...BASE_KEYS, 'ssd_budget_gb', 'ssd_prefetch'], settings: allKeys() },
+      { id: 'Deep-C', state: 'unloaded', bytes_on_disk: 96 * GiB, bytes_linked: 40 * GiB, pack_update: { current: '1.0', latest: '2.0', command: 'sushi pull deepseek-v4.1-flash', repo: 'beamster/Deep-Sushi' }, streaming: true, context_length: 131072, input_modalities: ['text'], keys: [...BASE_KEYS, 'ssd_budget_gb', 'ssd_prefetch'], settings: allKeys() },
       { id: 'Broke-D', state: 'error_state', bytes_on_disk: 20 * GiB, context_length: 8192, input_modalities: ['text'], keys: BASE_KEYS, settings: allKeys() },
     ],
     server: {
       models_dir: { default: '/h/.sushi/models', boot_roots: ['/models'], file: null, flag: '', source: 'default', locked: !!opts.dirLocked, applies: 'models are rescanned at once' },
       prefix_cache_disk_gb: { file: 100, flag: null, source: 'file', locked: false, effective_bytes: 100 * GiB, ask_bytes: 100 * GiB, applies: 'a running tier takes a new size at once and evicts down to it; 0 (off) and removing the key apply at the next load' },
+      update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
+      pack_update_check: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
+      port: { file: null, flag: null, default: 12345, source: 'default', locked: false, applies: 'the next start; a running server keeps its port' },
     },
     cache: {
       root: '/h/.sushi/kv-cache', volume: { free_bytes: 1399 * GiB, total_bytes: 3722 * GiB }, total_bytes: 71.5 * GiB,
@@ -53,9 +57,9 @@ function makeServer(opts = {}) {
       ],
     },
   };
-  const modelsBody = () => ({ data: state.models.map((m) => ({ id: m.id, object: 'model', loaded: m.state === 'ready', state: m.state === 'error_state' ? 'error' : m.state, bytes_resident: m.bytes_resident ?? 0, bytes_on_disk: m.bytes_on_disk, bytes_linked: m.bytes_linked ?? 0, streaming: !!m.streaming, streaming_required: !!m.streaming_required, ssd_budget_gb: m.ssd_budget_gb, context_length: m.context_length, input_modalities: m.input_modalities, capabilities: ['chat'], meta: { architecture: 'qwen4_exp', quantization: '2.75-bit', ...(m.pack_update ? { pack_update: m.pack_update } : {}) } })) });
+  const modelsBody = () => ({ data: state.models.map((m) => ({ id: m.id, object: 'model', loaded: m.state === 'ready', state: m.state === 'error_state' ? 'error' : m.state, bytes_resident: m.bytes_resident ?? 0, bytes_on_disk: m.bytes_on_disk, bytes_linked: m.bytes_linked ?? 0, streaming: !!m.streaming, streaming_required: !!m.streaming_required, ...(m.error ? { error: m.error } : {}), ssd_budget_gb: m.ssd_budget_gb, context_length: m.context_length, input_modalities: m.input_modalities, capabilities: ['chat'], meta: { architecture: 'qwen4_exp', quantization: '2.75-bit', ...(m.pack_update ? { pack_update: m.pack_update } : {}) } })) });
   const settingsBody = () => ({ file: '/h/.sushi/model-settings.json', applies: 'next load of the model', model_keys: KEYS, server: state.server,
-    models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
+    models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, defaults: m.defaults ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
   if (opts.limits) {
     state.models[0].limits = { ctx_size: { max: 131072, why: "This model's context window is 131072 tokens." }, kv_quant: { choices: ['off', '8'], why: '4-bit and 6-bit need a different cache layout.' },
       mtp_acceptance: { requires: { mtp: true }, why: 'Used only while MTP is on.' }, mtp_greedy_tail: { requires: { mtp: true }, why: 'Used only while MTP is on.' } };
@@ -147,7 +151,7 @@ async function main() {
       assert.equal(await page.evaluate(() => document.activeElement === window.__input), true, 'and so does focus');
       assert.equal(await page.evaluate(() => window.__input === document.querySelector('.set[data-key="ctx_size"] input')), true, 'the control is the same element');
       assert.ok(await page.isVisible('.savebar'), 'the save bar shows for a dirty form');
-      assert.match(await page.textContent('.savebar'), /1 unsaved change/);
+      assert.match(await page.textContent('.savebar'), /1 change/);
       assert.ok(server.count('/v1/settings', 'GET') >= 2, 'the page did poll');
       await page.click('.savebar button:text-is("Discard")');
       assert.equal(await page.inputValue(`${row('ctx_size')} input`), '65536', 'Discard restores the saved value');
@@ -155,6 +159,39 @@ async function main() {
       await page.evaluate(() => { window.__mutations = 0; window.__where = []; });
       await settle(page, 16_000);
       assert.equal(await page.evaluate(() => window.__mutations), 0, `identical answers cause no childList mutation (${await page.evaluate(() => window.__where)})`);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+
+    for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+      // Every Default says what the server would use; a model with no known default keeps the bare word.
+      const server = makeServer();
+      server.state.models[0].defaults = { kv_quant: '8', mtp: true, mtp_acceptance: 'exact', mtp_greedy_tail: false, preserve_thinking: true, think_penalty: 0, vision: false, max_tokens: 256000 };
+      const { page, context, errors } = await open(browser, server, '/models#Qwen-A', { viewport, mode: 'advanced' });
+      await page.waitForSelector(`${row('max_tokens')} input`);
+      const first = (key) => page.evaluate((k) => { const r = document.querySelector(`.set[data-key="${k}"]`); const o = r.querySelector('select option'); return o ? o.textContent : r.querySelector('.tri button').textContent; }, key);
+      assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default (256,000)', 'a number shows its default with separators');
+      assert.match(await page.textContent(`${row('max_tokens')} .lab`), /Max output tokens/);
+      assert.equal(await page.getAttribute(`${row('ctx_size')} input`, 'placeholder'), 'Default', 'a default measured at load is not guessed');
+      assert.equal(await first('kv_quant'), 'Default (8-bit)', 'a choice shows its label');
+      assert.equal(await first('mtp_acceptance'), 'Default (exact)');
+      assert.equal(await first('mtp'), 'Default (On)', 'a switch shows On or Off');
+      assert.equal(await first('mtp_greedy_tail'), 'Default (Off)');
+      assert.equal(await page.getAttribute(`${row('think_penalty')} input`, 'placeholder'), 'Default (0)');
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'no horizontal overflow');
+      await page.evaluate(() => { window.__mutations = 0; window.__where = []; new MutationObserver((list) => { window.__mutations += list.length; for (const m of list) window.__where.push(`${m.type}:${m.attributeName ?? ''}:${m.target.nodeName}.${m.target.className}`); }).observe(document.querySelector('#modelsDetail .rows'), { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['placeholder'] }); });
+      await settle(page, 16_000);
+      assert.equal(await page.evaluate(() => window.__mutations), 0, `an unchanged poll writes nothing (${await page.evaluate(() => window.__where.slice(0, 5))})`);
+      server.state.models[0].defaults = { ...server.state.models[0].defaults, kv_quant: 'off', max_tokens: 0, mtp: false };
+      await settle(page, 16_000);
+      assert.equal(await first('kv_quant'), 'Default (16-bit)');
+      assert.equal(await first('mtp'), 'Default (Off)');
+      assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default (rest of the context window)', 'no cap of its own means the window');
+      await page.goto(`${ORIGIN}/models#GLM-B`);
+      await page.waitForSelector(`${row('max_tokens')} input`);
+      assert.equal(await page.getAttribute(`${row('max_tokens')} input`, 'placeholder'), 'Default', 'a model that is not loaded keeps the bare word');
+      assert.equal(await first('kv_quant'), 'Default');
+      assert.equal(await first('mtp'), 'Default');
       assert.deepEqual(errors, []);
       await context.close();
     }
@@ -323,7 +360,7 @@ async function main() {
       // `streaming` only says the pack can stream; with no budget it loads resident.
       assert.match(await page.textContent('.detail .facts'), /can stream experts/);
       assert.match(await page.textContent('.detail .facts'), /96\.0 GiB on disk.*40\.0 GiB linked from elsewhere/);
-      assert.match(await page.textContent('.detail .facts'), /Pack 2\.0 available — sushi pull deepseek-v4\.1-flash/);
+      assert.doesNotMatch(await page.textContent('.detail .facts'), /sushi pull/, 'an update is never answered with sushi pull');
       await page.click('.list [data-id="Qwen-A"]');
       await page.waitForFunction(() => document.querySelector('#modelsDetail h2')?.textContent === 'Qwen-A');
       assert.doesNotMatch(await page.textContent('.detail .facts'), /linked from elsewhere|Pack .* available/);
@@ -440,6 +477,7 @@ async function main() {
     {
       // Per-model limits: a value or combination the model cannot run is refused on the row, before and after the save.
       const server = makeServer({ limits: true });
+      server.state.models[0].settings.kv_quant = keyState();
       const { page, context, errors } = await open(browser, server, '/models#Qwen-A', { mode: 'advanced' });
       await page.waitForSelector(`${row('ctx_size')} input`);
       await page.fill(`${row('ctx_size')} input`, '200000');
@@ -501,7 +539,7 @@ async function main() {
       assert.equal(await page.isVisible('.callout'), false, 'saving the loaded value back clears the prompt even after an earlier save');
       await page.click('#navSettings');
       await page.waitForSelector('#cacheRows tr');
-      assert.equal(await page.getAttribute('#cacheGb', 'placeholder'), '30', 'the placeholder is what the next load starts from');
+      assert.equal(await page.getAttribute('#cacheGb', 'placeholder'), 'Default (30)', 'the placeholder is what the next load starts from');
       const clears = page.locator('#cacheRows button:text-is("Clear…")');
       assert.equal(await clears.count(), 3, 'every stale row can be cleared on its own, and the loaded one');
       await page.click('#cacheRows tr:has-text("22.1") button');
@@ -584,6 +622,9 @@ async function main() {
       await settle(page, 16_000);
       assert.doesNotMatch(await page.innerText('#modelsAlert'), /null/);
       assert.equal(await page.locator('#modelsAlert button:text-is("Retry")').count(), 1);
+      assert.equal(await page.evaluate(() => document.getElementById('modelsMd').inert), true, 'nothing can be edited while the page cannot reach the server');
+      await page.click('#modelsAlert button:text-is("Retry")');
+      await page.waitForFunction(() => !document.getElementById('modelsMd').inert);
       server.state.hooks['/v1/settings'] = async (body, method) => (method === 'POST' ? { status: 500, contentType: 'text/html', body: '<html>boom</html>' } : null);
       await page.fill(`${row('ctx_size')} input`, '4096');
       await page.click('.savebar button:text-is("Save")');
@@ -612,8 +653,8 @@ async function main() {
       assert.match(await page.textContent('#cacheUsage'), /of 512 MiB/);
       assert.match(await page.textContent('#cacheCard'), /--prefix-cache-disk 512MB/);
       assert.match(await page.textContent('#cacheCard'), /Launch flag/);
-      assert.doesNotMatch(await page.textContent('.set[data-key="prefix_cache_disk_gb"]'), /Applies now/, 'a pinned size does not apply now');
-      assert.doesNotMatch(await page.textContent('#dirCard'), /Applies now/);
+      assert.doesNotMatch(await page.textContent('.set[data-key="prefix_cache_disk_gb"] .badges'), /Now|Next/, 'a pinned size has no timing badge');
+      assert.doesNotMatch(await page.textContent('#dirCard .badges'), /Now|Next/);
     });
     await scenario('a flag that pins MTP acceptance prints its own spelling', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
       s.state.models[0].settings.mtp_acceptance = keyState({ flag: '--mtp-tokenv3 0.5', source: 'flag', locked: true });
@@ -687,6 +728,16 @@ async function main() {
       await page.click('#confirmDialog >> text=Keep editing');
       await settle(page);
       assert.equal(await page.isVisible('#modelsPanel'), true);
+      assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
+    });
+    await scenario('Available with unsaved edits asks like a tab switch', { path: '/models#GLM-B' }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('#modelsTabAvailable');
+      assert.equal(await dialogOpen(page), true, 'the switch asks before leaving a dirty form');
+      await page.click('#confirmDialog >> text=Keep editing');
+      await settle(page);
+      assert.equal(await page.evaluate(() => location.pathname), '/models');
       assert.equal(await page.inputValue(`${row('ctx_size')} input`), '4096');
     });
     await scenario('a clean tab switch returns to the same model', { path: '/models' }, async ({ page }) => {
@@ -796,7 +847,7 @@ async function main() {
       assert.match(toast, /next model load/i);
       assert.doesNotMatch(toast, /now has 0/);
       await settle(page, 1000);
-      assert.doesNotMatch(await page.textContent('.set[data-key="prefix_cache_disk_gb"] .badges'), /Applies now/, 'a size of 0 applies at the next load');
+      assert.match(await page.textContent('.set[data-key="prefix_cache_disk_gb"] .badges'), /Next load/, 'a size of 0 applies at the next load');
     });
     await scenario('the model path shows when /v1/settings answers after /v1/models', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => {
       s.state.settingsDelay.push(new Promise((resolve) => { s.releaseSettings = resolve; }));
@@ -897,13 +948,238 @@ async function main() {
       await page.fill('#cacheGb', '100');
       assert.equal(await page.locator('#cacheCard .warn:visible').count(), 0);
     });
-    await scenario('Use default names the default size when the server says it', { path: '/settings', setup: (s) => { s.state.server.prefix_cache_disk_gb.default_bytes = 20 * GiB; } }, async ({ page }) => {
-      await page.waitForSelector('#cacheDefault');
-      assert.equal(await page.textContent('#cacheDefault'), 'Use default (20 GiB)');
+    await scenario('the automatic update checks show Default (On) and save On or Off', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('.set[data-key="update_check"]');
+      const row = (key) => page.locator(`.set[data-key="${key}"]`);
+      assert.equal(await row('update_check').locator('button[data-value="null"]').textContent(), 'Default (On)');
+      assert.equal(await row('update_check').locator('button[data-value="null"]').getAttribute('aria-pressed'), 'true');
+      await row('pack_update_check').locator('button[data-value="false"]').click();
+      await page.waitForFunction(() => document.querySelector('.set[data-key="pack_update_check"] button[data-value="false"]').getAttribute('aria-pressed') === 'true');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { pack_update_check: false } });
+      assert.equal(await row('update_check').locator('button[data-value="false"]').getAttribute('aria-pressed'), 'false', 'the other check is untouched');
     });
-    await scenario('Use default stays plain when the server does not say the default', { path: '/settings' }, async ({ page }) => {
-      await page.waitForSelector('#cacheDefault');
-      assert.equal(await page.textContent('#cacheDefault'), 'Use default');
+    await scenario('--no-update-check locks both automatic update checks', { path: '/settings', setup: (s) => {
+      for (const k of ['update_check', 'pack_update_check']) Object.assign(s.state.server[k], { flag: '--no-update-check', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector('.set[data-key="update_check"]');
+      assert.equal(await page.locator('.set[data-key="update_check"] button[data-value="true"]').isDisabled(), true);
+      assert.equal(await page.locator('.set[data-key="update_check"] button[data-value="false"]').getAttribute('aria-pressed'), 'true');
+      assert.match(await page.textContent('#updatesCard'), /Set by --no-update-check at launch/);
+      assert.match(await page.textContent('#updatesCard'), /Launch flag/);
+    });
+    await scenario('the default port shows its ghost text, refuses a bad number and saves a good one', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#portNum');
+      assert.equal(await page.getAttribute('#portNum', 'placeholder'), 'Default (12345)');
+      assert.equal(await page.isDisabled('#portSave'), true);
+      await page.fill('#portNum', '70000');
+      assert.equal(await page.isDisabled('#portSave'), true, 'a port past 65535 cannot be saved');
+      assert.match(await page.textContent('.set[data-key="port"]'), /1 to 65535/);
+      await page.fill('#portNum', '8080');
+      await page.click('#portSave');
+      await page.waitForFunction(() => document.querySelector('.set[data-key="port"] .badges').textContent.includes('Saved'));
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { port: 8080 } });
+      await page.fill('#portNum', '');
+      assert.equal(await page.textContent('#portSave'), 'Use default', 'an empty box saves the default');
+      await page.click('#portSave');
+      await page.waitForFunction(() => document.querySelector('#portNum').value === '');
+      assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings')[1].body, { server: { port: null } });
+    });
+    await scenario('--port locks the default port and names the flag', { path: '/settings', setup: (s) => {
+      Object.assign(s.state.server.port, { flag: '9000', source: 'flag', locked: true });
+    } }, async ({ page }) => {
+      await page.waitForSelector('#portNum');
+      assert.equal(await page.isDisabled('#portNum'), true);
+      assert.equal(await page.inputValue('#portNum'), '9000');
+      assert.match(await page.textContent('.set[data-key="port"]'), /Set by --port 9000 at launch/);
+    });
+
+    const badgesOf = (page, key) => page.textContent(`.set[data-key="${key}"] .badges`);
+    await scenario('every setting says when it applies: Now, Next load or Next start; a default row carries no badge', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#portNum');
+      assert.match(await badgesOf(page, 'port'), /Next start/);
+      assert.match(await badgesOf(page, 'update_check'), /Now/);
+      assert.match(await badgesOf(page, 'models_dir'), /Now/);
+      assert.match(await badgesOf(page, 'prefix_cache_disk_gb'), /Saved.*Now/);
+      assert.doesNotMatch(await badgesOf(page, 'port'), /Default/, 'the box already says Default');
+      server.state.server.prefix_cache_disk_gb.file = 0;
+      await page.evaluate(() => window.sushiAdmin.refresh());
+      await settle(page);
+      assert.match(await badgesOf(page, 'prefix_cache_disk_gb'), /Next load/);
+    });
+    await scenario('a model row is badged only when saved or pinned', { path: '/models#Qwen-A' }, async ({ page }) => {
+      await page.waitForSelector(row('ctx_size'));
+      assert.match(await badgesOf(page, 'ctx_size'), /Saved/);
+      assert.match(await badgesOf(page, 'kv_quant'), /Launch flag/);
+      assert.equal(await badgesOf(page, 'mtp'), '', 'a default row has no badge');
+    });
+    for (const [path, viewport] of [['/models#Qwen-A', { width: 1440, height: 900 }], ['/settings', { width: 1440, height: 900 }], ['/settings', phone]])
+      await scenario(`Default (On) stays on one line on ${path} at ${viewport.width}px`, { path, open: { viewport }, setup: (s) => { s.state.models[0].defaults = { mtp: true, vision: false, preserve_thinking: true }; } }, async ({ page }) => {
+        await page.waitForSelector('.tri button');
+        const wrapped = await page.$$eval('.tri button', (bs) => bs.filter((b) => b.offsetParent && (b.scrollHeight > b.clientHeight || b.scrollWidth > b.clientWidth)).map((b) => b.textContent));
+        assert.deepEqual(wrapped, [], 'no switch label wraps');
+        assert.match(await page.textContent('.tri button'), /^Default \(/);
+      });
+    await scenario('a loaded model\'s cache size shows without a click', { path: '/models#Qwen-A', open: { clock: false } }, async ({ page, server }) => {
+      await page.waitForSelector('.detail >> text=Clear this model', { timeout: 3000 });
+      assert.match(await page.textContent('.detail'), /41\.2 GiB/);
+      assert.ok(server.count('/v1/prefix-cache', 'GET') >= 1);
+    });
+    await scenario('About shows the version as soon as /props answers', { path: '/settings', setup: (s) => {
+      s.state.hooks['/props'] = async () => { await new Promise((resolve) => { s.releaseProps = resolve; }); return null; };
+    } }, async ({ page, server }) => {
+      await page.waitForSelector('#cacheCard:not([hidden])');
+      await page.waitForFunction(() => document.getElementById('aboutVersion').textContent === '-');
+      server.releaseProps();
+      await page.waitForFunction(() => document.getElementById('aboutVersion').textContent === 'v9.9.9', null, { timeout: 2000 });
+    });
+    await scenario('Load says what the server unloaded, and the button warns first', { path: '/models#GLM-B', setup: (s) => {
+      s.state.hooks['/v1/load-model'] = async () => { s.state.models[0].state = 'unloaded'; return null; };
+    } }, async ({ page }) => {
+      await page.waitForSelector('.d-actions button');
+      assert.match(await page.getAttribute('.d-actions >> text=Load', 'title'), /May unload Qwen-A/);
+      assert.match(await page.getAttribute('.list [data-id="GLM-B"] button', 'title'), /May unload Qwen-A/);
+      await page.click('.d-actions >> text=Load');
+      await page.waitForFunction(() => /Loaded GLM-B · unloaded Qwen-A/.test(document.getElementById('toastHost').textContent));
+    });
+    await scenario('Load beside nothing else says only Loaded', { path: '/models#GLM-B', setup: (s) => { s.state.models[0].state = 'unloaded'; } }, async ({ page }) => {
+      await page.waitForSelector('.d-actions button');
+      assert.equal(await page.getAttribute('.d-actions >> text=Load', 'title'), null);
+      await page.click('.d-actions >> text=Load');
+      await page.waitForFunction(() => /Loaded GLM-B/.test(document.getElementById('toastHost').textContent));
+      assert.doesNotMatch(await page.textContent('#toastHost'), /unloaded/);
+    });
+    await scenario('help text names no control the page lacks and no literal markup', { path: '/settings' }, async ({ page }) => {
+      await page.waitForSelector('#portNum');
+      const text = await page.textContent('#settingsPanel');
+      assert.doesNotMatch(text, /Check for updates|sushi pull|`/);
+      assert.match(await page.textContent('.set[data-key="update_check"] .help'), /Off stops the daily check only/);
+      assert.match(await page.textContent('.set[data-key="models_dir"] .help'), /where new downloads are saved/);
+    });
+    await scenario('a failed load after a reload still says why', { path: '/models#Broke-D', setup: (s) => { s.state.models[3].error = 'OutOfMemory'; } }, async ({ page }) => {
+      await page.waitForSelector('.detail .alert.err:not([hidden])');
+      assert.match(await page.textContent('.detail .alert.err'), /Load failed: OutOfMemory/);
+      assert.doesNotMatch(await page.textContent('.detail .alert.err'), /last load failed/);
+    });
+    await scenario('an empty Models page points at Downloads', { path: '/models', setup: (s) => { s.state.models = []; } }, async ({ page }) => {
+      await page.waitForSelector('#modelsList .empty');
+      assert.match(await page.textContent('#modelsList .empty'), /Download/);
+      await page.click('#modelsList .empty >> text=See available packs');
+      await page.waitForFunction(() => location.pathname === '/downloads');
+    });
+    await scenario('one Reload at a time: the callout replaces the header button', { path: '/models#Qwen-A', setup: (s) => { s.state.models[0].loaded_with = { ctx_size: 1024 }; } }, async ({ page, server }) => {
+      await page.waitForSelector('.callout:visible');
+      const reloads = () => page.$$eval('#modelsDetail button', (bs) => bs.filter((b) => b.offsetParent && /^Reload/.test(b.textContent)).map((b) => b.textContent));
+      assert.deepEqual(await reloads(), ['Reload now']);
+      server.state.models[0].loaded_with = { ctx_size: 65536 };
+      await settle(page, 16_000);
+      assert.deepEqual(await reloads(), ['Reload'], 'with nothing to apply the header keeps Reload');
+    });
+    await scenario('a pack update opens Downloads at that pack, never sushi pull', { path: '/models#Deep-C', setup: (s) => {
+      const pack = { repo: 'beamster/Deep-Sushi', name: 'deep', tag: '', size_bytes: 96 * GiB, tier_gb: 64, fits: true, streams_experts: true, recommended: false, installed: true, path: '/models/Deep-C', partial_bytes: null, update: { current: '1.0', latest: '2.0' }, launch: null };
+      const other = { ...pack, repo: 'beamster/Other-Sushi', name: 'other', update: null, installed: false, path: null };
+      s.state.hooks['/v1/downloads'] = async () => ({ status: 200, contentType: 'application/json', body: JSON.stringify({ ram_bytes: 128 * GiB, ram_gb: 128, update_check: true, catalog: 'ready', refreshing: false, dest: { path: '/models', source: 'default', locked: false, free_bytes: 900 * GiB, volume: 'Data' }, jobs: [], packs: [other, pack] }) });
+    } }, async ({ page }) => {
+      await page.waitForSelector('.callout:visible');
+      const text = await page.textContent('#modelsDetail .callout:visible');
+      assert.match(text, /Pack 2\.0 is available/);
+      assert.doesNotMatch(text, /sushi pull/);
+      await page.click('#modelsDetail .callout:visible button');
+      await page.waitForFunction(() => location.pathname === '/downloads');
+      await page.waitForSelector('.dl-row[data-repo="beamster/Deep-Sushi"]');
+      assert.equal(await page.evaluate(() => document.querySelector('.dl-row[data-repo="beamster/Deep-Sushi"]').classList.contains('pick')), true, 'the pack is marked');
+      assert.equal(await page.evaluate(() => document.querySelector('.dl-row[data-repo="beamster/Other-Sushi"]').classList.contains('pick')), false);
+    });
+    await scenario('Settings Save appears only for a changed value; empty plus Save sends null; no Use default buttons', { path: '/settings', setup: (s) => {
+      s.state.server.port.file = 8080;
+      s.state.server.models_dir.file = '/extra/packs';
+    } }, async ({ page, server }) => {
+      await page.waitForSelector('#portNum');
+      for (const id of ['cacheSave', 'dirSave', 'portSave']) assert.equal(await page.isVisible(`#${id}`), false, `${id} waits for a change`);
+      for (const id of ['cacheDefault', 'dirDefault', 'portDefault']) assert.equal(await page.locator(`#${id}`).count(), 0, `${id} is gone`);
+      await page.fill('#portNum', '');
+      assert.equal(await page.textContent('#portSave'), 'Use default');
+      await page.click('#portSave');
+      await page.fill('#cacheGb', '');
+      await page.click('#cacheSave');
+      await page.fill('#dirPath', '');
+      assert.equal(await page.textContent('#dirSave'), 'Use default');
+      await page.click('#dirSave');
+      while (server.count('/v1/settings', 'POST') < 3) await page.waitForTimeout(50);
+      assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings').map((c) => c.body), [{ server: { port: null } }, { server: { prefix_cache_disk_gb: null } }, { server: { models_dir: null } }]);
+      await page.fill('#cacheGb', '7');
+      assert.equal(await page.textContent('#cacheSave'), 'Save');
+      assert.equal(await page.isVisible('#cacheSave'), true);
+    });
+    await scenario('a refused server setting is shown on its row, once, with no toast', { path: '/settings', setup: (s) => {
+      s.state.hooks['/v1/settings'] = (body, method) => method === 'POST' && body.server && 'port' in body.server ? { status: 400, contentType: 'application/json', body: JSON.stringify({ error: { message: 'port 80 needs root; pick 1024 or higher' } }) } : null;
+    } }, async ({ page }) => {
+      await page.waitForSelector('#portNum');
+      await page.fill('#portNum', '80');
+      await page.click('#portSave');
+      await settle(page, 400);
+      assert.match(await page.textContent('.set[data-key="port"] .bad'), /port 80 needs root/);
+      assert.equal(await page.locator('#toastHost .toast').count(), 0, 'the row already says it');
+      await page.fill('#portNum', '81');
+      assert.equal(await page.textContent('.set[data-key="port"] .bad'), '', 'typing clears the refusal');
+    });
+    await scenario('a refused model setting names a label, not a key, and raises no toast', { serverOpts: { limits: true }, path: '/models#Qwen-A', open: { mode: 'advanced' } }, async ({ page }) => {
+      await page.waitForSelector(`${row('think_penalty')} input`);
+      await page.fill(`${row('think_penalty')} input`, '2');
+      await page.click('.savebar button:text-is("Save")');
+      await settle(page, 500);
+      const bad = await page.textContent(`${row('think_penalty')} .bad`);
+      assert.match(bad, /^Think penalty is not supported by this model/);
+      assert.doesNotMatch(bad, /think_penalty/);
+      assert.equal(await page.locator('#toastHost .toast').count(), 0);
+    });
+    await scenario('a bad number says "1 or more" and the save bar counts the invalid one', { path: '/models#Qwen-A', open: { mode: 'advanced' } }, async ({ page }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.fill(`${row('max_tokens')} input`, '12x');
+      assert.match(await page.textContent(`${row('max_tokens')} .bad`), /1 or more/);
+      assert.doesNotMatch(await page.textContent(`${row('max_tokens')} .bad`), /4294967295/);
+      assert.match(await page.textContent('.savebar'), /2 changes · 1 invalid/);
+      await page.fill(`${row('max_tokens')} input`, '');
+      await page.fill(`${row('think_penalty')} input`, '1');
+      assert.match(await page.textContent('.savebar'), /2 changes/);
+      assert.doesNotMatch(await page.textContent('.savebar'), /invalid/);
+    });
+    await scenario('a failed load is announced once on the page that shows it', { path: '/models#GLM-B', setup: (s) => { s.state.loadFails = true; } }, async ({ page }) => {
+      await page.waitForSelector('.d-actions button');
+      await page.click('.d-actions >> text=Load');
+      await page.waitForSelector('.detail .alert.err:not([hidden])');
+      assert.equal(await page.locator('#toastHost .toast').count(), 0, 'no toast beside the alert');
+      assert.doesNotMatch(await page.textContent('.list [data-id="GLM-B"] .meta'), /out of memory/, 'and the selected row only says it failed');
+    });
+    await scenario('an empty cache hides its Clear buttons and says Empty', { path: '/settings', setup: (s) => { s.state.cache.namespaces = []; s.state.cache.total_bytes = 0; } }, async ({ page }) => {
+      await page.waitForSelector('#cacheUsage');
+      assert.match(await page.textContent('#cacheUsage'), /^Empty · 100 GiB assigned$/);
+      assert.equal(await page.isVisible('#clearStale'), false);
+      assert.equal(await page.isVisible('#clearAll'), false);
+      assert.doesNotMatch(await page.innerText('#cacheCard'), /0 KiB|Stale:/);
+    });
+    await scenario('a locked KV row shows no hint about unavailable choices', { serverOpts: { limits: true }, path: '/models#Qwen-A' }, async ({ page }) => {
+      await page.waitForSelector(row('kv_quant'));
+      assert.equal(await page.textContent(`${row('kv_quant')} .hint`), '');
+    });
+    await scenario('offline makes the dimmed areas inert, not just faded', { path: '/models#Qwen-A' }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      server.state.down = true;
+      await settle(page, 6000);
+      await settle(page, 6000);
+      assert.equal(await page.evaluate(() => document.getElementById('modelsMd').inert), true);
+      assert.equal(await page.evaluate(() => document.getElementById('modelsAlert').closest('[inert]') === null), true, 'Retry stays usable');
+      server.state.down = false;
+      await settle(page, 6000);
+      await settle(page, 6000);
+      assert.equal(await page.evaluate(() => document.getElementById('modelsMd').inert), false);
+    });
+    await scenario('offline on Settings makes every card inert', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#cacheCard:not([hidden])');
+      server.state.down = true;
+      await settle(page, 6000);
+      await settle(page, 6000);
+      assert.deepEqual(await page.$$eval('#settingsPanel section.card:not([hidden])', (cs) => cs.filter((c) => !c.inert).map((c) => c.id)), []);
     });
 
     if (failures.length) throw new Error(`${failures.length} admin scenario(s) failed:\n  ${failures.join('\n  ')}`);

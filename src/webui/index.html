@@ -35,6 +35,7 @@ a:hover { text-decoration: underline; }
 .btn.ghost { border-color: transparent; background: transparent; color: var(--text-2); }
 .btn.ghost:hover { background: var(--surface-2); }
 .btn.sm { height: var(--h-ctl-sm); padding: 0 10px; font-size: var(--fs-sm); }
+.btn.xs { height: 22px; padding: 0 8px; font-size: 11px; }
 .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: var(--h-ctl); height: var(--h-ctl); border-radius: var(--r-md); border: 1px solid transparent; background: transparent; color: var(--text-2); cursor: pointer; transition: background .15s ease, color .15s ease; }
 .icon-btn:hover { background: var(--surface-2); color: var(--text); }
 .icon-btn svg { width: 18px; height: 18px; }
@@ -55,13 +56,15 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 #appShell { display: flex; flex-direction: column; height: 100dvh; }
 #appTopbar { display: flex; align-items: center; gap: 14px; height: var(--topbar-h); padding: 0 var(--s4); border-bottom: 1px solid var(--border); background: var(--surface); flex: none; z-index: 30; }
 .mark { display: block; flex: none; background: #fff; border-radius: var(--r-md); object-fit: contain; box-shadow: 0 0 0 1px var(--border); }
-.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; color: inherit; text-decoration: none; }
 .brand .mark { width: 30px; height: 30px; }
 .brand .name { font-size: var(--fs-lg); font-weight: 700; letter-spacing: -0.02em; }
 .brand .ver { font-size: var(--fs-xs); font-weight: 600; color: var(--text-3); margin-top: 5px; }
 .spacer { flex: 1; }
 .topbar-actions { display: flex; align-items: center; gap: var(--s2); }
-#serverDot { display: inline-flex; align-items: center; gap: var(--s2); height: 28px; padding: 0 10px; border: 0; border-radius: var(--r-pill); background: transparent; color: var(--text-2); font-size: var(--fs-sm); max-width: 300px; cursor: pointer; }
+/* Wide screens: the model name gives up its room first, the controls only once it has none left. */
+@media (min-width: 641px) { .topbar-actions { min-width: 0; } #serverDot { flex-shrink: 100; } }
+#serverDot { display: inline-flex; align-items: center; gap: var(--s2); height: 28px; padding: 0 10px; border: 0; border-radius: var(--r-pill); background: transparent; color: var(--text-2); font-size: var(--fs-sm); min-width: 0; cursor: pointer; }
 #serverDot:hover { background: var(--surface-2); }
 #serverDot b { font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #moreMenu:popover-open { display: grid; gap: var(--s3); position: fixed; inset: calc(var(--topbar-h) + 4px) 8px auto auto; margin: 0; padding: var(--s3); border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--surface); color: var(--text); box-shadow: var(--shadow-pop); }
@@ -285,6 +288,38 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 #viewNav a { padding: 3px 12px; border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-md); font-weight: 600; }
 #viewNav a:hover { color: var(--text); text-decoration: none; }
 #viewNav a[aria-current="page"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border); }
+#viewNav a { position: relative; display: inline-flex; align-items: center; gap: 6px; transition: color .15s, background-color .15s; }
+.nav-dot { position: absolute; top: 2px; right: 2px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.nav-dot[hidden] { display: none; }
+#viewNav .nav-i { width: 14px; height: 14px; flex: none; opacity: .75; }
+#viewNav a[aria-current="page"] .nav-i { opacity: 1; }
+/* Models: Installed | Available, one URL each (/models, /downloads); the thumb slides under the current one. */
+#modelsTabs { position: relative; display: inline-grid; grid-template-columns: 1fr 1fr; padding: 2px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); }
+#modelsTabs::before { content: ""; position: absolute; inset: 2px auto 2px 2px; width: calc(50% - 2px); border-radius: var(--r-sm); background: var(--surface); box-shadow: 0 0 0 1px var(--border); transition: transform .22s cubic-bezier(.2, .8, .2, 1); }
+#modelsPanel[data-sub="available"] #modelsTabs::before { transform: translateX(100%); }
+#modelsTabs a { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 26px; padding: 0 14px; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; white-space: nowrap; transition: color .15s; }
+#modelsTabs a:hover, #modelsTabs a[aria-current="page"] { color: var(--text); text-decoration: none; }
+#modelsTabPct { color: var(--accent); font-variant-numeric: tabular-nums; }
+#modelsTabPct:empty { display: none; }
+#modelsPanel[data-sub="available"] :is(#modelsBody, #modelsDir, #modelsRescan, #modelsBack),
+#modelsPanel:not([data-sub="available"]) :is(#downloadsPanel, #dlSub, #dlRefresh) { display: none; }
+/* Wide: the switch sits beside the title and the subtitle wraps below, so a longer subtitle never moves it. */
+@media (min-width: 641px) {
+  #modelsPanel .page-head .in { row-gap: 0; padding-top: var(--s2); padding-bottom: var(--s2); }
+  #modelsPanel .page-head .titles { display: contents; }
+  #modelsPanel .page-head .titles .sub { order: 1; flex-basis: 100%; }
+}
+@media (prefers-reduced-motion: reduce) { #modelsTabs::before, #viewNav a { transition: none; } }
+.dl-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--s2) var(--s3); padding: var(--s3) var(--s4); border-bottom: 1px solid var(--border); }
+.dl-row:last-child { border-bottom: 0; }
+.dl-row.pick { background: var(--accent-soft); }
+.dl-row .name { font-weight: 600; overflow-wrap: anywhere; display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); }
+.dl-row .meta, .dl-row .why { color: var(--text-2); font-size: var(--fs-sm); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.dl-row .why.err { color: var(--err); }
+.dl-row .act { display: flex; gap: var(--s2); }
+.dl-row .prog { grid-column: 1 / -1; }
+.dl-row .prog[hidden] { display: none; }
+.dl-row .prog .meter { margin: 0 0 var(--s1); }
 /* Hidden by visibility, not display or removal: the chat keeps its layout, scroll offset and running stream. */
 #appMain:not([data-view="chat"]) #chatPanel { visibility: hidden; pointer-events: none; }
 body[data-mode="compact"] .adv { display: none !important; }
@@ -359,8 +394,8 @@ dialog.confirm .acts { display: flex; justify-content: flex-end; gap: var(--s2);
 .set .ctl .warn { font-size: var(--fs-xs); color: var(--warn); }
 .set .ctl input[aria-invalid="true"] { border-color: var(--err); }
 .set.locked .ctl input { background: var(--surface-2); color: var(--text-2); }
-.tri { display: grid; grid-template-columns: repeat(3, 1fr); padding: 2px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); }
-.tri button { height: 26px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; cursor: pointer; }
+.tri { display: grid; grid-template-columns: auto 1fr 1fr; padding: 2px; border-radius: var(--r-md); background: var(--surface-2); border: 1px solid var(--border); }
+.tri button { height: 26px; padding: 0 var(--s2); white-space: nowrap; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--text-2); font-size: var(--fs-sm); font-weight: 600; cursor: pointer; }
 .tri button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border-strong); }
 .tri.locked button { cursor: default; }
 @media (max-width: 640px) {
@@ -510,13 +545,18 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 @media (max-width: 640px) {
   .brand .name, #serverDotLabel, .topbar-actions > .seg, #themeToggle { display: none; }
   #viewNav { gap: 0; }
-  #viewNav a { padding: 3px 5px; font-size: var(--fs-sm); }
+  #viewNav a { padding: 4px 9px; font-size: var(--fs-sm); }
+  #viewNav .nav-i { width: 15px; height: 15px; }
+  #viewNav .nav-l { display: none; }
+  /* The switch takes a row of its own under the title. */
+  #modelsTabs { order: 1; width: 100%; margin-bottom: var(--s2); }
+  #modelsPanel .page-head .titles { flex: 1 1 0; }
   .brand { gap: 0; }
   #appTopbar { gap: var(--s2); padding: 0 var(--s2) 0 var(--s3); }
   #serverDot { padding: 0 6px; }
 }
 @media (max-width: 360px) {
-  #viewNav a { padding: 3px; }
+  #viewNav a { padding: 4px 6px; }
   #appTopbar { gap: var(--s1); }
 }
 /* Keyed to the composer's own width: beside the side panels a wide window still leaves a narrow row. */
@@ -555,6 +595,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <symbol id="i-box" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M21 8.2 12 3 3 8.2v7.6L12 21l9-5.2ZM3.3 8.4 12 13.4l8.7-5M12 13.4V21"/></symbol>
   <symbol id="i-sliders" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M4 8h9m5 0h2M4 16h3m5 0h8"/><circle cx="15.5" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9.5" cy="16" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
   <symbol id="i-pulse" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M3 12h4l2.5-6 4 12 2.5-6h5"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" d="M4 5h16v11H10l-5 4v-4H4Z"/></symbol>
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m11.3 11.7 8.2-8.2m-3 3 2.5 2.5m-5-.5 2 2"/></symbol>
 </svg>
 
@@ -576,16 +617,16 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 
 <div id="appShell">
 <header id="appTopbar">
-  <div class="brand">
+  <a class="brand" href="https://github.com/beamivalice/sushi" target="_blank" rel="noopener" title="sushi on GitHub">
     <img class="mark" alt="" />
     <span class="name">sushi</span>
     <span class="ver num" id="brandVersion"></span>
-  </div>
+  </a>
   <nav id="viewNav" aria-label="Views">
-    <a id="navDashboard" href="/dashboard" aria-current="page">Dashboard</a>
-    <a id="navChat" href="/chat">Chat</a>
-    <a id="navModels" href="/models">Models</a>
-    <a id="navSettings" href="/settings">Settings</a>
+    <a id="navDashboard" href="/dashboard" aria-current="page" aria-label="Dashboard"><svg class="nav-i" aria-hidden="true"><use href="#i-pulse"/></svg><span class="nav-l">Dashboard</span></a>
+    <a id="navChat" href="/chat" aria-label="Chat"><svg class="nav-i" aria-hidden="true"><use href="#i-chat"/></svg><span class="nav-l">Chat</span></a>
+    <a id="navModels" href="/models" aria-label="Models"><svg class="nav-i" aria-hidden="true"><use href="#i-box"/></svg><span class="nav-l">Models</span><span class="nav-dot" id="navModelsDot" title="New packs" hidden></span></a>
+    <a id="navSettings" href="/settings" aria-label="Settings"><svg class="nav-i" aria-hidden="true"><use href="#i-sliders"/></svg><span class="nav-l">Settings</span></a>
   </nav>
   <span class="spacer"></span>
   <div class="topbar-actions">
@@ -672,10 +713,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
           <textarea id="optSystem" rows="3" placeholder="Optional instructions for the model"></textarea>
         </label>
         <div class="opt-grid">
-          <label class="field">Max tokens <input id="optMaxTokens" type="number" min="1" step="1" placeholder="default" /></label>
-          <label class="field">Temperature <input id="optTemperature" type="number" min="0" max="2" step="0.05" placeholder="default" /></label>
-          <label class="field">Top-p <input id="optTopP" type="number" min="0" max="1" step="0.01" placeholder="default" /></label>
-          <label class="field">Top-k <input id="optTopK" type="number" min="0" step="1" placeholder="default" /></label>
+          <label class="field">Max tokens <input id="optMaxTokens" type="number" min="1" step="1" placeholder="Default" /></label>
+          <label class="field">Temperature <input id="optTemperature" type="number" min="0" max="2" step="0.05" placeholder="Default" /></label>
+          <label class="field">Top-p <input id="optTopP" type="number" min="0" max="1" step="0.01" placeholder="Default" /></label>
+          <label class="field">Top-k <input id="optTopK" type="number" min="0" step="1" placeholder="Default" /></label>
         </div>
         <button class="btn sm ghost" id="chatOptionsReset">Reset to the model's defaults</button>
       </div>
@@ -759,8 +800,8 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
   <section class="card adv feed">
     <h2>Sessions<span class="legend"><span><i style="background:var(--c2)"></i>restored from cache</span><span><i style="background:var(--c1)"></i>new this request</span></span></h2>
     <div class="tablewrap"><table class="tbl sessions">
-      <colgroup><col style="width:84px"><col><col style="width:130px"><col style="width:120px"><col style="width:130px"><col style="width:90px"><col style="width:120px"><col style="width:90px"><col style="width:96px"><col style="width:96px"></colgroup>
-      <thead><tr><th>ID</th><th>Model</th><th>Phase</th><th>Context</th><th></th><th>Cached</th><th>Generated</th><th>Elapsed</th><th>Rate</th><th>State</th></tr></thead>
+      <colgroup><col style="width:84px"><col><col style="width:130px"><col style="width:120px"><col style="width:130px"><col style="width:90px"><col style="width:120px"><col style="width:90px"><col style="width:96px"><col style="width:96px"><col style="width:72px"></colgroup>
+      <thead><tr><th>ID</th><th>Model</th><th>Phase</th><th>Context</th><th></th><th>Cached</th><th>Generated</th><th>Elapsed</th><th>Rate</th><th>State</th><th></th></tr></thead>
       <tbody id="dashSessions"></tbody>
     </table></div>
   </section>
@@ -785,11 +826,16 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 <section id="modelsPanel" class="panel page" aria-label="Models" hidden>
   <div class="page-head"><div class="in">
     <button class="icon-btn" id="modelsBack" type="button" aria-label="Back to models" hidden><svg width="18" height="18"><use href="#i-back"/></svg></button>
-    <div class="titles"><h1 id="modelsTitle">Models</h1><div class="sub mono" id="modelsDir"></div></div>
+    <div class="titles"><h1 id="modelsTitle">Models</h1><div class="sub mono" id="modelsDir"></div><div class="sub" id="dlSub">Sushi packs on Hugging Face</div></div>
+    <nav id="modelsTabs" aria-label="Models">
+      <a id="modelsTabInstalled" href="/models" aria-current="page">Installed</a>
+      <a id="modelsTabAvailable" href="/downloads">Available<span id="modelsTabPct"></span><span class="nav-dot" id="modelsTabDot" title="New packs" hidden></span></a>
+    </nav>
     <span class="spacer"></span>
     <button class="btn sm" id="modelsRescan" type="button">Rescan</button>
+    <button class="btn sm" id="dlRefresh" type="button">Check again</button>
   </div></div>
-  <div class="page-body">
+  <div class="page-body" id="modelsBody">
     <div id="modelsAlert" class="alert err" role="alert" hidden></div>
     <div class="md" id="modelsMd">
       <div class="card list" id="modelsListCard">
@@ -798,6 +844,11 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
       </div>
       <div class="card detail" id="modelsDetail"></div>
     </div>
+  </div>
+  <div class="page-body narrow" id="downloadsPanel">
+    <div id="dlAlert" class="alert err" role="alert" hidden></div>
+    <section class="card" id="dlMacCard"><div class="card-b"><div class="kv" id="dlMac"></div><div class="callout" id="dlNote" style="margin-top:12px" hidden></div></div></section>
+    <section class="card list" id="dlList" aria-label="Sushi packs"><div class="skel"></div><div class="skel"></div><div class="skel"></div></section>
   </div>
 </section>
 <section id="settingsPanel" class="panel page" aria-label="Settings" hidden>
@@ -817,11 +868,11 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <thead><tr><th>Model</th><th class="n">Size</th><th>Last used</th><th class="n adv">Entries</th><th class="adv">ID</th><th class="n adv">Tier use</th><th class="n adv">Written</th><th class="n adv">Write rate</th><th></th></tr></thead>
         <tbody id="cacheRows"></tbody>
       </table></div>
-      <div class="card-b"><div class="bulk">
+      <div class="card-b" id="clearBox"><div class="bulk">
         <button class="btn danger" id="clearStale" type="button">Clear stale caches</button>
         <button class="btn danger" id="clearAll" type="button">Clear all caches</button>
       </div>
-      <div class="sub muted" style="margin-top:8px;font-size:var(--fs-sm)">Stale: no loaded model uses it (an old build, a changed pack or an unloaded model).</div></div>
+      <div class="sub muted" id="clearNote" style="margin-top:8px;font-size:var(--fs-sm)">Stale: no loaded model uses it (an old build, a changed pack or an unloaded model).</div></div>
     </section>
     <section class="card" id="dirCard" hidden>
       <div class="card-h">Models folder</div>
@@ -830,9 +881,17 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
         <div class="kv" id="dirKv" style="margin-top:8px"></div>
       </div>
     </section>
+    <section class="card" id="portCard" hidden>
+      <div class="card-h">Server port</div>
+      <div class="card-b"><div id="portSet"></div></div>
+    </section>
+    <section class="card" id="updatesCard" hidden>
+      <div class="card-h">Automatic update checks</div>
+      <div class="card-b"><div id="updateSet"></div><div id="packUpdateSet"></div></div>
+    </section>
     <section class="card" id="aboutCard" hidden>
       <div class="card-h">About</div>
-      <div class="card-b"><div class="kv"><span>Version</span><span id="aboutVersion"></span></div>
+      <div class="card-b"><div class="kv"><span>Version</span><span id="aboutVersion">-</span></div>
         <div class="bulk" style="margin-top:12px"><button class="btn sm" id="forgetKeyButton" type="button" hidden>Forget the API key</button></div></div>
     </section>
   </div>
@@ -1113,18 +1172,24 @@ const modelStore = {
     this.emit();
     this.schedule();
     const verbs = { load: ["Loaded", "Load"], unload: ["Unloaded", "Unload"], reload: ["Reloaded", "Reload"] }[kind];
+    const before = this.list.filter((model) => model.state === "ready").map((model) => model.id);
+    let done = false;
     try {
       if (kind !== "load") await postJson("/v1/unload-model", { model: id });
       if (kind !== "unload") await postJson("/v1/load-model", { model: id });
-      toast(`${verbs[0]} ${id}`);
+      done = true;
     } catch (error) {
       const message = adminErrorText(error);
       this.failed.set(id, message);
-      toast(`${verbs[1]} failed: ${message}`, "err");
+      if (!window.sushiAdmin?.shows(id)) toast(`${verbs[1]} failed: ${message}`, "err");
     }
     this.pending.delete(id);
     await this.refresh();
     this.emit();
+    if (!done) return;
+    // A load can evict other models to fit; the list after it says which.
+    const evicted = kind === "unload" ? [] : before.filter((other) => other !== id && this.byId(other)?.state !== "ready");
+    toast(`${verbs[0]} ${id}${evicted.length ? ` · unloaded ${evicted.join(", ")}` : ""}`);
   },
 };
 document.addEventListener("visibilitychange", () => { if (document.hidden) clearTimeout(modelStore.timer); else modelStore.refresh(); });
@@ -1581,7 +1646,7 @@ function loadVersion() {
   apiJson("/props")
     .then((props) => {
       const version = props?.update?.current ?? props?.settings?.version;
-      if (version) $("brandVersion").textContent = `v${String(version).replace(/^v/, "")}`;
+      if (version) $("brandVersion").textContent = $("aboutVersion").textContent = `v${String(version).replace(/^v/, "")}`;
       showUpdate(props?.update);
       reportUpdateResult(props?.update);
       renderPrefixCache(props?.settings?.prefix_cache);
@@ -1779,8 +1844,27 @@ function applyEffortBudget() {
   const budget = box.disabled ? null : model?.reasoning_effort_budgets?.[effort];
   box.value = budget == null ? "" : String(budget);
 }
+// "Default (value)" when the server reports what the model uses unset, else a bare "Default".
+function defaultWith(value) { return value == null ? "Default" : `Default (${value})`; }
+const decimalText = (n) => (Number.isInteger(n) ? n.toFixed(1) : String(n));
+function renderChatDefaults(model) {
+  const meta = model?.meta ?? {};
+  const known = (v) => (Number.isFinite(v) ? v : null);
+  const tokens = known(meta.default_max_tokens);
+  const shown = {
+    optMaxTokens: tokens == null ? null : tokens > 0 ? tokens.toLocaleString("en-US") : "rest of the context window",
+    optTemperature: known(meta.default_temperature) == null ? null : decimalText(meta.default_temperature),
+    optTopP: known(meta.default_top_p) == null ? null : decimalText(meta.default_top_p),
+    optTopK: known(meta.default_top_k) == null ? null : meta.default_top_k === 0 ? "off" : String(meta.default_top_k),
+  };
+  for (const [id, value] of Object.entries(shown)) {
+    const text = defaultWith(value);
+    if ($(id).placeholder !== text) $(id).placeholder = text;
+  }
+}
 function renderModelStatus() {
   const model = selectedModel();
+  renderChatDefaults(model);
   $("composerModelName").textContent = model?.id ?? "no model";
   const vision = modelSeesImages(model);
   $("attachButton").hidden = !vision;
@@ -2861,7 +2945,8 @@ function adminControlValue(spec, text, badInput) {
 // What is wrong with a typed value, or null.
 function adminProblem(spec, text) {
   if (adminControlValue(spec, text).ok) return null;
-  return `Enter ${spec.type === "int" ? "a whole number" : "a number"} from ${spec.min} to ${spec.max}`;
+  const noun = spec.type === "int" ? "a whole number" : "a number";
+  return spec.max >= 4294967295 ? `Enter ${noun} of ${spec.min} or more` : `Enter ${noun} from ${spec.min} to ${spec.max}`;
 }
 // A file value as its control shows it.
 function adminFileText(value) { return value == null ? "" : String(value); }
@@ -2924,6 +3009,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     try { return await fn(); } finally { btn.disabled = false; btn.removeAttribute("aria-busy"); btn.textContent = was; }
   }
   const failToast = (what, e) => toast(`${what} failed: ${adminErrorText(e)}`, "err");
+  // A server message names settings by their key; the page names them by their label.
+  const labelled = (text) => text.replace(/\b[a-z]+(?:_[a-z]+)+\b/g, (key) => KEY[key]?.[0] ?? key);
 
   const applyMode = (mode) => {
     document.body.dataset.mode = mode;
@@ -2949,13 +3036,23 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     preserve_thinking: ["Keep earlier thinking", "Keep earlier turns' reasoning in the prompt.", "--preserve-thinking"],
     think_penalty: ["Think penalty", "Pushes the model to finish thinking sooner. 0 to 20.", "--think-penalty"],
     vision: ["Vision tower", "Loads the image tower, so the model can read images. Off saves its memory.", "--vision"],
+    max_tokens: ["Max output tokens", "Longest reply for a request that names no max_tokens. A request's own number outranks it.", "--max-tokens"],
   };
-  const COMMON = ["ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb"];
+  const COMMON = ["ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "max_tokens"];
   const KV_LABEL = { off: "16-bit (off)", 4: "4-bit", 6: "6-bit", 8: "8-bit" };
   const choiceLabel = (key, v) => (key === "kv_quant" ? KV_LABEL[v] : null) ?? v;
+  // What the server would use with the key unset, as the label of the Default choice; a bare "Default" when it cannot say.
+  const defaultLabel = (m, spec) => {
+    const v = m.defaults?.[spec.name];
+    if (v == null) return "Default";
+    if (spec.type === "bool") return `Default (${v ? "On" : "Off"})`;
+    if (spec.type === "choice") return `Default (${choiceLabel(spec.name, String(v)).replace(/ \(off\)$/, "")})`;
+    if (spec.name === "max_tokens" && v === 0) return "Default (rest of the context window)";
+    return `Default (${Number(v).toLocaleString("en-US")})`;
+  };
   const isOff = (flag) => flag === "off" || flag === "false" || /^--no-/.test(flag);
   // The server may send a flag's whole spelling ("--mtp-tokenv3 0.5") or just its value ("8").
-  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk" }[key] ?? "";
+  const flagName = (key) => KEY[key]?.[2] ?? { prefix_cache_disk_gb: "--prefix-cache-disk", port: "--port", update_check: "--no-update-check", pack_update_check: "--no-update-check" }[key] ?? "";
   const flagText = (key, flag) => /^--/.test(flag) ? flag : key === "mtp" || key === "vision" ? flagName(key).replace("--", isOff(flag) ? "--no-" : "--") : key === "mtp_greedy_tail" ? flagName(key) : flagName(key) ? `${flagName(key)} ${flag}` : "";
   const flagHelp = (key, flag) => { const text = flagText(key, flag); return `Set by ${text ? `${text} at launch` : "a launch flag"}. Start sushi without the flag to change it here.`; };
   const flagShown = (spec, flag) => {
@@ -2965,7 +3062,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   };
 
   const A = { view: "chat", settings: null, cache: null, texts: {}, seq: {}, applied: {}, error: null,
-    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, timer: null, retry: null, tbody: "",
+    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, serr: {}, timer: null, retry: null, tbody: "",
     busy: new Set(), wsample: null, rates: new Map() };
   const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
 
@@ -2989,6 +3086,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const info = (id) => rowsOf().find((m) => m.id === id);
   const isLoaded = (m) => m.state === "ready" || m.state === "loading" || modelStore.pending.has(m.id);
   const selLoaded = () => info(A.sel)?.state === "ready";
+  const needCache = () => A.view === "settings" || selLoaded();
   const wide = () => window.matchMedia("(min-width: 1024px)").matches;
   const hashId = () => { try { return decodeURIComponent(location.hash.slice(1)); } catch { return ""; } };
 
@@ -3004,7 +3102,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   async function refresh() {
     if (A.view !== "models" && A.view !== "settings") return;
-    const wantCache = A.view === "settings" || selLoaded();
+    const wantCache = needCache();
     clearTimeout(A.retry);
     try {
       const [s, c] = await Promise.all([pull("settings", "/v1/settings"), wantCache ? pull("cache", "/v1/prefix-cache") : undefined]);
@@ -3014,6 +3112,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (wantCache && c !== null && A.cache) sampleWrites(A.cache, Date.now());
     } catch (e) { A.error = adminErrorText(e); A.retry = setTimeout(refresh, 4000); }
     renderAll();
+    // The selected model turned out loaded only now (the page opened on its link): its cache has not been asked for.
+    if (!wantCache && needCache() && !A.cache && !A.error) refresh();
   }
   function alertIn(node, message, retry) {
     if ((node.dataset.msg ?? "") === (message ?? "")) return;
@@ -3049,9 +3149,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function dirtyKeys(id) {
     const m = info(id);
     if (!m) return [];
-    const errs = Object.keys(per(id).errors).filter((k) => per(id).errors[k] && !whyDisabled(m, k));
-    return [...new Set([...Object.keys(adminChanges(specsOf(m), m.settings, sendable(m)).set), ...errs])];
+    return [...new Set([...Object.keys(adminChanges(specsOf(m), m.settings, sendable(m)).set), ...invalidKeys(m)])];
   }
+  const invalidKeys = (m) => Object.keys(per(m.id).errors).filter((k) => per(m.id).errors[k] && !whyDisabled(m, k));
   const isDirty = (id) => !!id && dirtyKeys(id).length > 0;
   // True when the saved file differs from what the loaded model started with.
   // A file value the loader drops (a key the model lacks, a choice it cannot store) is never stamped on a load.
@@ -3064,9 +3164,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // `streaming` in /v1/models means the pack can stream; it does only when it must or an SSD budget is set.
   const streamsExperts = (m) => !!(m.streaming_required || m.ssd_budget_gb);
 
+  // Why the last load failed: this session's answer, else the one /v1/models keeps for a failed model.
+  const loadError = (m) => modelStore.failed.get(m.id) || (m.state === "error" ? m.error : "");
+  const evictNote = (m) => { const others = modelStore.list.filter((x) => x.state === "ready" && x.id !== m.id).map((x) => x.id); return others.length ? `May unload ${others.join(", ")} to make room` : ""; };
   function metaOf(m) {
-    const failed = modelStore.failed.get(m.id), n = savedCount(m);
-    const phrase = modelStore.pending.has(m.id) || m.state === "loading" ? "Loading…" : m.state === "error" ? `Load failed${failed ? ` · ${failed.slice(0, 60)}` : ""}` : m.state === "ready" && m.bytes_resident ? `${adminBytes(m.bytes_resident)} in memory` : streamsExperts(m) ? "streams experts" : n ? `${n} saved` : "";
+    const failed = loadError(m), n = savedCount(m);
+    const phrase = modelStore.pending.has(m.id) || m.state === "loading" ? "Loading…" : m.state === "error" ? `Load failed${failed && m.id !== A.sel ? ` · ${failed.slice(0, 60)}` : ""}` : m.state === "ready" && m.bytes_resident ? `${adminBytes(m.bytes_resident)} in memory` : streamsExperts(m) ? "streams experts" : n ? `${n} saved` : "";
     return [m.bytes_on_disk ? adminBytes(m.bytes_on_disk) : "", phrase].filter(Boolean).join(" · ");
   }
   function renderList(rows) {
@@ -3077,21 +3180,21 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     q("modelsFilter").placeholder = `Filter ${rows.length} models`;
     const shown = rows.filter((m) => !filter || m.id.toLowerCase().includes(filter)).sort((a, b) => a.id.localeCompare(b.id));
     const live = shown.filter(isLoaded), both = live.length && live.length < shown.length;
-    const state = (m) => [m.id, dotOf(m), metaOf(m), m.id === A.sel, isDirty(m.id), m.state, modelStore.pending.has(m.id)];
+    const state = (m) => [m.id, dotOf(m), metaOf(m), m.id === A.sel, isDirty(m.id), m.state, modelStore.pending.has(m.id), evictNote(m)];
     const roots = rootsInUse(A.settings?.server.models_dir ?? { boot_roots: [] }).join(", ") || "the models folder";
     const item = (m) => {
       const canLoad = (m.state === "unloaded" || m.state === "error") && !modelStore.pending.has(m.id);
       return h("div", { class: "row", role: "option", tabindex: "0", "data-id": m.id, "aria-selected": String(m.id === A.sel), onclick: () => trySelect(m.id), onkeydown: (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === e.currentTarget) { e.preventDefault(); trySelect(m.id); } } },
         h("span", { class: `dot ${dotOf(m)}` }), h("div", { class: "main" }, h("div", { class: "name", text: m.id }), h("div", { class: `meta${m.state === "error" && !modelStore.pending.has(m.id) ? " err" : ""}`, text: metaOf(m) })),
         isDirty(m.id) ? h("span", { class: "edit-dot", title: "Unsaved changes" }) : null,
-        canLoad ? h("button", { class: "btn sm", type: "button", text: "Load", onclick: (e) => { e.stopPropagation(); modelStore.act(m.id, "load"); } }) : null);
+        canLoad ? h("button", { class: "btn sm", type: "button", text: "Load", title: evictNote(m) || null, onclick: (e) => { e.stopPropagation(); modelStore.act(m.id, "load"); } }) : null);
     };
     const group = (t) => h("div", { class: "group-l", text: t });
     const at = document.activeElement, held = list.contains(at) ? { id: at.closest(".row")?.dataset.id, button: at.tagName === "BUTTON" } : null;
     fill(list, JSON.stringify([shown.map(state), both, rows.length, roots]), () => shown.length
       ? [...(both ? [group("Loaded")] : []), ...live.map(item), ...(both ? [group("On disk")] : []), ...shown.filter((m) => !live.includes(m)).map(item)]
-      : [h("div", { class: "empty" }, h("span", { text: rows.length ? "No model matches the filter." : `No models in ${roots}. Put a pack folder there, or change the folder in Settings.` }),
-        ...(rows.length ? [] : [" ", h("button", { class: "btn sm", type: "button", text: "Open Settings", onclick: () => $("navSettings").click() })]))]);
+      : [h("div", { class: "empty" }, h("span", { text: rows.length ? "No model matches the filter." : `No models in ${roots}. Download a pack, or put a pack folder there.` }),
+        ...(rows.length ? [] : [" ", h("button", { class: "btn sm primary", type: "button", text: "See available packs", onclick: () => q("modelsTabAvailable").click() }), " ", h("button", { class: "btn sm", type: "button", text: "Open Settings", onclick: () => $("navSettings").click() })]))]);
     if (held?.id && !list.contains(document.activeElement)) {
       const r = list.querySelector(`[data-id="${CSS.escape(held.id)}"]`);
       ((held.button ? r?.querySelector("button") : null) ?? r)?.focus();
@@ -3143,9 +3246,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   window.addEventListener("popstate", onNav);
   window.addEventListener("hashchange", onNav);
   window.addEventListener("beforeunload", (e) => { if ([...A.per.keys()].some(isDirty)) e.preventDefault(); });
-  // Leaving the Models tab by the top bar asks first when the open model has unsaved edits.
+  // Leaving the Models tab by the top bar, or for its Available list, asks first when the open model has unsaved edits.
   document.addEventListener("click", async (e) => {
-    const link = e.target.closest?.("#navChat, #navDashboard, #navSettings, #serverDot");
+    const link = e.target.closest?.("#navChat, #navDashboard, #navSettings, #modelsTabAvailable, #serverDot");
     if (!link || A.passNav || A.view !== "models" || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || !isDirty(A.sel)) return;
     e.preventDefault();
     e.stopImmediatePropagation();
@@ -3183,6 +3286,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     q("modelsMd").classList.toggle("none", !rows.length);
     setHidden(q("modelsBack"), !phoneDetail);
     setHidden(q("modelsRescan"), phoneDetail);
+    setHidden(q("modelsTabs"), phoneDetail);
     setText(q("modelsTitle"), phoneDetail && A.sel ? A.sel : "Models");
     renderList(rows);
     const m = rows.find((x) => x.id === A.sel);
@@ -3196,10 +3300,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     patchDetail(m);
   }
 
+  // The server's sentence for when a setting takes effect, as one word.
+  const whenOf = (applies) => /at once/.test(applies) ? "Now" : /next start/.test(applies) ? "Next start" : "Next load";
   function badges(node, st, applies) {
-    const live = /at once/.test(applies || ""), sig = `${st.locked}|${st.file != null}|${applies}`;
-    fill(node, sig, () => [h("span", { class: `badge ${st.locked ? "flag" : st.file != null ? "saved" : ""}` }, ...(st.locked ? [icon("lock", 11), "Launch flag"] : [st.file != null ? "Saved" : "Default"])),
-      ...(applies && !st.locked ? [h("span", { class: `badge ${live ? "live" : ""}`, text: live ? "Applies now" : "On next load" })] : [])]);
+    const sig = `${st.locked}|${st.file != null}|${applies}`;
+    fill(node, sig, () => [...(st.locked ? [h("span", { class: "badge flag" }, icon("lock", 11), "Launch flag")] : st.file != null ? [h("span", { class: "badge saved", text: "Saved" })] : []),
+      ...(applies && !st.locked ? [h("span", { class: `badge ${/at once/.test(applies) ? "live" : ""}`, text: whenOf(applies) })] : [])]);
   }
   function setRow(key, label, forId) {
     const badge = h("span", { class: "badges" }), help = h("div", { class: "help" }), ctl = h("div", { class: "ctl" }), hint = h("div", { class: "hint" }), bad = h("div", { class: "bad", role: "alert" });
@@ -3217,6 +3323,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       const btns = names.map(([v, t]) => h("button", { type: "button", text: t, onclick: () => { cur = v; paint(); onChange(); } }));
       paint();
       return { node: h("div", { class: "tri", role: "group", "aria-label": label }, ...btns), get: () => cur, set: (v) => { cur = v; paint(); }, focused: () => false,
+        def: (t) => setText(btns[0], t),
         lock: (on, flag) => { btns.forEach((b) => { b.disabled = on; }); paint(on && flag !== undefined ? (isOff(flag) ? "false" : "true") : cur); } };
     }
     const choice = spec.type === "choice";
@@ -3224,6 +3331,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       : h("input", { type: "text", inputmode: spec.type === "int" ? "numeric" : "decimal", autocomplete: "off", placeholder: "Default", "aria-label": label, oninput: () => onChange() });
     const extra = h("option", { value: "\0" });
     return { node, get: () => node.value, focused: () => document.activeElement === node,
+      def: (t) => { if (choice) setText(node.options[0], t); else if (node.placeholder !== t) node.placeholder = t; },
       set: (v) => { if (choice && v && ![...node.options].some((o) => o.value === v)) node.append(h("option", { value: v, text: `${v} (not valid)`, disabled: true })); node.value = v; },
       lock: (on, flag) => {
         node.disabled = on;
@@ -3258,6 +3366,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     badges(S.badge, s);
     S.control.lock(locked || !!why, locked ? s.flag ?? "" : undefined);
     S.control.allow?.(lim?.choices);
+    S.control.def(defaultLabel(m, S.spec));
     if (!locked && !(key in P.texts) && !S.control.focused()) { const want = adminFileText(s.file); if (S.control.get() !== want) S.control.set(want); }
     setText(S.help, locked ? flagHelp(key, s.flag) : why || KEY[key][1]);
     setHidden(S.remove, locked || !why || s.file == null);
@@ -3265,7 +3374,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const changed = !locked && !why && key in P.texts && !(parsed.ok && adminSameAsFile(parsed, s.file));
     S.row.classList.toggle("dirty", changed || !!(P.errors[key] && !why));
     const cut = lim?.choices && S.spec.choices?.filter((c) => !lim.choices.includes(c)).map((c) => choiceLabel(key, c));
-    let hint = key === "ctx_size" && text && !P.errors[key] ? `${adminTokens(Number(text))} tokens` : cut?.length ? `${cut.join(", ")} not available for this model${lim.why ? `: ${lim.why}` : "."}` : "";
+    let hint = key === "ctx_size" && text && !P.errors[key] ? `${adminTokens(Number(text))} tokens` : cut?.length && !locked && !why ? lim.why || `${cut.join(", ")} not available for this model.` : "";
     if (changed) hint = [hint, `was ${saved || "Default"}`].filter(Boolean).join(" · ");
     setText(S.hint, hint);
     setText(S.bad, why ? "" : P.errors[key] ?? "");
@@ -3277,6 +3386,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     F.alert = h("div", { class: "alert err", role: "alert", hidden: true });
     F.callout = h("div", { class: "callout", hidden: true }, h("span", { text: "Saved settings differ from the ones this model loaded with." }),
       h("button", { class: "btn sm primary", type: "button", text: "Reload now", onclick: () => modelStore.act(F.id, "reload") }));
+    F.update = h("div", { class: "callout", hidden: true }, F.updateText = h("span"),
+      h("button", { class: "btn sm primary", type: "button", text: "View update", onclick: () => { D.pick = F.pick; q("modelsTabAvailable").click(); } }));
     F.saveErr = h("div", { class: "alert err", role: "alert", hidden: true });
     F.rows = h("div", { class: "rows" });
     F.cacheKv = h("div", { class: "kv" });
@@ -3289,7 +3400,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const lead = h("div", { class: "lead", text: "Saved in model-settings.json. They apply the next time this model loads; a launch flag outranks the file." });
     delete q("modelsDetail").dataset.sig;
     q("modelsDetail").replaceChildren(h("div", { class: "d-head" }, h("div", { class: "grow" }, F.name, F.facts), F.actions), F.alert,
-      h("div", { class: "sect" }, h("h3", { text: "Settings" }), lead, F.callout, F.saveErr, F.rows), F.cacheSect, F.savebar);
+      h("div", { class: "sect" }, h("h3", { text: "Settings" }), lead, F.callout, F.update, F.saveErr, F.rows), F.cacheSect, F.savebar);
   }
   function buildRows(F, m) {
     const specs = F.specs = specsOf(m), P = per(F.id);
@@ -3303,31 +3414,36 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function patchDetail(m) {
     const F = A.form;
     if (!m || !F || F.id !== m.id) return;
-    const P = per(F.id), pend = modelStore.pending.get(m.id), failed = modelStore.failed.get(m.id);
+    const P = per(F.id), pend = modelStore.pending.get(m.id), why = loadError(m);
     setText(F.name, m.id);
     const words = pend ? (pend === "unload" ? "Unloading…" : "Loading…") : { ready: "Loaded", loading: "Loading…", error: "Load failed" }[m.state] ?? "Not loaded";
-    const facts = [m.bytes_on_disk && `${adminBytes(m.bytes_on_disk)} on disk`, m.bytes_linked > 0 && `${adminBytes(m.bytes_linked)} linked from elsewhere`, m.state === "ready" && m.bytes_resident && `${adminBytes(m.bytes_resident)} in memory`, m.meta?.pack_update && `Pack ${m.meta.pack_update.latest} available — ${m.meta.pack_update.command}`,
-      m.context_length && `${adminTokens(m.context_length)} max context`, (m.input_modalities ?? []).includes("image") && "sees images", streamsExperts(m) ? "streams experts" : m.streaming && "can stream experts"].filter(Boolean);
+    const facts = [m.bytes_on_disk && `${adminBytes(m.bytes_on_disk)} on disk`, m.bytes_linked > 0 && `${adminBytes(m.bytes_linked)} linked from elsewhere`, m.state === "ready" && m.bytes_resident && `${adminBytes(m.bytes_resident)} in memory`, m.context_length && `${adminTokens(m.context_length)} max context`, (m.input_modalities ?? []).includes("image") && "sees images", streamsExperts(m) ? "streams experts" : m.streaming && "can stream experts"].filter(Boolean);
     fill(F.facts, [dotOf(m), words, ...facts, m.path].join("|"), () => [h("span", {}, h("span", { class: `dot ${dotOf(m)}` }), words), ...facts.map((t) => h("span", { text: t })), ...(m.path ? [h("span", { class: "adv mono", text: m.path })] : [])]);
-    fill(F.actions, `${m.state}|${pend ?? ""}`, () => {
-      const btn = (text, kind, cls = "", busy = false) => h("button", { class: `btn sm ${cls}`, type: "button", text, disabled: busy, "aria-busy": busy ? "true" : null, onclick: () => actOn(F.id, kind) });
+    const stale = needsReload(m);
+    fill(F.actions, `${m.state}|${pend ?? ""}|${stale}|${evictNote(m)}`, () => {
+      const btn = (text, kind, cls = "", busy = false, title = "") => h("button", { class: `btn sm ${cls}`, type: "button", text, title: title || null, disabled: busy, "aria-busy": busy ? "true" : null, onclick: () => actOn(F.id, kind) });
       return pend ? [btn(pend === "unload" ? "Unloading…" : pend === "reload" ? "Reloading…" : "Loading…", "", "primary", true)]
-        : m.state === "ready" ? [btn("Reload", "reload"), btn("Unload", "unload")] : m.state === "loading" ? [btn("Loading…", "", "primary", true)] : [btn("Load", "load", "primary")];
+        : m.state === "ready" ? [...(stale ? [] : [btn("Reload", "reload")]), btn("Unload", "unload")] : m.state === "loading" ? [btn("Loading…", "", "primary", true)] : [btn("Load", "load", "primary", false, evictNote(m))];
     });
-    alertIn(F.alert, !pend && failed && m.state !== "ready" ? `Load failed: ${failed}` : !pend && m.state === "error" ? "The last load failed." : "");
+    alertIn(F.alert, !pend && m.state !== "ready" && (why || m.state === "error") ? (why ? `Load failed: ${why}` : "The last load failed.") : "");
     alertIn(F.saveErr, P.saveError ? `Couldn't save: ${P.saveError}` : "");
-    setHidden(F.callout, !needsReload(m));
+    setHidden(F.callout, !stale);
+    const up = m.meta?.pack_update;
+    F.pick = up?.repo;
+    setHidden(F.update, !up);
+    if (up) setText(F.updateText, `Pack ${up.latest} is available; this copy is ${up.current}.`);
     const sig = specsOf(m).map((s) => `${s.name}${s.max}`).join();
     if (F.sig !== sig) { F.sig = sig; buildRows(F, m); }
     for (const k of Object.keys(P.texts)) { const S = F.sets.get(k); if (S && !P.errors[k] && P.texts[k] === adminFileText(m.settings[k]?.file)) delete P.texts[k]; }
     for (const S of F.sets.values()) patchSet(F, S, m);
     const keys = dirtyKeys(F.id), n = keys.length;
     setHidden(F.savebar, n === 0);
-    setText(F.saveMsg, `${n} unsaved change${n === 1 ? "" : "s"}`);
-    F.save.disabled = Object.entries(P.errors).some(([k, e]) => e && !whyDisabled(m, k)) || F.save.getAttribute("aria-busy") === "true";
+    const bad = invalidKeys(m);
+    setText(F.saveMsg, `${n} change${n === 1 ? "" : "s"}${bad.length ? ` · ${bad.length} invalid` : ""}`);
+    F.save.disabled = bad.length > 0 || F.save.getAttribute("aria-busy") === "true";
     if (F.more) {
       const changed = F.moreList.filter((s) => keys.includes(s.name)).length, saved = F.moreList.filter((s) => m.settings[s.name]?.file != null).length;
-      const invalid = F.moreList.filter((s) => P.errors[s.name] && !whyDisabled(m, s.name)).length;
+      const invalid = F.moreList.filter((s) => bad.includes(s.name)).length;
       setText(F.moreSum, `More settings (${F.moreList.length})${invalid ? ` · ${invalid} invalid` : changed ? ` · ${changed} changed` : saved ? ` · ${saved} saved` : ""}`);
       const open = invalid > 0 || (P.moreOpen ?? modeNow() === "advanced");
       if (F.more.open !== open) { F.moreProg = true; F.more.open = open; setTimeout(() => { F.moreProg = false; }); }
@@ -3374,6 +3490,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   async function saveModel(F) {
     const m = info(F.id), P = per(F.id), { set } = adminChanges(F.specs, m.settings, sendable(m));
     if (!Object.keys(set).length) return;
+    let shown = null;
     await withBusy(F.save, "Saving…", async () => {
       try {
         const r = await postJson("/v1/settings", { model: F.id, set });
@@ -3381,13 +3498,14 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         P.saveError = "";
         toast(r.model_loaded ? `Saved. Reload ${F.id} to use them.` : `Saved. Applies the next time ${F.id} loads.`);
       } catch (e) {
-        // A refusal that names a setting belongs on that setting's row.
-        const text = adminErrorText(e), key = F.specs.find((sp) => new RegExp(`\\b${sp.name}\\b`).test(text))?.name;
+        // A refusal that names a setting belongs on that setting's row; either way it is shown there, not as a toast.
+        const raw = adminErrorText(e), key = F.specs.find((sp) => new RegExp(`\\b${sp.name}\\b`).test(raw))?.name, text = labelled(raw);
         if (key) P.errors[key] = text; else P.saveError = text;
-        failToast("Save", e);
+        shown = key ? F.sets.get(key).row : F.saveErr;
       }
     });
     await refresh();
+    shown?.scrollIntoView({ block: "nearest" });
   }
 
   // One clear at a time: every clear control stays off from the confirmation until the refreshed bytes are on screen.
@@ -3430,21 +3548,44 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const GB_SPEC = { type: "int", min: 0, max: 1048576 };
   // The two server settings reuse the setting row: assigned space and the models folder.
   const cacheRow = setRow("prefix_cache_disk_gb", "Assigned space", "cacheGb"), dirRow = setRow("models_dir", "Models folder", "dirPath");
-  const enterTo = (button) => (e) => { if (e.key === "Enter") { e.preventDefault(); if (!button.disabled) button.click(); } };
-  const cacheIn = h("input", { id: "cacheGb", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default", "aria-label": "Assigned SSD prefix cache space in GiB", oninput: () => { A.cacheText = cacheIn.value; renderSettings(); }, onkeydown: (e) => enterTo(cacheSave)(e) });
+  const enterTo = (button) => (e) => { if (e.key === "Enter") { e.preventDefault(); if (!button.disabled && !button.hidden) button.click(); } };
+  // Typing starts a new attempt: the last refusal of this setting goes.
+  const typed = (key) => { delete A.serr[key]; };
+  const cacheIn = h("input", { id: "cacheGb", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default", "aria-label": "Assigned SSD prefix cache space in GiB", oninput: () => { A.cacheText = cacheIn.value; typed("prefix_cache_disk_gb"); renderSettings(); }, onkeydown: (e) => enterTo(cacheSave)(e) });
   const cacheUnit = h("span", { class: "muted", text: "GiB" }), cacheWarn = h("div", { class: "warn", role: "status", hidden: true });
   const cacheSave = h("button", { class: "btn sm primary", id: "cacheSave", type: "button", text: "Save", onclick: saveCache });
-  const cacheDefault = h("button", { class: "btn sm", id: "cacheDefault", type: "button", text: "Use default", onclick: () => saveServer("prefix_cache_disk_gb", null, "Back to the default size.", cacheDefault, "Resetting…") });
-  cacheRow.ctl.append(h("div", { class: "row-in" }, cacheIn, cacheUnit), h("div", { class: "row-in" }, cacheSave, cacheDefault), cacheRow.bad, cacheWarn);
-  const dirIn = h("input", { id: "dirPath", type: "text", autocomplete: "off", "aria-label": "Models folder", placeholder: "/absolute/path/to/models", oninput: () => { A.dirText = dirIn.value; setText(dirRow.bad, ""); }, onkeydown: (e) => enterTo(dirSave)(e) });
+  cacheRow.ctl.append(h("div", { class: "row-in" }, cacheIn, cacheUnit, cacheSave), cacheRow.bad, cacheWarn);
+  const dirIn = h("input", { id: "dirPath", type: "text", autocomplete: "off", "aria-label": "Models folder", placeholder: "/absolute/path/to/models", oninput: () => { A.dirText = dirIn.value; typed("models_dir"); renderDir(A.settings.server.models_dir); }, onkeydown: (e) => enterTo(dirSave)(e) });
   const dirSave = h("button", { class: "btn sm primary", id: "dirSave", type: "button", text: "Save and rescan", onclick: () => {
-    if (!dirIn.value.trim().startsWith("/")) return setText(dirRow.bad, "Enter an absolute folder path.");
-    saveServer("models_dir", dirIn.value.trim(), "Saved. Rescanning the folder.", dirSave, "Saving…");
+    const path = dirIn.value.trim();
+    saveServer("models_dir", path || null, path ? "Saved. Rescanning the folder." : "Back to the default folder.", dirSave, "Saving…");
   } });
-  const dirDefault = h("button", { class: "btn sm", id: "dirDefault", type: "button", text: "Use default", onclick: () => saveServer("models_dir", null, "Back to the default folder.", dirDefault, "Resetting…") });
-  const dirCtl = [dirIn, h("div", { class: "row-in" }, dirSave, dirDefault)];
+  const dirCtl = [dirIn, h("div", { class: "row-in" }, dirSave)];
   q("cacheSet").replaceWith(cacheRow.row);
   q("dirSet").replaceWith(dirRow.row);
+
+  // The default port: where `sushi --serve` binds without --port, and what sushibar and `sushi launch` target.
+  const PORT_SPEC = { type: "int", min: 1, max: 65535 };
+  const portRow = setRow("port", "Default port", "portNum");
+  const portIn = h("input", { id: "portNum", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default (12345)", "aria-label": "Default port", oninput: () => { A.portText = portIn.value; typed("port"); renderPort(A.settings.server.port); }, onkeydown: (e) => enterTo(portSave)(e) });
+  const portSave = h("button", { class: "btn sm primary", id: "portSave", type: "button", text: "Save", onclick: () => {
+    const v = adminControlValue(PORT_SPEC, portIn.value);
+    if (v.ok) saveServer("port", v.value, v.value === null ? "Back to the default port." : "Saved.", portSave, "Saving…");
+  } });
+  portRow.ctl.append(h("div", { class: "row-in" }, portIn, portSave), portRow.bad);
+  q("portSet").replaceWith(portRow.row);
+
+  // The two automatic update checks: Default, On or Off. A file value of null is the default, shown as "Default (On)".
+  const UPDATE_KEYS = [
+    ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Off stops the daily check only."],
+    ["pack_update_check", "packUpdateSet", "Model packs", "Look for a newer revision of each model pack on Hugging Face once a day. Off stops the daily check only."],
+  ].map(([key, slot, label, help]) => {
+    const row = setRow(key, label);
+    const btns = [[null, "Default"], [true, "On"], [false, "Off"]].map(([value, text]) => h("button", { type: "button", "data-value": String(value), text, onclick: (e) => saveServer(key, value, "Saved.", e.currentTarget, "Saving…") }));
+    row.ctl.append(h("div", { class: "tri", role: "group", "aria-label": label }, ...btns), row.bad);
+    q(slot).replaceWith(row.row);
+    return { key, row, btns, help };
+  });
 
   // The server's own words for when a server setting takes effect ("saved; applies at the next model load").
   const sentence = (note) => `${note[0].toUpperCase()}${note.slice(1)}.`;
@@ -3452,31 +3593,33 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     await withBusy(btn, label, async () => {
       try {
         const r = await postJson("/v1/settings", { server: { [key]: value } });
+        typed(key);
         toast(typeof r.applied?.[key] === "string" && r.applied[key] ? sentence(r.applied[key]) : text);
-        if (key === "models_dir") A.dirText = null; else A.cacheText = null;
-      } catch (e) { failToast("Save", e); }
+        if (key === "models_dir") A.dirText = null; else if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null;
+      } catch (e) { A.serr[key] = adminErrorText(e); }
     });
     await Promise.all([refresh(), key === "models_dir" ? modelStore.refresh() : null]);
   }
   async function saveCache() {
     const v = adminControlValue(GB_SPEC, cacheIn.value);
-    if (!v.ok || v.value === null) return;
+    if (!v.ok) return;
     if (v.value === 0 && !(await confirmAction({ title: "Turn the SSD prefix cache off?", body: "Takes effect at the next model load; existing caches stay on disk until cleared.", confirm: "Turn off" }))) return;
-    saveServer("prefix_cache_disk_gb", v.value, "Saved.", cacheSave, "Saving…");
+    saveServer("prefix_cache_disk_gb", v.value, v.value === null ? "Back to the default size." : "Saved.", cacheSave, "Saving…");
   }
   function renderSettings() {
     const s = A.settings, c = A.cache;
     if (!s) return;
     setHidden(q("settingsSkel"), true);
-    for (const id of ["cacheCard", "dirCard", "aboutCard"]) setHidden(q(id), false);
+    for (const id of ["cacheCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) setHidden(q(id), false);
     setText(q("settingsFile"), `Saved in ${s.file}`);
     if (c) renderCache(c, s.server.prefix_cache_disk_gb);
     renderDir(s.server.models_dir);
-    setText(q("aboutVersion"), q("brandVersion").textContent || "-");
+    if (s.server.port) renderPort(s.server.port);
+    renderUpdates(s.server);
   }
   function renderCache(c, gb) {
     const cap = gb.effective_bytes, used = c.total_bytes, busy = (b) => b.getAttribute("aria-busy") === "true", clearing = A.busy.size > 0;
-    setText(q("cacheUsage"), `${adminBytes(used)} of ${adminBytes(cap)} assigned`);
+    setText(q("cacheUsage"), `${used > 0 ? `${adminBytes(used)} of` : "Empty ·"} ${adminBytes(cap)} assigned`);
     setText(q("cacheFree"), c.volume ? `${adminBytes(c.volume.free_bytes)} free on disk` : "");
     const pct = cap > 0 ? Math.min(100, (100 * used) / cap) : 0;
     q("cacheBar").style.width = `${pct}%`;
@@ -3488,23 +3631,23 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const kv = [["Cache volume", `${volumeLabel} · ${cachePath}`], ["Write rate", rate === null ? "-" : rate ? `${adminBytes(rate)}/s` : "idle"]];
     fill(q("cacheKv"), JSON.stringify(kv), () => kvRows(kv, ["Cache volume"]));
     const folderRow = q("cacheKv").querySelectorAll("span");
-    if (folderRow.length > 1) folderRow[1].title = cachePath;
+    if (folderRow.length > 1 && folderRow[1].title !== cachePath) folderRow[1].title = cachePath;
     const locked = !!gb.locked, file = adminFileText(gb.file);
     badges(cacheRow.badge, gb, gb.file === 0 && !locked ? "at the next load" : gb.applies);
     // A pinned size shows the flag as typed; the box is a draft only while it differs from what the page would show.
     const shown = locked ? adminFileText(gb.flag) || adminBytes(cap) : file;
     if (A.cacheText === shown) A.cacheText = null;
     if ((locked || A.cacheText === null) && cacheIn.value !== shown) cacheIn.value = shown;
-    cacheIn.placeholder = String(+(gb.ask_bytes / GiB).toFixed(2));
+    const askText = `Default (${+(gb.ask_bytes / GiB).toFixed(2)})`;
+    if (cacheIn.placeholder !== askText) cacheIn.placeholder = askText;
     setHidden(cacheUnit, locked);
     setText(cacheRow.help, locked ? flagHelp("prefix_cache_disk_gb", gb.flag) : "Space the cache may use on the SSD. A smaller size drops the oldest entries at once; 0 turns the cache off at the next model load.");
     const text = cacheIn.value.trim(), parsed = adminControlValue(GB_SPEC, text), dirty = !locked && text !== file;
     cacheIn.disabled = locked;
-    cacheSave.disabled = locked || !dirty || !parsed.ok || parsed.value === null || busy(cacheSave);
-    cacheDefault.disabled = locked || gb.file == null || busy(cacheDefault);
-    const standard = gb.default_bytes ?? (gb.file == null && !locked ? gb.ask_bytes : null);
-    if (!busy(cacheDefault)) setText(cacheDefault, standard ? `Use default (${+(standard / GiB).toFixed(2)} GiB)` : "Use default");
-    setText(cacheRow.bad, dirty && text && !parsed.ok ? "Enter a whole number of GiB (0 turns the cache off)." : "");
+    setHidden(cacheSave, !dirty);
+    cacheSave.disabled = !dirty || !parsed.ok || busy(cacheSave);
+    if (!busy(cacheSave)) setText(cacheSave, text === "" ? "Use default" : "Save");
+    setText(cacheRow.bad, (dirty && text && !parsed.ok ? "Enter a whole number of GiB (0 turns the cache off)." : "") || A.serr.prefix_cache_disk_gb || "");
     cacheIn.setAttribute("aria-invalid", String(!!cacheRow.bad.textContent));
     const want = dirty && parsed.ok && parsed.value !== null ? parsed.value * GiB : cap, room = c.volume ? c.volume.free_bytes + used : Infinity;
     setText(cacheWarn, want > room ? `More than this disk has free (${adminBytes(room)}, counting this cache's own use).` : "");
@@ -3525,22 +3668,62 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         h("td", { class: "n" }, act(n))))
         : [h("tr", {}, h("td", { colspan: 9, class: "muted", text: "Nothing cached yet. Caches appear after a loaded model answers." }))]));
     }
+    setHidden(q("clearBox"), allBytes(c) === 0);
+    setHidden(q("clearNote"), staleBytes(c) === 0);
     for (const [id, bytes, label, scope] of [["clearStale", staleBytes(c), "Clear stale caches", "stale"], ["clearAll", allBytes(c), "Clear all caches", "all"]]) {
       const mine = A.busy.has(JSON.stringify({ scope }));
       setText(q(id), mine ? "Clearing…" : `${label} (${adminBytes(bytes)})…`);
+      setHidden(q(id), bytes === 0);
       q(id).disabled = bytes === 0 || clearing;
       if (mine) q(id).setAttribute("aria-busy", "true"); else q(id).removeAttribute("aria-busy");
     }
   }
+  function renderUpdates(srv) {
+    for (const { key, row, btns, help } of UPDATE_KEYS) {
+      const st = srv[key];
+      if (!st) continue;
+      const locked = !!st.locked, shown = locked ? String(!isOff(st.flag ?? "")) : String(st.file);
+      badges(row.badge, st, st.applies);
+      for (const b of btns) {
+        b.disabled = locked;
+        b.setAttribute("aria-pressed", String(b.dataset.value === shown));
+        if (b.dataset.value === "null" && b.getAttribute("aria-busy") !== "true") setText(b, `Default (${st.default ? "On" : "Off"})`);
+      }
+      setText(row.help, locked ? flagHelp(key, st.flag) : help);
+      setText(row.bad, A.serr[key] || "");
+    }
+  }
+  function renderPort(p) {
+    const locked = !!p.locked, file = adminFileText(p.file), shown = locked ? adminFileText(p.flag) : file;
+    badges(portRow.badge, p, p.applies);
+    if (A.portText === shown) A.portText = null;
+    if ((locked || A.portText === null) && portIn.value !== shown) portIn.value = shown;
+    const hint = `Default (${p.default})`;
+    if (portIn.placeholder !== hint) portIn.placeholder = hint;
+    setText(portRow.help, locked ? flagHelp("port", p.flag) : "The port sushi serves on when started without --port, and the one sushibar and sushi launch use. It applies at the next start.");
+    const text = portIn.value.trim(), parsed = adminControlValue(PORT_SPEC, text), dirty = !locked && text !== file, busy = (b) => b.getAttribute("aria-busy") === "true";
+    portIn.disabled = locked;
+    setHidden(portSave, !dirty);
+    portSave.disabled = !dirty || !parsed.ok || busy(portSave);
+    if (!busy(portSave)) setText(portSave, text === "" ? "Use default" : "Save");
+    setText(portRow.bad, (dirty && text && !parsed.ok ? "Enter a whole number from 1 to 65535." : "") || A.serr.port || "");
+    portIn.setAttribute("aria-invalid", String(!!portRow.bad.textContent));
+  }
   function renderDir(d) {
     badges(dirRow.badge, d, d.applies);
-    dirRow.ctl.replaceChildren(...(d.locked ? [] : [...dirCtl, dirRow.bad]));
+    fill(dirRow.ctl, String(!!d.locked), () => d.locked ? [] : [...dirCtl, dirRow.bad]);
     if (!d.locked) {
-      if (A.dirText === (d.file || "")) A.dirText = null;
-      if (A.dirText === null && dirIn.value !== (d.file || "")) dirIn.value = d.file || "";
+      const file = d.file || "";
+      if (A.dirText === file) A.dirText = null;
+      if (A.dirText === null && dirIn.value !== file) dirIn.value = file;
       dirIn.placeholder = d.default;
+      const text = dirIn.value.trim(), dirty = text !== file, invalid = dirty && text && !text.startsWith("/");
+      setHidden(dirSave, !dirty);
+      dirSave.disabled = !!invalid || dirSave.getAttribute("aria-busy") === "true";
+      if (dirSave.getAttribute("aria-busy") !== "true") setText(dirSave, text === "" ? "Use default" : "Save and rescan");
+      setText(dirRow.bad, (invalid ? "Enter an absolute folder path." : "") || A.serr.models_dir || "");
     }
-    setText(dirRow.help, d.locked ? "Set by --model-dir at launch. Start sushi without it to change it here." : "Where sushi looks for packs. Saving rescans at once. Packs from `sushi pull` still land in ~/.sushi/models.");
+    setText(dirRow.help, d.locked ? "Set by --model-dir at launch. Start sushi without it to change it here." : "Where sushi looks for packs, and where new downloads are saved. Saving rescans at once.");
     const kv = [["In use", rootsInUse(d).join(", ") || "(none)"], ["Default", d.default]];
     fill(q("dirKv"), JSON.stringify(kv), () => kvRows(kv, ["In use", "Default"]));
   }
@@ -3551,7 +3734,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const msg = modelStore.online === false ? "Can't reach the sushi server. Retrying…" : A.error ? `Couldn't load: ${A.error}` : "";
     alertIn(q("modelsAlert"), msg, true);
     alertIn(q("settingsAlert"), msg, true);
-    for (const id of ["modelsMd", "cacheCard", "dirCard", "aboutCard"]) q(id).classList.toggle("stale-view", !!msg && !!A.settings);
+    const off = !!msg && !!A.settings;
+    for (const id of ["modelsMd", "cacheCard", "dirCard", "portCard", "updatesCard", "aboutCard"]) {
+      q(id).classList.toggle("stale-view", off);
+      if (q(id).inert !== off) q(id).inert = off;
+    }
     if (A.view === "models") renderModels(); else if (A.view === "settings") renderSettings();
   }
   modelStore.subscribe(() => {
@@ -3561,12 +3748,165 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   window.addEventListener("sushi-mode", () => { if (A.view === "models" || A.view === "settings") renderAll(); });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 
+  // Downloads: the packs on Hugging Face, this Mac's fit and the server's download queue (/v1/downloads).
+  const D = { data: null, error: null, timer: null, rows: new Map(), order: "", seen: null, pick: null, scrolled: false };
+  const SEEN_KEY = "sushi-seen-packs";
+  const packKeys = (d) => d.packs.flatMap((p) => [p.repo, ...(p.update ? [`${p.repo}@${p.update.latest}`] : [])]);
+  // The dot names a pack (or an update) this browser has not listed before; the first full catalog seeds the list
+  // silently. A catalog still loading is only the packs this build knows, so it neither seeds nor marks.
+  function markNew(d, viewing) {
+    if (d.catalog !== "ready" || d.refreshing || !d.update_check) return;
+    let seen = null;
+    try { seen = JSON.parse(localStorage.getItem(SEEN_KEY)); } catch {}
+    const keys = packKeys(d);
+    if (!Array.isArray(seen) || viewing) {
+      seen = [...new Set([...(Array.isArray(seen) ? seen : []), ...keys])];
+      try { localStorage.setItem(SEEN_KEY, JSON.stringify(seen)); } catch {}
+    }
+    const fresh = !viewing && !keys.every((k) => seen.includes(k));
+    setHidden(q("navModelsDot"), !fresh);
+    setHidden(q("modelsTabDot"), !fresh);
+    const name = fresh ? "Models, new packs" : "Models";
+    if (q("navModels").getAttribute("aria-label") !== name) q("navModels").setAttribute("aria-label", name);
+  }
+  // The installed list shows a running download's percent on the Available switch.
+  function tabProgress() {
+    const j = D.data?.jobs.find(isActive);
+    setText(q("modelsTabPct"), j?.total_bytes ? `${Math.floor((100 * j.done_bytes) / j.total_bytes)}%` : "");
+  }
+  // A downloaded pack opens in the installed list (its id is its folder's name), where it loads.
+  function openInstalled(p) {
+    history.pushState(null, "", `/models#${encodeURIComponent(p.path.split("/").pop())}`);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }
+  const eta = (s) => s < 90 ? `${Math.max(1, Math.round(s))} s left` : s < 5400 ? `${Math.round(s / 60)} min left` : `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min left`;
+  const jobOf = (repo) => D.data?.jobs.filter((j) => j.repo === repo).pop();
+  const PHASE = { queued: "Queued", listing: "Listing files…", checking: "Checking the files already on disk…", downloading: "Downloading", verifying: "Verifying", done: "Downloaded", failed: "Failed", cancelled: "Stopped" };
+  const isActive = (j) => !!j && !["done", "failed", "cancelled"].includes(j.phase);
+  const label = (p) => p.tag ? `${p.name}:${p.tag}` : p.name;
+  // `sushi list`'s tier words: a pack below this Mac's tier "may stream (--ssd-budget-gb)"; DeepSeek always streams.
+  const tierText = (p) => p.streams_experts ? `Needs ${p.tier_gb} GB with its experts streamed from the SSD; this Mac has ${D.data.ram_gb} GB.`
+    : `Runs in memory from ${p.tier_gb} GB; this Mac has ${D.data.ram_gb} GB. It may stream (--ssd-budget-gb).`;
+  async function startDownload(p, btn) {
+    if (p.fits === false && !(await confirmAction({ title: `Download ${label(p)}?`, body: `${tierText(p)} Nothing promises it runs here.`, confirm: "Download anyway" }))) return;
+    await withBusy(btn, "Starting…", async () => {
+      try {
+        const r = await postJson("/v1/downloads", { repo: p.repo });
+        toast(r.warning ? `Downloading ${label(p)}; it ${r.warning}.` : `Downloading ${label(p)}.`);
+      } catch (e) { failToast("Download", e); }
+    });
+    refreshDownloads();
+  }
+  async function stopDownload(p, btn) {
+    await withBusy(btn, "Stopping…", async () => {
+      try { await postJson("/v1/downloads/cancel", { repo: p.repo }); } catch (e) { failToast("Stop", e); }
+    });
+    refreshDownloads();
+  }
+  // A row is rebuilt only when what it shows changes; the live numbers of a running download are text writes.
+  function packRow(p) {
+    const j = jobOf(p.repo), live = isActive(j);
+    // A running download's folder grows: its size on disk is no part of the row while it runs.
+    const sig = JSON.stringify([{ ...p, partial_bytes: live ? null : p.partial_bytes }, j && [j.phase, j.message, j.stopping]]);
+    const old = D.rows.get(p.repo);
+    if (old?.sig === sig) return old;
+    const badges = [
+      p.recommended ? h("span", { class: "badge ok", text: "Recommended for this Mac" }) : null,
+      p.installed ? h("span", { class: "badge saved", text: "Downloaded" }) : null,
+      p.update ? h("span", { class: "badge flag", text: `Update ${p.update.latest}` }) : null,
+      p.fits === false ? h("span", { class: "badge", text: `Needs ${p.tier_gb} GB` }) : null,
+    ];
+    const meta = [p.size_bytes != null ? adminBytes(p.size_bytes) : "size unknown", p.partial_bytes ? `${adminBytes(p.partial_bytes)} on disk, not complete` : "", p.repo].filter(Boolean).join(" · ");
+    const why = j?.phase === "failed" ? `Failed: ${j.message || "the download stopped"}. Downloaded files are kept.` : j?.phase === "cancelled" ? "Stopped. The downloaded part is kept; Resume continues from it."
+      : p.fits === false ? tierText(p) : "";
+    const btn = (text, cls, fn, off) => { const b = h("button", { class: `btn sm ${cls}`, type: "button", text, "aria-label": `${text} ${label(p)}${fn === openInstalled ? " in Installed" : ""}`, disabled: !!off }); b.addEventListener("click", () => fn(p, b)); return b; };
+    const action = live ? (j.stopping ? btn("Stopping…", "", stopDownload, true) : btn(j.phase === "queued" ? "Remove" : "Stop", "", stopDownload))
+      : p.update ? btn("Update", "primary", startDownload)
+      : p.installed ? (p.path ? btn("Open", "", openInstalled) : null)
+      : btn(p.partial_bytes || j?.phase === "cancelled" || j?.phase === "failed" ? "Resume" : "Download", p.recommended ? "primary" : "", startDownload);
+    const prog = h("div", { class: "prog", hidden: !live }, h("div", { class: "meter", role: "progressbar", "aria-label": `${label(p)} download`, "aria-valuemin": "0", "aria-valuemax": "100" }, h("span")), h("div", { class: "meter-text" }, h("span", { class: "a" }), h("span", { class: "b" })));
+    const el = h("div", { class: "dl-row", "data-repo": p.repo },
+      h("div", { class: "main" }, h("div", { class: "name" }, h("span", { text: label(p) }), ...badges), h("div", { class: "meta", text: meta }),
+        why ? h("div", { class: `why${j?.phase === "failed" ? " err" : ""}`, text: why }) : null),
+      h("div", { class: "act" }, action), prog);
+    const row = { sig, el, prog };
+    D.rows.set(p.repo, row);
+    return row;
+  }
+  function progress(row, j) {
+    if (!isActive(j)) return;
+    const pct = j.total_bytes ? Math.min(100, (100 * j.done_bytes) / j.total_bytes) : 0;
+    const bar = row.prog.querySelector(".meter"), fillEl = bar.firstChild, w = `${+pct.toFixed(1)}%`;
+    if (fillEl.style.width !== w) fillEl.style.width = w;
+    if (bar.getAttribute("aria-valuenow") !== String(Math.round(pct))) bar.setAttribute("aria-valuenow", String(Math.round(pct)));
+    const step = j.phase === "downloading" || j.phase === "verifying" ? `${PHASE[j.phase]} ${j.file ? `${j.file.path} (${j.file_index} of ${j.files})` : ""}` : PHASE[j.phase];
+    const nums = j.total_bytes ? [`${adminBytes(j.done_bytes)} of ${adminBytes(j.total_bytes)}`, j.speed_bps != null ? `${adminBytes(j.speed_bps)}/s` : "", j.eta_s != null ? eta(j.eta_s) : ""].filter(Boolean).join(" · ") : "";
+    setText(row.prog.querySelector(".a"), step.trim());
+    setText(row.prog.querySelector(".b"), nums);
+  }
+  function renderDownloads() {
+    const d = D.data;
+    alertIn(q("dlAlert"), D.error ? `Couldn't load: ${D.error}` : "", false);
+    if (!d) return;
+    const where = d.dest.locked ? "set by --model-dir" : d.dest.source === "file" ? "the Settings tab's models folder" : "the default models folder";
+    const space = d.dest.free_bytes != null ? `${adminBytes(d.dest.free_bytes)} free${d.dest.volume ? ` on ${d.dest.volume}` : ""}` : "unknown";
+    const kv = [["This Mac", `${d.ram_gb} GB of memory`], ["Saves to", `${d.dest.path} (${where})`], ["Free space", space]];
+    fill(q("dlMac"), JSON.stringify(kv), () => kvRows(kv, ["Saves to"]));
+    const note = d.catalog === "offline" ? "Hugging Face can't be reached: these are the packs this build knows, without sizes." : d.catalog === "loading" ? "Checking Hugging Face…" : "";
+    setText(q("dlNote"), note);
+    setHidden(q("dlNote"), !note);
+    const rows = d.packs.map(packRow);
+    for (const repo of [...D.rows.keys()]) if (!d.packs.some((p) => p.repo === repo)) D.rows.delete(repo);
+    const order = d.packs.map((p) => D.rows.get(p.repo).sig).join("\n");
+    if (D.order !== order) {
+      D.order = order;
+      q("dlList").replaceChildren(...(rows.length ? rows.map((r) => r.el) : [h("div", { class: "card-b muted", text: "No packs are published yet." })]));
+    }
+    for (const p of d.packs) progress(D.rows.get(p.repo), jobOf(p.repo));
+    // A pack the Models tab sent us here for is marked, and scrolled to once.
+    for (const [repo, r] of D.rows) r.el.classList.toggle("pick", repo === D.pick);
+    if (D.pick && !D.scrolled && D.rows.has(D.pick)) { D.scrolled = true; D.rows.get(D.pick).el.scrollIntoView({ block: "center" }); }
+  }
+  async function refreshDownloads(force) {
+    clearTimeout(D.timer);
+    const viewing = A.view === "downloads", near = () => viewing || (A.view === "models" && !!D.data?.jobs.some(isActive));
+    if (document.hidden && near()) { D.timer = setTimeout(refreshDownloads, 5000); return; }
+    try {
+      const d = await pull("downloads", force ? "/v1/downloads?refresh=1" : viewing ? "/v1/downloads" : "/v1/downloads?background=1");
+      D.error = null;
+      // A finished download is a new model: the Models tab and the chat's list hear of it now.
+      if (d && d.jobs.some((j) => j.phase === "done" && !D.data?.jobs.some((o) => o.repo === j.repo && o.phase === "done"))) modelStore.refresh();
+      if (d) D.data = d;
+      if (D.data && (d || viewing)) markNew(D.data, viewing);
+    } catch (e) { D.error = adminErrorText(e); }
+    if (viewing) renderDownloads();
+    tabProgress();
+    const loading = D.data?.refreshing || D.data?.catalog === "loading";
+    // Under --no-update-check another tab asks nothing: Hugging Face is read only while this list is open.
+    if (!near() && D.data && !D.data.update_check) return;
+    D.timer = setTimeout(refreshDownloads, viewing ? (loading || D.data?.jobs.some(isActive) ? 1000 : 5000) : near() ? 2000 : loading ? 5000 : 30 * 60 * 1000);
+  }
+  q("dlRefresh").addEventListener("click", () => withBusy(q("dlRefresh"), "Checking…", () => refreshDownloads(true)));
+  setTimeout(() => { if (A.view !== "downloads") refreshDownloads(); }, 3000);
+
   window.sushiAdmin = {
     refresh,
+    shows: (id) => A.view === "models" && A.sel === id,
     show(view) {
+      const sub = view === "downloads" ? "available" : "installed", panel = q("modelsPanel");
+      // Switching between Installed and Available fades the new list in; the switch's thumb slides in CSS.
+      if (!panel.hidden && (view === "models" || view === "downloads") && panel.dataset.sub !== sub && !matchMedia("(prefers-reduced-motion: reduce)").matches)
+        q(sub === "available" ? "downloadsPanel" : "modelsBody").animate([{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "none" }], { duration: 180, easing: "ease-out" });
       A.view = view;
-      q("modelsPanel").hidden = view !== "models";
+      panel.dataset.sub = sub;
+      for (const [id, on] of [["modelsTabInstalled", sub === "installed"], ["modelsTabAvailable", sub === "available"]]) {
+        if (on) q(id).setAttribute("aria-current", "page"); else q(id).removeAttribute("aria-current");
+      }
+      if (view !== "downloads") Object.assign(D, { pick: null, scrolled: false });
+      panel.hidden = view !== "models" && view !== "downloads";
       q("settingsPanel").hidden = view !== "settings";
+      if (view === "downloads") { setText(q("modelsTitle"), "Models"); setHidden(q("modelsTabs"), false); renderDownloads(); refreshDownloads(); }
+      else if (view === "models" && D.data?.jobs.some(isActive)) refreshDownloads();
       clearInterval(A.timer);
       clearTimeout(A.retry);
       A.timer = null;
@@ -3921,7 +4261,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     kv($('writes'), writeRows);
     renderWriteOrigins($('write-origins'), writes?.origins);
     const locationRows = $('writes').querySelectorAll('span');
-    if (locationRows.length > 1) locationRows[1].title = ssdVolume?.path || '';
+    const writesTitle = ssdVolume?.path || '';
+    if (locationRows.length > 1 && locationRows[1].title !== writesTitle) locationRows[1].title = writesTitle;
     hist('ttft', h.time_to_first_token_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
     hist('e2e', h.e2e_request_latency_seconds, b => b < 1 ? (b * 1000) + 'ms' : b + 's');
     sessions(d.sessions || [], now, g);
@@ -4000,7 +4341,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (k === 'progress') html = `<div class="t">Prefill progress</div><div style="line-height:1.4">${fmtInt(+el.dataset.done)} of ${fmtInt(+el.dataset.exp)} prompt tokens processed.</div>`;
     else if (PHASE_HELP[k]) html = `<div class="t">${PHASE_HELP[k][0]}</div><div style="line-height:1.4">${PHASE_HELP[k][1]}</div>`;
     else return;
-    placeTip(r.left + r.width / 2, r.top, html, 'phase');
+    placeTip(r.left + r.width / 2, r.top, html, 'phase', r.bottom + 12);
   }
   // Called after the table is rebuilt: the hovered chip may have changed or its row may be gone.
   function refreshPhaseTip() {
@@ -4021,7 +4362,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const exp = g.prefill_tokens_expected || 0, done = Math.min(g.prefill_tokens_live || 0, exp);
     const prefillDone = prefilling === 1 && exp > 0 ? 100 * done / exp : null;
     const tb = $('sessions');
-    if (!rows.length) { setHtml(tb, '<tr><td colspan="10" class="empty">No live requests or cached conversations.</td></tr>'); lastGen.clear(); refreshPhaseTip(); return; }
+    if (!rows.length) { setHtml(tb, '<tr><td colspan="11" class="empty">No live requests or cached conversations.</td></tr>'); lastGen.clear(); refreshPhaseTip(); return; }
     const seen = new Set();
     setHtml(tb, rows.map(s => {
       const len = s.context_length || 0, ctx = s.context_tokens || 0;
@@ -4034,6 +4375,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         lastGen.set(s.request_id, { gen: s.generated_tokens, t: now });
       }
       const genTxt = s.phase === 'cached' ? '' : fmtInt(s.generated_tokens) + (s.max_tokens ? ` / ${fmtInt(s.max_tokens)}` : '');
+      const canCancel = (s.phase === 'prefill' || s.phase === 'decode') && s.request_id;
+      const cancelBtn = canCancel
+        ? `<button class="btn xs danger" data-cancel="${esc(s.request_id)}" title="Cancel this in-flight request">Cancel</button>`
+        : '';
       return `<tr>
         <td class="rid"${s.request_id ? ` title="Request ${esc(s.request_id)}"` : ''}>${esc(s.request_id || '')}</td>
         <td title="${esc(s.model)}">${esc(String(s.model).split('/').pop())}</td>
@@ -4044,11 +4389,28 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         <td>${genTxt}</td>
         <td>${s.phase === 'cached' ? '' : secs(s.elapsed_seconds)}</td>
         <td>${rate}</td>
-        <td>${bytes(s.state_bytes || 0)}</td></tr>`;
+        <td>${bytes(s.state_bytes || 0)}</td>
+        <td class="n">${cancelBtn}</td></tr>`;
     }).join(''));
     for (const id of lastGen.keys()) if (!seen.has(id)) lastGen.delete(id);
     refreshPhaseTip();
   }
+
+  async function cancelSlot(btn) {
+    btn.disabled = true;
+    btn.textContent = 'Stopping…';
+    try {
+      const res = await fetch('/v1/slots/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: Number(btn.dataset.cancel) }) });
+      if (!res.ok) throw new Error((await res.json().catch(() => null))?.error?.message || `HTTP ${res.status}`);
+      btn.textContent = 'Cancelled';
+      setTimeout(pollSoon, 100);
+    } catch (e) {
+      btn.textContent = 'Failed';
+      btn.title = e.message;
+    }
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Cancel'; }, 2000);
+  }
+  sess.addEventListener('click', e => { const btn = e.target.closest('button[data-cancel]'); if (btn && !btn.disabled) cancelSlot(btn); });
 
   const ago = ms => { const s = Math.max(0, Math.round(ms / 1000)); return s < 5 ? 'just now' : s < 60 ? s + ' s ago' : s < 3600 ? Math.floor(s / 60) + ' min ago' : Math.floor(s / 3600) + ' h ago'; };
   const upFor = ms => { const m = Math.floor(ms / 60000), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60); return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`; };
@@ -4131,7 +4493,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setWidth($('cm-ssd-bar'), cap ? Math.min(100, 100 * ssd / cap) : 0);
     put($('cm-ssd-s'), cap ? `${fmtInt(entries)} ${entries === 1 ? 'entry' : 'entries'}` : known ? 'SSD prefix cache is off' : modelsKnown && !ready.length ? 'no model loaded' : '');
     put($('cm-ssd-volume'), cap ? cacheVolumeText(volume) : '');
-    $('cm-ssd-volume').title = volume?.path || '';
+    const ssdTitle = volume?.path || '';
+    if ($('cm-ssd-volume').title !== ssdTitle) $('cm-ssd-volume').title = ssdTitle;
 
     setValue($('cm-req'), String(g.requests_running || 0), 'running');
     put($('cm-req-s'), `${g.requests_waiting || 0} waiting` + (g.requests_prefilling ? ', prefilling' : ''));
@@ -4322,15 +4685,19 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     tip.style.display = 'block'; tipOwner = cv.id;
     const r = cv.getBoundingClientRect(), tw = tip.offsetWidth, th = tip.offsetHeight;
     let left = r.left + x + 14; if (left + tw > window.innerWidth - 8) left = r.left + x - tw - 14;
-    let top = r.top + y - th / 2; top = Math.max(8, Math.min(top, window.innerHeight - th - 8));
-    tip.style.left = Math.max(8, left) + 'px'; tip.style.top = top + 'px';
+    const top = tipTop(th, r.top + y - th / 2, r.top + y - th / 2);
+    tip.style.left = Math.max(8, Math.min(left, window.innerWidth - tw - 8)) + 'px'; tip.style.top = top + 'px';
   }
-  function placeTip(cx, cy, html, owner) {
+  // Above the anchor when it fits under the top bar, else below; always inside the viewport.
+  function tipTop(th, above, below) {
+    const min = document.getElementById('appTopbar').getBoundingClientRect().bottom + 8;
+    return Math.max(min, Math.min(above >= min ? above : below, window.innerHeight - th - 8));
+  }
+  function placeTip(cx, cy, html, owner, below = cy + 24) {
     setHtml(tip, html); tip.style.display = 'block'; tipOwner = owner;
     const tw = tip.offsetWidth, th = tip.offsetHeight;
     let left = cx + 14; if (left + tw > window.innerWidth - 8) left = cx - tw - 14;
-    const top = Math.max(8, Math.min(cy - th - 12, window.innerHeight - th - 8));
-    tip.style.left = Math.max(8, left) + 'px'; tip.style.top = top + 'px';
+    tip.style.left = Math.max(8, Math.min(left, window.innerWidth - tw - 8)) + 'px'; tip.style.top = tipTop(th, cy - th - 12, below) + 'px';
   }
   function hideTip() { tip.style.display = 'none'; tipOwner = null; }
 
@@ -4494,7 +4861,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (!el || !TILE_TIPS[el.dataset.tile]) return;
     const [title, rows, help] = TILE_TIPS[el.dataset.tile](), r = el.getBoundingClientRect();
     placeTip(r.left + 20, r.top, `<div class="t">${title}</div>` + rows.map(([k, v]) =>
-      `<div class="r near" style="grid-template-columns:1fr auto"><span>${k}</span><b>${v}</b></div>`).join('') + `<div class="h">${help}</div>`, 'tile');
+      `<div class="r near" style="grid-template-columns:1fr auto"><span>${k}</span><b>${v}</b></div>`).join('') + `<div class="h">${help}</div>`, 'tile', r.bottom + 12);
   };
   for (const tiles of $('panel').querySelectorAll('.tiles')) {
     tiles.addEventListener('pointerover', e => tileTip(e.target.closest('[data-tile]')));
@@ -4504,8 +4871,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
 
 
-  const VIEW_PATH = { chat: '/chat', dashboard: '/dashboard', models: '/models', settings: '/settings' };
+  const VIEW_PATH = { chat: '/chat', dashboard: '/dashboard', models: '/models', settings: '/settings', downloads: '/downloads' };
   const NAV_ID = { chat: 'navChat', dashboard: 'navDashboard', models: 'navModels', settings: 'navSettings' };
+  // /downloads is the Models tab's Available list: the tab it lights and the switch that leads there.
+  const navOf = view => view === 'downloads' ? 'models' : view;
+  const SUB_ID = { models: 'modelsTabInstalled', downloads: 'modelsTabAvailable' };
   // The root is the Dashboard: it is where a visit to the server starts; the chat lives at /chat.
   const viewOf = p => Object.keys(VIEW_PATH).find(v => VIEW_PATH[v] === p) ?? 'dashboard';
   const chatTitle = document.title;
@@ -4531,9 +4901,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     document.getElementById('appMain').dataset.view = view;
     for (const v of Object.keys(NAV_ID)) {
       const link = document.getElementById(NAV_ID[v]);
-      if (v === view) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
+      if (v === navOf(view)) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
     }
-    document.title = chat ? chatTitle : 'sushi · ' + view;
+    document.title = chat ? chatTitle : 'sushi · ' + navOf(view);
     modelStore.setView(view);
     window.sushiAdmin?.show(view);
     if (dash) {
@@ -4544,19 +4914,19 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     } else if (chat && chatFocus?.isConnected) chatFocus.focus({ preventScroll: true });
     switching = false;
   }
-  function goTo(view) {
+  function goTo(view, sub) {
     if (viewOf(location.pathname) === view && dashActive === (view === 'dashboard')) return;
     history.pushState(null, '', VIEW_PATH[view]);
     applyView(view);
-    // Keyboard and screen-reader users land on the new page's heading.
-    if (view !== 'chat') document.querySelector('#' + { dashboard: 'dashPanel', models: 'modelsPanel', settings: 'settingsPanel' }[view] + ' h1')?.focus({ preventScroll: true });
+    // Keyboard and screen-reader users land on the new page's heading; the Models switch keeps its focus.
+    if (view !== 'chat' && !sub) document.querySelector('#' + { dashboard: 'dashPanel', models: 'modelsPanel', settings: 'settingsPanel' }[view] + ' h1')?.focus({ preventScroll: true });
   }
   document.getElementById('serverDot').addEventListener('click', () => goTo('dashboard'));
   for (const h1 of document.querySelectorAll('.page-head h1')) h1.tabIndex = -1;
-  for (const [view, id] of Object.entries(NAV_ID)) {
+  for (const [ids, sub] of [[NAV_ID, false], [SUB_ID, true]]) for (const [view, id] of Object.entries(ids)) {
     document.getElementById(id).addEventListener('click', e => {
       if (e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-      e.preventDefault(); goTo(view);
+      e.preventDefault(); goTo(view, sub);
     });
   }
   // Cmd+1..4 (Ctrl+1..4 off a Mac) click the tabs in their order, so a form with unsaved edits still asks first.

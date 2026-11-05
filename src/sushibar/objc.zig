@@ -13,6 +13,7 @@ extern fn objc_registerClassPair(cls: id) void;
 extern fn class_addMethod(cls: id, sel: SEL, imp: *const anyopaque, types: [*:0]const u8) bool;
 extern var NSRunLoopCommonModes: id;
 extern var NSPasteboardTypeString: id;
+extern var NSEventTrackingRunLoopMode: id;
 
 pub fn class(name: [*:0]const u8) id {
     return objc_getClass(name);
@@ -69,16 +70,21 @@ pub fn new(cls: id) id {
     return msg(id, msg(id, cls, "alloc", .{}), "init", .{});
 }
 
-/// Calls `[target selector:timer]` every `seconds` on the main run loop, menu tracking included.
-pub fn addTimer(seconds: f64, target: id, selector: [*:0]const u8) void {
+/// Calls `[target selector:timer]` every `seconds` on the main run loop, menu tracking included; `invalidate` stops it.
+pub fn addTimer(seconds: f64, target: id, selector: [*:0]const u8) id {
     const timer = msg(id, class("NSTimer"), "timerWithTimeInterval:target:selector:userInfo:repeats:", .{ seconds, target, sel_registerName(selector), @as(id, null), true });
     msg(void, msg(id, class("NSRunLoop"), "mainRunLoop", .{}), "addTimer:forMode:", .{ timer, NSRunLoopCommonModes });
+    return timer;
 }
 
 pub fn copyText(text: [*:0]const u8) void {
+    copyString(nsString(text));
+}
+
+pub fn copyString(s: id) void {
     const pb = msg(id, class("NSPasteboard"), "generalPasteboard", .{});
     _ = msg(isize, pb, "clearContents", .{});
-    _ = msg(bool, pb, "setString:forType:", .{ nsString(text), NSPasteboardTypeString });
+    _ = msg(bool, pb, "setString:forType:", .{ s, NSPasteboardTypeString });
 }
 
 /// An NSImage from SVG bytes, `w` x `h` points; a template image is tinted by the system.
@@ -88,4 +94,60 @@ pub fn loadSvg(svg: []const u8, template: bool, w: f64, h: f64) id {
     msg(void, image, "setSize:", .{NSSize{ .width = w, .height = h }});
     msg(void, image, "setTemplate:", .{template});
     return image;
+}
+
+/// The user asked the system for less motion (Accessibility > Display > Reduce motion).
+pub fn reduceMotion() bool {
+    return msg(bool, msg(id, class("NSWorkspace"), "sharedWorkspace", .{}), "accessibilityDisplayShouldReduceMotion", .{});
+}
+
+/// The next change `view` draws, its subviews' included, cross-fades in over `seconds` instead of snapping; nothing
+/// under Reduce motion. Core Animation, which AppKit already loads.
+pub fn fadeNext(view: id, seconds: f64) void {
+    if (view == null or reduceMotion()) return;
+    msg(void, view, "setWantsLayer:", .{true});
+    const layer = msg(id, view, "layer", .{});
+    if (layer == null) return;
+    const t = msg(id, class("CATransition"), "animation", .{});
+    msg(void, t, "setDuration:", .{seconds});
+    msg(void, t, "setTimingFunction:", .{msg(id, class("CAMediaTimingFunction"), "functionWithName:", .{nsString("easeInEaseOut")})});
+    msg(void, layer, "addAnimation:forKey:", .{ t, nsString("fade") });
+}
+
+pub fn color(name: [*:0]const u8) id {
+    return msg(id, class("NSColor"), name, .{});
+}
+
+pub fn withAlpha(c: id, a: f64) id {
+    return msg(id, c, "colorWithAlphaComponent:", .{a});
+}
+
+/// A system symbol drawn in the single colour `c`, or null when the system has no such symbol.
+pub fn symbolImage(name: [*:0]const u8, c: id) id {
+    const img = msg(id, class("NSImage"), "imageWithSystemSymbolName:accessibilityDescription:", .{ nsString(name), @as(id, null) });
+    if (img == null) return null;
+    const colors = msg(id, class("NSArray"), "arrayWithObject:", .{c});
+    const cfg = msg(id, class("NSImageSymbolConfiguration"), "configurationWithPaletteColors:", .{colors});
+    return msg(id, img, "imageWithSymbolConfiguration:", .{cfg});
+}
+
+/// Follows the pointer from a mouse-down in `view` to the button release, as a control does, calling `moved(view,
+/// inside)` as it goes. True when the release was inside the view.
+pub fn trackClick(view: id, moved: *const fn (id, bool) void) bool {
+    const app = msg(id, class("NSApplication"), "sharedApplication", .{});
+    const forever = msg(id, class("NSDate"), "distantFuture", .{});
+    const bounds = msg(NSRect, view, "bounds", .{});
+    const mask_up_or_drag: u64 = (1 << 2) | (1 << 6);
+    const type_up: isize = 2;
+    var inside = true;
+    while (true) {
+        moved(view, inside);
+        const ev = msg(id, app, "nextEventMatchingMask:untilDate:inMode:dequeue:", .{ mask_up_or_drag, forever, NSEventTrackingRunLoopMode, true });
+        if (ev == null) return false;
+        const p = msg(NSPoint, view, "convertPoint:fromView:", .{ msg(NSPoint, ev, "locationInWindow", .{}), @as(id, null) });
+        inside = p.x >= 0 and p.y >= 0 and p.x < bounds.w and p.y < bounds.h;
+        if (msg(isize, ev, "type", .{}) == type_up) break;
+    }
+    moved(view, false);
+    return inside;
 }

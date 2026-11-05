@@ -9,6 +9,9 @@ const objc = @import("sushibar/objc.zig");
 const io_util = @import("io_util.zig");
 const header_view = @import("sushibar/header_view.zig");
 const port_field = @import("sushibar/port_field.zig");
+const button_row = @import("sushibar/button_row.zig");
+const log_view = @import("sushibar/log_view.zig");
+const port_row = @import("sushibar/port_row.zig");
 
 const usage =
     \\usage: sushibar [--port <n>]
@@ -18,12 +21,13 @@ const usage =
     \\It detaches from the terminal.
     \\
     \\  --port <n>   Port of the server to watch and start (default: the port last chosen
-    \\               in the menu, else {d})
+    \\               in the menu, else the default port: `server.port` in
+    \\               ~/.sushi/model-settings.json, else {d})
     \\  --help       This text
     \\
 ;
 
-const poll_ms = 1000;
+const tick_ms = 1000;
 const server_exe = "sushi";
 const bar_exe = "sushibar";
 const bar_pid_name = "sushibar.pid";
@@ -66,7 +70,7 @@ fn Str(comptime N: usize) type {
 
 // ── Test seams: SUSHIBAR_TEST_POLLS, SUSHIBAR_TEST_ACTIONS (docs/envvar.md) ──
 
-const ActionKind = enum { start, stop, confirm, check, update, port, typed, models };
+const ActionKind = enum { start, stop, load, unload, confirm, check, update, port, typed, models, remove };
 const Action = struct { kind: ActionKind, at: u32, value: u32 = 0 };
 var test_polls: u32 = 0;
 var test_actions: [12]Action = undefined;
@@ -87,6 +91,9 @@ fn readTestSeams() void {
         } else if (std.mem.startsWith(u8, word, "port")) {
             act.kind = .port;
             act.value = std.fmt.parseInt(u16, word[4..], 10) catch continue;
+        } else if (std.mem.startsWith(u8, word, "remove")) {
+            act.kind = .remove;
+            act.value = std.fmt.parseInt(u16, word[6..], 10) catch continue;
         } else if (std.mem.startsWith(u8, word, "type")) {
             act.kind = .typed;
             act.value = std.fmt.parseInt(u32, word[4..], 10) catch continue;
@@ -126,7 +133,6 @@ const Shared = struct {
     last_prefill: ?f64 = null,
     hist: [200]logic.Hist = undefined,
     hist_n: usize = 0,
-    up_to_date: bool = false,
     bar_version: Str(32) = .{},
     server_version: Str(32) = .{},
     /// What the running server's `/props.update` says.
@@ -136,16 +142,31 @@ const Shared = struct {
     latest: Str(32) = .{},
     available: bool = false,
     note: Str(240) = .{},
+    /// The note says something went wrong: it is drawn orange and opens the Log window.
+    note_problem: bool = false,
+    note_at_ms: i64 = 0,
+    props_url: Str(160) = .{},
     busy: logic.Busy = .none,
     check_failed: bool = false,
+    /// Where the watched port's server writes its log; stale once the watched port changes (`port`).
+    log_kind: logic.LogKind = .standard,
+    log_path: Str(1024) = .{},
     relaunch: bool = false,
-    req_check: bool = false,
-    req_update: bool = false,
+    /// How the last check the user asked for ended, and when; shown on the Update button.
+    manual_result: logic.CheckResult = .none,
+    manual_at_ms: i64 = 0,
+    /// The key the watched server's argv gives it (`--api-key`, `--api-key-env`), sent only to `key_port`.
+    api_key: Str(512) = .{},
+    key_port: u16 = 0,
 };
 
 var shared: Shared = .{};
 var g_io: std.Io = undefined;
 var g_port = std.atomic.Value(u16).init(logic.default_port);
+/// The port the menu lists first and never lets go: `server.port` of the settings file, re-read as the menu opens.
+var g_default_port: u16 = logic.default_port;
+/// The ports the user added; the menu and the Port field are the main thread's.
+var g_saved: logic.SavedPorts = .{};
 var g_home: []const u8 = "/tmp";
 var g_sushi_found = false;
 var g_sibling_brew = false;
@@ -155,6 +176,17 @@ var g_bar_pid_path: []const u8 = "";
 var g_saved_path: []const u8 = "";
 var g_capture_seq = std.atomic.Value(u32).init(0);
 var g_launched_version: Str(32) = .{};
+/// The model the watched server last had loaded (`sushibar.json`): Start loads it again.
+var g_last_model: Str(logic.max_model) = .{};
+/// The port a server is being asked to load `g_last_model` on, 0 when none is.
+var g_load_port = std.atomic.Value(u16).init(0);
+/// The port a server is being asked to unload `g_last_model` on, 0 when none is.
+var g_unload_port = std.atomic.Value(u16).init(0);
+/// A server the user's own Stop is ending, so its going away is no news.
+var g_stop_port: u16 = 0;
+var g_stop_at_ms: i64 = 0;
+/// The port whose server exited on its own, for the icon's badge until a server answers there or Start is pressed.
+var g_crashed_port: u16 = 0;
 
 fn lock() void {
     shared.mu.lockUncancelable(g_io);
@@ -175,15 +207,18 @@ const poll_timeout_s = 4;
 const models_timeout_s = 1;
 
 /// A server that accepts and never answers is offline after `timeout_s`, not a stalled poll thread.
-fn request(a: std.mem.Allocator, method: std.http.Method, url: []const u8, origin: ?[]const u8) ?Reply {
-    return requestWithin(a, method, url, origin, poll_timeout_s);
+fn request(a: std.mem.Allocator, p: u16, method: std.http.Method, url: []const u8, origin: ?[]const u8) ?Reply {
+    return requestWithin(a, p, method, url, origin, poll_timeout_s, "");
 }
 
-fn requestWithin(a: std.mem.Allocator, method: std.http.Method, url: []const u8, origin: ?[]const u8, timeout_s: i64) ?Reply {
+/// `p` is the port `url` names: only the watched server's own key is sent, and only to it.
+fn requestWithin(a: std.mem.Allocator, p: u16, method: std.http.Method, url: []const u8, origin: ?[]const u8, timeout_s: i64, payload: []const u8) ?Reply {
+    var auth_buf: [600]u8 = undefined;
+    const auth = authFor(&auth_buf, p);
     const U = union(enum) { got: ?Reply, timer: std.Io.Cancelable!void };
     var buf: [2]U = undefined;
     var sel = std.Io.Select(U).init(g_io, &buf);
-    sel.concurrent(.got, fetchNow, .{ a, method, url, origin }) catch return fetchNow(a, method, url, origin);
+    sel.concurrent(.got, fetchNow, .{ a, method, url, origin, auth, payload }) catch return fetchNow(a, method, url, origin, auth, payload);
     sel.concurrent(.timer, std.Io.sleep, .{ g_io, std.Io.Duration.fromSeconds(timeout_s), .awake }) catch {};
     const first = sel.await() catch {
         while (sel.cancel()) |_| {}
@@ -196,20 +231,37 @@ fn requestWithin(a: std.mem.Allocator, method: std.http.Method, url: []const u8,
     };
 }
 
-fn get(a: std.mem.Allocator, url: []const u8) ?Reply {
-    return request(a, .GET, url, null);
+fn get(a: std.mem.Allocator, p: u16, url: []const u8) ?Reply {
+    return request(a, p, .GET, url, null);
 }
 
-fn fetchNow(a: std.mem.Allocator, method: std.http.Method, url: []const u8, origin: ?[]const u8) ?Reply {
+/// `Bearer <key>` when `p` is the watched port and its server's argv gave it a key, else "".
+fn authFor(buf: []u8, p: u16) []const u8 {
+    lock();
+    defer unlock();
+    if (shared.key_port != p or shared.api_key.len == 0) return "";
+    return std.fmt.bufPrint(buf, "Bearer {s}", .{shared.api_key.get()}) catch "";
+}
+
+fn fetchNow(a: std.mem.Allocator, method: std.http.Method, url: []const u8, origin: ?[]const u8, auth: []const u8, payload: []const u8) ?Reply {
     var client: std.http.Client = .{ .allocator = a, .io = g_io };
     defer client.deinit();
     var body: std.Io.Writer.Allocating = .init(a);
-    var hdr = [_]std.http.Header{.{ .name = "origin", .value = origin orelse "" }};
+    var hdr: [2]std.http.Header = undefined;
+    var hn: usize = 0;
+    if (origin) |o| {
+        hdr[hn] = .{ .name = "origin", .value = o };
+        hn += 1;
+    }
     const res = client.fetch(.{
         .location = .{ .url = url },
         .method = method,
-        .payload = if (method == .POST) "" else null,
-        .extra_headers = if (origin != null) hdr[0..1] else &.{},
+        .payload = if (method == .POST) payload else null,
+        .headers = .{
+            .content_type = if (payload.len > 0) .{ .override = "application/json" } else .default,
+            .authorization = if (auth.len > 0) .{ .override = auth } else .default,
+        },
+        .extra_headers = hdr[0..hn],
         .keep_alive = false,
         .response_writer = &body.writer,
     }) catch return null;
@@ -222,7 +274,7 @@ fn urlFor(buf: []u8, p: u16, comptime path: []const u8) []const u8 {
 
 fn modelsOf(a: std.mem.Allocator, p: u16) logic.ModelState {
     var b: [64]u8 = undefined;
-    const r = get(a, urlFor(&b, p, "/v1/models")) orelse return .{};
+    const r = get(a, p, urlFor(&b, p, "/v1/models")) orelse return .{};
     if (r.status != 200) return .{};
     return logic.parseModelState(a, r.body) catch .{};
 }
@@ -244,7 +296,7 @@ fn modelsWorker(p: u16) void {
     var b: [64]u8 = undefined;
     var known: logic.ModelsKnown = .failed;
     var name: []const u8 = "";
-    if (requestWithin(a, .GET, urlFor(&b, p, "/v1/models"), null, models_timeout_s)) |r| {
+    if (requestWithin(a, p, .GET, urlFor(&b, p, "/v1/models"), null, models_timeout_s, "")) |r| {
         if (r.status == 200) {
             if (logic.parseModelState(a, r.body)) |m| {
                 known = .answered;
@@ -261,14 +313,15 @@ fn modelsWorker(p: u16) void {
     c.model.set(name);
 }
 
-/// The Port submenu is about to be read: ask every foreign listener for its models, in parallel. This is the only
-/// time sushibar talks to a server it is not watching.
+/// The Port submenu is about to be read: ask the listed ports' listeners for their models, in parallel. This is the
+/// only time sushibar talks to a server it is not watching, and never to one the menu does not list.
 fn refreshModels(only: ?u16) void {
     var ports: [max_listings]u16 = undefined;
     var n: usize = 0;
     lock();
     for (shared.listings[0..shared.listing_n]) |l| {
         if (l.port == port() or (only != null and only.? != l.port)) continue;
+        if (l.port != g_default_port and !g_saved.has(l.port)) continue;
         const c = cacheSlot(l.port);
         if (c.busy) continue;
         c.port = l.port;
@@ -345,48 +398,88 @@ fn refreshBarVersion(a: std.mem.Allocator) void {
 
 fn setNote(text: []const u8) void {
     lock();
-    shared.note.set(text);
-    unlock();
+    defer unlock();
+    putNote(text, false);
 }
 
-/// `sushi update --check`, recorded in sushi's own cache like the daily check. False when it gave no answer.
-fn cliCheck(a: std.mem.Allocator, manual: bool) bool {
-    // Both an explicit and a daily check end in the header's "up to date" or "available"; only failures are worded.
-    var sb: [path_cap]u8 = undefined;
-    const sushi = siblingNow(&sb, server_exe) orelse return false;
-    refreshBarVersion(a);
-    const got = capture(a, &.{ sushi.ptr, "update", "--check" });
-    const code = got.code;
-    const result = logic.parseCheck(got.text);
+fn setProblem(text: []const u8) void {
     lock();
     defer unlock();
-    if (code == null) {
-        if (manual) shared.note.set("could not run sushi");
-        return false;
-    }
+    putNote(text, true);
+}
+
+/// Holding the lock.
+fn putNote(text: []const u8, problem: bool) void {
+    shared.note.set(text);
+    shared.note_problem = problem;
+    shared.note_at_ms = io_util.nowMs(g_io);
+}
+
+/// Folds a check's answer into what the menu shows. False when it was a failure.
+fn applyCheck(result: logic.Check, manual: bool) bool {
+    lock();
+    defer unlock();
     switch (result) {
         .available => |v| {
             shared.latest.set(v);
             shared.available = true;
-            shared.up_to_date = false;
             shared.note.set("");
+            shared.note_problem = false;
         },
         .up_to_date => {
             shared.available = false;
-            shared.up_to_date = true;
             shared.note.set("");
+            shared.note_problem = false;
         },
         .failed => |line| {
-            if (manual) shared.note.set(line);
+            if (manual) {
+                shared.note.set(line);
+                shared.note_problem = true;
+            }
             return false;
         },
     }
     return true;
 }
 
+/// A daily check answered from sushi's own cache while it is under a day old, so a bar launch asks no one.
+fn cachedCheck(a: std.mem.Allocator) ?logic.Check {
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/.sushi/update-check.json", .{g_home}) catch return null;
+    const text = std.Io.Dir.cwd().readFileAlloc(g_io, path, a, .limited(64 * 1024)) catch return null;
+    lock();
+    const bar = a.dupe(u8, shared.bar_version.get()) catch "";
+    unlock();
+    return logic.cachedCheck(a, text, io_util.nowSecs(g_io), bar);
+}
+
+/// Whether `model-settings.json` leaves the automatic check on.
+fn autoCheckEnabled(a: std.mem.Allocator) bool {
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/.sushi/model-settings.json", .{g_home}) catch return true;
+    const text = std.Io.Dir.cwd().readFileAlloc(g_io, path, a, .limited(1 << 20)) catch return true;
+    return logic.autoCheckOn(a, text);
+}
+
+/// `sushi update --check`, recorded in sushi's own cache like the daily check. False when it gave no answer. The
+/// automatic one reuses a cache under a day old; the menu's own "Check for updates" always asks.
+fn cliCheck(a: std.mem.Allocator, manual: bool) bool {
+    // Both an explicit and a daily check end in the header's "up to date" or "available"; only failures are worded.
+    var sb: [path_cap]u8 = undefined;
+    const sushi = siblingNow(&sb, server_exe) orelse return false;
+    refreshBarVersion(a);
+    if (!manual) if (cachedCheck(a)) |hit| return applyCheck(hit, false);
+    const got = capture(a, &.{ sushi.ptr, "update", "--check" });
+    if (got.code == null) {
+        if (manual) setProblem("could not run sushi");
+        return false;
+    }
+    return applyCheck(logic.parseCheck(got.text), manual);
+}
+
 fn refreshProps(a: std.mem.Allocator, p: u16) void {
     var b: [64]u8 = undefined;
-    const r = get(a, urlFor(&b, p, "/props")) orelse return;
+    const r = get(a, p, urlFor(&b, p, "/props")) orelse return;
     if (r.status != 200) return;
     const u = (logic.parseProps(a, r.body) catch return) orelse return;
     lock();
@@ -395,6 +488,7 @@ fn refreshProps(a: std.mem.Allocator, p: u16) void {
     shared.props_latest.set(u.latest orelse "");
     shared.props_available = u.available;
     shared.props_command.set(u.command orelse "");
+    shared.props_url.set(u.url orelse "");
     unlock();
     if (changed) refreshBarVersion(a);
 }
@@ -404,7 +498,14 @@ fn finishUpdate(a: std.mem.Allocator, ok_note: []const u8) void {
     lock();
     defer unlock();
     shared.available = false;
-    shared.note.set(ok_note);
+    putNote(ok_note, false);
+}
+
+/// `error.message` of a server's JSON error body, or "".
+fn errorMessage(a: std.mem.Allocator, body: []const u8) []const u8 {
+    const E = struct { @"error": struct { message: []const u8 = "" } = .{} };
+    const e = std.json.parseFromSliceLeaky(E, a, body, .{ .ignore_unknown_fields = true }) catch return "";
+    return e.@"error".message;
 }
 
 fn updateViaServer(a: std.mem.Allocator, p: u16) void {
@@ -416,13 +517,11 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
     const from = from_buf[0..shared.server_version.len];
     @memcpy(from, shared.server_version.get());
     unlock();
-    const r = request(a, .POST, urlFor(&url, p, "/v1/update"), origin_s) orelse return setNote("Update failed: the server did not answer");
+    const r = request(a, p, .POST, urlFor(&url, p, "/v1/update"), origin_s) orelse return setProblem("Update failed: the server did not answer");
     if (r.status != 202) {
-        const E = struct { @"error": struct { message: []const u8 = "" } = .{} };
-        const e = std.json.parseFromSliceLeaky(E, a, r.body, .{ .ignore_unknown_fields = true }) catch null;
+        const why = errorMessage(a, r.body);
         var msg: [400]u8 = undefined;
-        const text = std.fmt.bufPrint(&msg, "Update refused: {s}", .{if (e != null and e.?.@"error".message.len > 0) e.?.@"error".message else "the server did not accept it"}) catch "Update refused";
-        return setNote(text);
+        return setProblem(std.fmt.bufPrint(&msg, "Update refused: {s}", .{if (why.len > 0) why else "the server did not accept it"}) catch "Update refused");
     }
     setNote("Updating…");
     var down = false;
@@ -431,19 +530,19 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
         std.Io.sleep(g_io, .fromMilliseconds(500), .real) catch {};
         if (port() != p) return setNote("Update started; no longer followed after the port change");
         var hb: [64]u8 = undefined;
-        const alive = if (get(a, urlFor(&hb, p, "/health"))) |h| h.status == 200 else false;
+        const alive = if (get(a, p, urlFor(&hb, p, "/health"))) |h| h.status == 200 else false;
         if (!alive) {
             down = true;
             continue;
         }
         if (down) break;
         var pb: [64]u8 = undefined;
-        const props = get(a, urlFor(&pb, p, "/props")) orelse continue;
+        const props = get(a, p, urlFor(&pb, p, "/props")) orelse continue;
         const u = (logic.parseProps(a, props.body) catch null) orelse continue;
         if (!std.mem.eql(u8, u.current, from)) break;
     }
     var pb: [64]u8 = undefined;
-    const props = get(a, urlFor(&pb, p, "/props"));
+    const props = get(a, p, urlFor(&pb, p, "/props"));
     const u = if (props) |pr| (logic.parseProps(a, pr.body) catch null) else null;
     refreshProps(a, p);
     if (u) |up| if (!std.mem.eql(u8, up.current, from)) {
@@ -452,7 +551,7 @@ fn updateViaServer(a: std.mem.Allocator, p: u16) void {
     };
     var msg: [400]u8 = undefined;
     const why = if (u) |up| up.err orelse "sushi restarted on the version it had" else "the server did not come back";
-    setNote(std.fmt.bufPrint(&msg, "Update failed: {s}", .{why}) catch "Update failed");
+    setProblem(std.fmt.bufPrint(&msg, "Update failed: {s}", .{why}) catch "Update failed");
 }
 
 /// Two minutes of half-second polls: past that the update is reported as failed instead of locking the menu.
@@ -460,7 +559,7 @@ const update_wait_polls = 240;
 
 fn updateViaCli(a: std.mem.Allocator) void {
     var sb: [path_cap]u8 = undefined;
-    const sushi = siblingNow(&sb, server_exe) orelse return setNote("could not find sushi beside sushibar");
+    const sushi = siblingNow(&sb, server_exe) orelse return setProblem("could not find sushi beside sushibar");
     setNote("Updating…");
     const got = capture(a, &.{ sushi.ptr, "update" });
     if (got.code == 0) {
@@ -473,7 +572,7 @@ fn updateViaCli(a: std.mem.Allocator) void {
         return finishUpdate(a, text);
     }
     var msg: [400]u8 = undefined;
-    setNote(std.fmt.bufPrint(&msg, "Update failed: {s}", .{logic.failureLine(got.text)}) catch "Update failed");
+    setProblem(std.fmt.bufPrint(&msg, "Update failed: {s}", .{logic.failureLine(got.text)}) catch "Update failed");
 }
 
 const WorkerKind = enum { auto_check, check, update };
@@ -488,6 +587,10 @@ fn worker(kind: WorkerKind) void {
             const ok = cliCheck(a, kind == .check);
             lock();
             shared.check_failed = !ok;
+            if (kind == .check) {
+                shared.manual_result = if (!ok) .failed else if (shared.available) .none else .up_to_date;
+                shared.manual_at_ms = io_util.nowMs(g_io);
+            }
             unlock();
         },
         .update => {
@@ -501,7 +604,7 @@ fn worker(kind: WorkerKind) void {
             unlock();
             switch (logic.updatePath(ask)) {
                 .none => setNote("Nothing to update"),
-                .brew => setNote("Homebrew install: run the command in the menu"),
+                .brew => setNote("Homebrew install: use the Upgrade button"),
                 .server => updateViaServer(a, p),
                 .cli => updateViaCli(a),
             }
@@ -520,6 +623,7 @@ fn startWorker(kind: WorkerKind) void {
     }
     shared.busy = if (kind == .update) .updating else .checking;
     unlock();
+    if (kind == .update) pollSoon();
     const t = std.Thread.spawn(.{}, worker, .{kind}) catch {
         lock();
         shared.busy = .none;
@@ -531,68 +635,125 @@ fn startWorker(kind: WorkerKind) void {
 
 // ── Poll thread ──
 
+/// Wakes the poll thread before its wait is over: the menu opened, or the user started something.
+var g_wake: std.Io.Event = .unset;
+var g_menu_open = std.atomic.Value(bool).init(false);
+/// Until then the poll runs every second: a start, stop, port switch or update the user just asked for.
+var g_fast_until_ms = std.atomic.Value(i64).init(0);
+const fast_after_action_ms = 30_000;
+
+/// Polls at once and then every second for a while: the user just changed something.
+fn pollSoon() void {
+    g_fast_until_ms.store(io_util.nowMs(g_io) + fast_after_action_ms, .release);
+    g_wake.set(g_io);
+}
+
 fn pollLoop() void {
     var tracker: logic.Tracker = .{};
     var tracked_port: u16 = 0;
     var last_check_ms: i64 = 0;
     var last_ok = true;
     var iter: u32 = 0;
-    var loop_start_ms: i64 = 0;
+    var log_pid: i32 = 0;
+    var log_port: u16 = 0;
+    var log_buf: [1024]u8 = undefined;
+    var log_src: logic.LogSource = .{ .kind = .standard };
+    // The scan and the models answer are kept between the polls that skip them.
+    var listings: [max_listings]Listing = undefined;
+    var n: usize = 0;
+    var sushi_listening = false;
+    var since_scan: u32 = logic.scan_every;
+    var since_models: u32 = 0;
+    var models_ready = false;
+    var models_loading = false;
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
     {
         _ = arena_state.reset(.retain_capacity);
         refreshBarVersion(arena_state.allocator());
     }
-    while (true) : ({
-        const spent = io_util.nowMs(g_io) - loop_start_ms;
-        if (spent < poll_ms) std.Io.sleep(g_io, .fromMilliseconds(poll_ms - spent), .real) catch {};
-    }) {
+    pollSoon();
+    while (true) {
+        const woken = g_wake.isSet();
+        g_wake.reset();
         _ = arena_state.reset(.retain_capacity);
         const a = arena_state.allocator();
         const now = io_util.nowMs(g_io);
-        loop_start_ms = now;
         const p = port();
         if (p != tracked_port) {
             tracker = .{};
             tracked_port = p;
+            since_scan = logic.scan_every;
+            models_ready = false;
             lock();
             shared.hist_n = 0;
             shared.last_prefill = null;
             unlock();
         }
+        const menu_open = g_menu_open.load(.acquire);
         var url_buf: [96]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/metrics.json?since={d}", .{ p, tracker.since_ms }) catch unreachable;
-        var lbuf: [16]logic.Listener = undefined;
-        var listings: [max_listings]Listing = undefined;
-        var n: usize = 0;
-        var sushi_listening = false;
-        for (proc.listeners(&lbuf, server_exe)) |l| {
-            if (l.port == p) sushi_listening = true;
-            const dup = for (listings[0..n]) |x| {
-                if (x.port == l.port) break true;
-            } else false;
-            if (dup or n == max_listings) continue;
-            listings[n] = .{ .port = l.port, .pid = l.pid };
-            n += 1;
+        var reply = get(a, p, url);
+        var reached = logic.linkFor(if (reply) |r| r.status else null);
+
+        since_scan += 1;
+        if (logic.scanDue(since_scan, reached, menu_open)) {
+            since_scan = 0;
+            var lbuf: [16]logic.Listener = undefined;
+            n = 0;
+            sushi_listening = false;
+            for (proc.listeners(&lbuf, server_exe)) |l| {
+                if (l.port == p) sushi_listening = true;
+                const dup = for (listings[0..n]) |x| {
+                    if (x.port == l.port) break true;
+                } else false;
+                if (dup or n == max_listings) continue;
+                listings[n] = .{ .port = l.port, .pid = l.pid };
+                n += 1;
+            }
         }
 
-        var sample: logic.Sample = .{};
-        const reply = get(a, url);
-        sample.link = logic.linkFor(if (reply) |r| r.status else null);
-        if (sample.link == .up) sample = logic.parseMetrics(a, reply.?.body) catch .{};
+        // The server's own argv says where it logs and which key it wants; read again only when its pid changes.
+        var server_pid: i32 = 0;
+        for (listings[0..n]) |l| if (l.port == p) {
+            server_pid = l.pid;
+        };
+        if (server_pid != log_pid or p != log_port) {
+            log_pid = server_pid;
+            log_port = p;
+            const args = a.alloc(u8, proc.args_cap) catch null;
+            const read = if (server_pid != 0 and args != null) proc.argsOfPid(server_pid, args.?) else null;
+            log_src = logic.logSource(&log_buf, g_home, p, read);
+            const key = if (read) |r| logic.argsApiKey(r) orelse "" else "";
+            lock();
+            shared.api_key.set(key);
+            shared.key_port = p;
+            unlock();
+            // A key found just now answers the 401 it explains in this poll, not in the next.
+            if (reached == .unauthorized and key.len > 0) {
+                reply = get(a, p, url);
+                reached = logic.linkFor(if (reply) |r| r.status else null);
+            }
+        }
+
+        var sample: logic.Sample = .{ .link = reached };
+        if (reached == .up) sample = logic.parseMetrics(a, reply.?.body) catch .{};
         // A sushi that holds the port and does not answer is not a stopped one.
         if (sample.link == .offline and sushi_listening) sample.link = .silent;
         tracker.observe(now, sample);
 
         var models: logic.ModelState = .{};
-        if (sample.link == .up or sample.link == .metrics_off) models = modelsOf(a, p);
-        const model = models.ready;
-
-        for (listings[0..n]) |*l| {
-            if (l.port != p) continue;
-            l.model.set(model orelse "");
-            l.known = if (sample.link == .up or sample.link == .metrics_off) .answered else if (sample.link == .silent) .failed else .unknown;
+        const answers = sample.link == .up or sample.link == .metrics_off;
+        since_models += 1;
+        const fetch_models = answers and logic.modelsDue(since_models, models_ready, models_loading);
+        if (fetch_models) {
+            models = modelsOf(a, p);
+            since_models = 0;
+            models_ready = models.ready != null;
+            models_loading = models.loading != null;
+        } else if (!answers) {
+            models_ready = false;
+            models_loading = false;
         }
         const taken = sample.link == .offline and !sushi_listening and proc.portInUse(p);
 
@@ -600,12 +761,19 @@ fn pollLoop() void {
             lock();
             shared.port = p;
             shared.view = tracker.view(sample.link);
-            shared.model.set(model orelse "");
-            shared.model_loading.set(models.loading orelse "");
-            const pu = models.pack_update orelse logic.PackUpdate{};
-            shared.pack_current.set(pu.current);
-            shared.pack_latest.set(pu.latest);
-            shared.pack_command.set(pu.command);
+            if (fetch_models or !answers) {
+                shared.model.set(models.ready orelse "");
+                shared.model_loading.set(models.loading orelse "");
+                const pu = models.pack_update orelse logic.PackUpdate{};
+                shared.pack_current.set(pu.current);
+                shared.pack_latest.set(pu.latest);
+                shared.pack_command.set(pu.command);
+            }
+            for (listings[0..n]) |*l| {
+                if (l.port != p) continue;
+                l.model.set(shared.model.get());
+                l.known = if (answers) .answered else if (sample.link == .silent) .failed else .unknown;
+            }
             if (sample.link == .up) {
                 shared.mem_mb = sample.mem_mb;
                 shared.gpu_mhz = sample.gpu_mhz;
@@ -625,11 +793,15 @@ fn pollLoop() void {
             shared.listing_n = n;
             shared.sushi_listening = sushi_listening;
             shared.port_taken = taken;
+            shared.log_kind = log_src.kind;
+            shared.log_path.set(log_src.path);
             unlock();
         }
+        // Someone is looking: the menu shows this answer now, not at its next tick.
+        if (woken and test_polls == 0) objc.msg(void, menu_target, "performSelectorOnMainThread:withObject:waitUntilDone:", .{ objc.sel("refreshNow:"), @as(objc.id, null), false });
 
         iter += 1;
-        if (iter % props_every == 1 and sample.link != .offline and sample.link != .silent and sample.link != .unauthorized) refreshProps(a, p);
+        if (iter % props_every == 1 and answers) refreshProps(a, p);
 
         lock();
         if (shared.check_failed) {
@@ -638,41 +810,58 @@ fn pollLoop() void {
         }
         const link = shared.view.link;
         const known = shared.props_latest.len > 0;
-        const req_check = shared.req_check;
-        const req_update = shared.req_update;
-        shared.req_check = false;
-        shared.req_update = false;
+        const busy = shared.busy != .none;
         unlock();
-        if (req_update) startWorker(.update) else if (req_check) startWorker(.check) else if (logic.checkDue(last_check_ms, now, last_ok)) {
+        if (logic.checkDue(last_check_ms, now, last_ok)) {
             if (link == .offline) {
                 last_check_ms = now;
                 last_ok = true;
-                startWorker(.auto_check);
+                if (autoCheckEnabled(a)) startWorker(.auto_check);
             } else if (known) {
                 last_check_ms = now;
                 last_ok = true;
                 refreshBarVersion(a);
                 lock();
                 shared.available = shared.props_available;
-                shared.up_to_date = !shared.props_available;
                 shared.latest.set(shared.props_latest.get());
                 unlock();
             }
         }
+
+        const activity: logic.Activity = .{
+            .link = sample.link,
+            .decoding = tracker.decoding or tracker.prefilling,
+            .menu_open = menu_open,
+            .changing = now < g_fast_until_ms.load(.acquire) or models_loading or busy or g_load_port.load(.acquire) != 0 or g_unload_port.load(.acquire) != 0,
+        };
+        const spent = io_util.nowMs(g_io) - now;
+        const wait = logic.pollWaitMs(activity) - spent;
+        if (wait > 0) g_wake.waitTimeout(g_io, .{ .duration = .{ .raw = .fromMilliseconds(wait), .clock = .awake } }) catch {};
     }
 }
 
 // ── Port ──
 
 fn writeSaved(p: u16) void {
-    var text: [48]u8 = undefined;
+    var text: [512]u8 = undefined;
     std.Io.Dir.cwd().createDirPath(g_io, std.fs.path.dirname(g_saved_path) orelse ".") catch {};
-    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p) }) catch {};
+    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p, g_saved.items(), g_last_model.get()) }) catch {};
+}
+
+fn readDefaultPort() u16 {
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/.sushi/model-settings.json", .{g_home}) catch return logic.default_port;
+    const text = std.Io.Dir.cwd().readFileAlloc(g_io, path, arena_state.allocator(), .limited(1 << 20)) catch return logic.default_port;
+    return logic.defaultPortOf(arena_state.allocator(), text);
 }
 
 fn setPort(p: u16) void {
     if (p == port()) return;
     g_port.store(p, .release);
+    pollSoon();
+    g_saved.add(p, g_default_port);
     writeSaved(p);
     lock();
     shared.view = .{ .link = .offline };
@@ -681,7 +870,17 @@ fn setPort(p: u16) void {
     shared.props_latest.set("");
     shared.props_available = false;
     shared.props_command.set("");
+    shared.props_url.set("");
     unlock();
+}
+
+/// Forgets an added port; the watch moves to the default port when it was on it. A sushi still listening there
+/// stays in the menu as a listener, and the server is never touched.
+fn removePort(p: u16) void {
+    if (p == g_default_port) return;
+    g_saved.remove(p);
+    const to = logic.afterRemove(port(), p, g_default_port);
+    if (to != port()) setPort(to) else writeSaved(port());
 }
 
 // ── Start and Stop ──
@@ -701,14 +900,21 @@ fn ownServer() ?logic.PidEntry {
 /// failed start.
 const Started = struct { pid: i32 = 0, port: u16 = 0, answered: bool = false, stopping: bool = false };
 var started: [8]Started = @splat(.{});
+var reaped_this_tick = false;
 
 fn reapStarted() void {
     for (&started) |*st| {
         if (st.pid == 0) continue;
-        if (std.c.waitpid(st.pid, null, std.c.W.NOHANG) != st.pid) continue;
-        if (!st.answered and !st.stopping) {
+        var status: c_int = 0;
+        if (std.c.waitpid(st.pid, &status, std.c.W.NOHANG) != st.pid) continue;
+        if (!st.stopping) {
             var nb: [160]u8 = undefined;
-            setNote(logic.startFailedNote(&nb, st.port));
+            const how = logic.exitOf(@bitCast(status));
+            if (st.answered) {
+                setProblem(logic.exitedNote(&nb, st.port, how));
+                g_crashed_port = st.port;
+                reaped_this_tick = true;
+            } else setProblem(logic.startFailedNote(&nb, st.port, how));
         }
         st.* = .{};
     }
@@ -728,13 +934,15 @@ fn markStopping(pid: i32) void {
 
 fn startServer() void {
     var sb: [path_cap]u8 = undefined;
-    const sushi = siblingNow(&sb, server_exe) orelse return setNote("could not find sushi beside sushibar");
+    const sushi = siblingNow(&sb, server_exe) orelse return setProblem("could not find sushi beside sushibar");
     if (ownServer() != null) return;
     var port_buf: [8:0]u8 = undefined;
     const p = port();
     const port_z = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{p}, 0) catch return;
-    const pid = proc.spawnDetached(&.{ sushi.ptr, "--serve", "--port", port_z.ptr }, false) catch return setNote("could not start sushi");
+    const pid = proc.spawnDetached(&.{ sushi.ptr, "--serve", "--port", port_z.ptr }, false) catch return setProblem("could not start sushi");
     setNote("");
+    pollSoon();
+    if (g_crashed_port == p) g_crashed_port = 0;
     for (&started) |*st| if (st.pid == 0) {
         st.* = .{ .pid = pid, .port = p };
         break;
@@ -743,13 +951,72 @@ fn startServer() void {
     proc.writePid(g_io, g_home, serverPidPath(&pb, p), .{ .pid = pid, .port = p }) catch {};
 }
 
+const ModelOp = struct { port: u16, unload: bool, model: Str(logic.max_model) };
+
+const load_timeout_s = 1800;
+
+/// Load or unload `g_last_model` on the watched server, the only model either button acts on. The button offers
+/// neither before the server answers, so a Start never loads.
+fn startModelOp(unload: bool) void {
+    const p = port();
+    if (g_load_port.load(.acquire) != 0 or g_unload_port.load(.acquire) != 0 or g_last_model.len == 0) return;
+    const slot = if (unload) &g_unload_port else &g_load_port;
+    if (slot.cmpxchgStrong(0, p, .acq_rel, .acquire) != null) return;
+    const t = std.Thread.spawn(.{}, modelOpWorker, .{ModelOp{ .port = p, .unload = unload, .model = g_last_model }}) catch return slot.store(0, .release);
+    t.detach();
+    pollSoon();
+}
+
+fn modelOpWorker(job: ModelOp) void {
+    defer {
+        (if (job.unload) &g_unload_port else &g_load_port).store(0, .release);
+        pollSoon();
+    }
+    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var url: [64]u8 = undefined;
+    var origin: [48]u8 = undefined;
+    const origin_s = std.fmt.bufPrint(&origin, "http://127.0.0.1:{d}", .{job.port}) catch return;
+    var body: [logic.max_model * 2 + 40]u8 = undefined;
+    const target = if (job.unload) urlFor(&url, job.port, "/v1/unload-model") else urlFor(&url, job.port, "/v1/load-model");
+    const payload = if (job.unload) logic.unloadModelBody(&body, job.model.get()) else logic.loadModelBody(&body, job.model.get());
+    const reply = requestWithin(a, job.port, .POST, target, origin_s, load_timeout_s, payload);
+    const verb = if (job.unload) "unload" else "load";
+    var msg: [240]u8 = undefined;
+    if (reply) |r| if (r.status == 200) {
+        lock();
+        if (shared.port == job.port) shared.model.set(if (job.unload) "" else job.model.get());
+        unlock();
+        return;
+    };
+    // A server that was stopped under the request is reported by its own exit note.
+    if (get(a, job.port, urlFor(&url, job.port, "/health")) == null) return;
+    const why = if (reply) |r| errorMessage(a, r.body) else "";
+    setProblem(std.fmt.bufPrint(&msg, "Port {d}: could not {s} {s}: {s}", .{ job.port, verb, job.model.get(), if (why.len > 0) why else if (reply == null) "no answer" else "the server refused" }) catch "Could not load or unload the model");
+}
+
+const Tm = extern struct { sec: c_int, min: c_int, hour: c_int, mday: c_int, mon: c_int, year: c_int, wday: c_int, yday: c_int, isdst: c_int, gmtoff: c_long, zone: ?[*:0]const u8 };
+extern "c" fn localtime_r(t: *const i64, out: *Tm) ?*Tm;
+
+fn stoppedAtNote(buf: []u8, p: u16) []const u8 {
+    const t = io_util.nowSecs(g_io);
+    var tm: Tm = undefined;
+    if (localtime_r(&t, &tm) == null) return logic.stoppedNote(buf, p, 0, 0);
+    return logic.stoppedNote(buf, p, @intCast(tm.hour), @intCast(tm.min));
+}
+
 const NSRect = extern struct { x: f64, y: f64, w: f64, h: f64 };
 
-fn runAlert(message: []const u8, info: []const u8, ok: [*:0]const u8, cancel: ?[*:0]const u8, field: objc.id) bool {
+const alert_first = 1000;
+const alert_third = 1002;
+
+/// Runs the alert and returns which button ended it (`alert_first` is the default one).
+fn runAlert(message: []const u8, info: []const u8, ok: [*:0]const u8, cancel: ?[*:0]const u8, third: ?[*:0]const u8, field: objc.id) isize {
     var m: [160:0]u8 = undefined;
     var i: [200:0]u8 = undefined;
-    const mz = std.fmt.bufPrintSentinel(&m, "{s}", .{message}, 0) catch return false;
-    const iz = std.fmt.bufPrintSentinel(&i, "{s}", .{info}, 0) catch return false;
+    const mz = std.fmt.bufPrintSentinel(&m, "{s}", .{message}, 0) catch return 0;
+    const iz = std.fmt.bufPrintSentinel(&i, "{s}", .{info}, 0) catch return 0;
     const app = objc.msg(objc.id, objc.class("NSApplication"), "sharedApplication", .{});
     objc.msg(void, app, "activateIgnoringOtherApps:", .{true});
     const alert = objc.new(objc.class("NSAlert"));
@@ -758,23 +1025,63 @@ fn runAlert(message: []const u8, info: []const u8, ok: [*:0]const u8, cancel: ?[
     objc.msg(void, alert, "setInformativeText:", .{objc.nsString(iz.ptr)});
     _ = objc.msg(objc.id, alert, "addButtonWithTitle:", .{objc.nsString(ok)});
     if (cancel) |c| _ = objc.msg(objc.id, alert, "addButtonWithTitle:", .{objc.nsString(c)});
+    if (third) |t| _ = objc.msg(objc.id, alert, "addButtonWithTitle:", .{objc.nsString(t)});
     if (field != null) {
         objc.msg(void, alert, "setAccessoryView:", .{field});
         objc.msg(void, objc.msg(objc.id, alert, "window", .{}), "setInitialFirstResponder:", .{field});
     }
-    return objc.msg(isize, alert, "runModal", .{}) == 1000;
+    return objc.msg(isize, alert, "runModal", .{});
 }
 
 fn confirmStop(p: u16, pid: i32) bool {
     if (test_polls > 0) return test_confirm;
     var m: [96]u8 = undefined;
     const text = std.fmt.bufPrint(&m, "Stop sushi on port {d} (pid {d})?", .{ p, pid }) catch return false;
-    return runAlert(text, "sushibar did not start it.", "Stop", "Cancel", null);
+    return runAlert(text, "sushibar did not start it.", "Stop", "Cancel", null, null) == alert_first;
+}
+
+/// The Update button on a server with a model loaded: the restart is named before it happens.
+fn confirmUpdate() bool {
+    if (test_polls > 0) return test_confirm;
+    var m: [96]u8 = undefined;
+    var i: [160]u8 = undefined;
+    const text = std.fmt.bufPrint(&m, "Update sushi to {s}?", .{confirm_latest.get()}) catch return false;
+    const info = logic.updateConfirmInfo(&i, port(), confirm_model.get());
+    const answer = runAlert(text, info, "Update", "Cancel", "Release Notes", null);
+    if (answer == alert_third) openReleaseNotes(null, null, null);
+    return answer == alert_first;
 }
 
 /// How long the menu says "Stopping…" before it trusts what the poll says.
 const stopping_ms = 15_000;
 var stopping_until_ms: i64 = 0;
+
+/// The Stop last sent, for Force Stop when it does not take.
+var g_stop_sent: logic.StopSent = .{};
+var g_stuck_noted = false;
+
+fn noteStopped(p: u16, pid: i32) void {
+    pollSoon();
+    stopping_until_ms = io_util.nowMs(g_io) + stopping_ms;
+    g_stop_port = p;
+    g_stop_at_ms = stopping_until_ms;
+    g_stop_sent = .{ .pid = pid, .port = p, .deadline_ms = stopping_until_ms };
+}
+
+/// SIGKILL, only to the pid the Stop signalled while it is still the sushi on the watched port.
+fn forceStop() void {
+    const p = port();
+    var lbuf: [16]logic.Listener = undefined;
+    const ours = ownServer();
+    const pid = switch (logic.planStop(if (ours) |e| e.pid else null, p, proc.listeners(&lbuf, server_exe))) {
+        .now, .confirm => |pid| pid,
+        .none => return,
+    };
+    if (pid != g_stop_sent.pid) return;
+    markStopping(pid);
+    proc.kill(pid);
+    noteStopped(p, pid);
+}
 
 /// A sushibar-started server stops at once; any other sushi on the port only after a confirm, re-verified.
 fn stopServer() void {
@@ -786,7 +1093,7 @@ fn stopServer() void {
         .now => |pid| {
             markStopping(pid);
             proc.terminate(pid);
-            stopping_until_ms = io_util.nowMs(g_io) + stopping_ms;
+            noteStopped(p, pid);
         },
         .confirm => |pid| {
             if (!confirmStop(p, pid)) return;
@@ -794,12 +1101,45 @@ fn stopServer() void {
             switch (logic.planStop(null, p, proc.listeners(&again, server_exe))) {
                 .confirm => |same| if (same == pid) {
                     proc.terminate(pid);
-                    stopping_until_ms = io_util.nowMs(g_io) + stopping_ms;
+                    noteStopped(p, pid);
                 },
                 else => {},
             }
         },
     }
+}
+
+/// The ports of the servers this sushibar started that still run, the watched port's included.
+fn startedPorts(ports: []u16) []u16 {
+    var n: usize = 0;
+    var cand: [started.len + 1]u16 = undefined;
+    var cn: usize = 0;
+    for (started) |st| if (st.pid != 0) {
+        cand[cn] = st.port;
+        cn += 1;
+    };
+    cand[cn] = port();
+    cn += 1;
+    for (cand[0..cn]) |p| {
+        if (n == ports.len or std.mem.indexOfScalar(u16, ports[0..n], p) != null) continue;
+        var pb: [std.fs.max_path_bytes]u8 = undefined;
+        if (proc.verifiedPid(g_io, serverPidPath(&pb, p), server_exe, true) == null) continue;
+        ports[n] = p;
+        n += 1;
+    }
+    return ports[0..n];
+}
+
+/// Quit & Stop: each server sushibar started gets the Stop it would get from the menu, then sushibar quits.
+fn quitStop() void {
+    var ports: [started.len + 1]u16 = undefined;
+    for (startedPorts(&ports)) |p| {
+        var pb: [std.fs.max_path_bytes]u8 = undefined;
+        const e = proc.verifiedPid(g_io, serverPidPath(&pb, p), server_exe, true) orelse continue;
+        markStopping(e.pid);
+        proc.terminate(e.pid);
+    }
+    quit();
 }
 
 fn quit() void {
@@ -813,32 +1153,40 @@ fn quit() void {
 
 var status_item: objc.id = null;
 var header_mi: objc.id = null;
-var toggle_mi: objc.id = null;
 var port_mi: objc.id = null;
 var port_menu: objc.id = null;
 var open_mis: [4]objc.id = .{ null, null, null, null };
-var check_mi: objc.id = null;
-var update_mi: objc.id = null;
-var copy_mi: objc.id = null;
+var button_action: logic.ButtonAction = .none;
 var pack_mi: objc.id = null;
+var badge_view: objc.id = null;
+var shown_badge = false;
+var prev_answering = false;
+var prev_port: u16 = 0;
+/// What was copied to the clipboard last, and when: the button and the pack item say Copied for a few seconds.
+var copied_what: enum { none, upgrade, pack } = .none;
+var copied_at_ms: i64 = 0;
+/// Set by `refresh` for the Update button's click: the brew command it copies, and whether an alert comes first.
+var button_command: Str(80) = .{};
+var confirm_needed = false;
+var confirm_model: Str(96) = .{};
+var confirm_latest: Str(32) = .{};
+var shown_note_sig: [600]u8 = undefined;
+var shown_note_sig_len: usize = std.math.maxInt(usize);
 var menu_target: objc.id = null;
 var top_menu: objc.id = null;
 var port_field_mi: objc.id = null;
 var note_mi: objc.id = null;
-const note_show_max = 100;
 var icons: [2]objc.id = .{ null, null };
 var shown_icon: ?logic.Icon = null;
-var shown_symbol: ?[*]const u8 = null;
 var tick_count: u32 = 0;
 var last_title: [128]u8 = undefined;
 var shown_title: [128]u8 = undefined;
 var shown_title_len: usize = std.math.maxInt(usize);
-var shown_dim = false;
-var port_sig: [1024]u8 = undefined;
+var port_sig: [1536]u8 = undefined;
 var port_sig_len: usize = std.math.maxInt(usize);
 
 fn setText(setter_target: objc.id, selector: [*:0]const u8, text: []const u8) void {
-    var z: [192:0]u8 = undefined;
+    var z: [256:0]u8 = undefined;
     const n = @min(text.len, z.len - 1);
     @memcpy(z[0..n], text[0..n]);
     z[n] = 0;
@@ -855,20 +1203,20 @@ fn symbol(name: []const u8) objc.id {
 
 fn showIcon(button: objc.id, icon: logic.Icon) void {
     if (shown_icon == icon) return;
+    if (shown_icon != null) objc.fadeNext(button, 0.3);
     shown_icon = icon;
     objc.msg(void, button, "setImage:", .{icons[@intFromEnum(icon)]});
 }
 
-/// The button title in monospaced digits, so its width does not jitter; the last request's speed is dim.
-fn setButtonTitle(button: objc.id, text: []const u8, dim: bool) void {
-    if (shown_title_len == text.len and shown_dim == dim and std.mem.eql(u8, shown_title[0..text.len], text)) return;
+/// The button title in monospaced digits, so its width does not jitter.
+fn setButtonTitle(button: objc.id, text: []const u8) void {
+    if (shown_title_len == text.len and std.mem.eql(u8, shown_title[0..text.len], text)) return;
     shown_title_len = text.len;
-    shown_dim = dim;
     @memcpy(shown_title[0..text.len], text);
     var z: [192:0]u8 = undefined;
     @memcpy(z[0..text.len], text);
     z[text.len] = 0;
-    const s = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsString(&z), header_view.titleAttributes(dim) });
+    const s = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsString(&z), header_view.titleAttributes() });
     defer objc.release(s);
     objc.msg(void, button, "setAttributedTitle:", .{s});
 }
@@ -896,47 +1244,135 @@ fn addSeparator(menu: objc.id) void {
 
 /// Rebuilds the Port submenu only when its entries changed, so an open menu is not disturbed.
 fn syncPortMenu(entries: []const logic.PortEntry) void {
-    var sig: [1024]u8 = undefined;
+    var sig: [1536]u8 = undefined;
     var n: usize = 0;
     var lb: [96]u8 = undefined;
     for (entries) |e| {
         const l = logic.portLabel(&lb, e);
-        const piece = std.fmt.bufPrint(sig[n..], "{s}{d}\n", .{ l, @intFromBool(e.checked) }) catch break;
+        const piece = std.fmt.bufPrint(sig[n..], "{s}{d}{d}\n", .{ l, @intFromBool(e.checked), @intFromBool(e.removable) }) catch break;
         n += piece.len;
     }
     if (n == port_sig_len and std.mem.eql(u8, sig[0..n], port_sig[0..n])) return;
     port_sig_len = n;
     @memcpy(port_sig[0..n], sig[0..n]);
     // The submenu ends with a separator and the port field, which stay; only the entries above them change.
+    port_row.reset();
     while (objc.msg(isize, port_menu, "numberOfItems", .{}) > 2) objc.msg(void, port_menu, "removeItemAtIndex:", .{@as(isize, 0)});
+    var width: f64 = port_row.min_width;
+    for (entries) |e| width = @max(width, port_row.widthFor(logic.portLabel(&lb, e), e.removable));
     for (entries, 0..) |e, i| {
         var z: [112:0]u8 = undefined;
         const label = logic.portLabel(&lb, e);
         const lz = std.fmt.bufPrintSentinel(&z, "{s}", .{label}, 0) catch continue;
         const mi = newItem(lz.ptr, "pickPort:", e.port, "", null);
         defer objc.release(mi);
-        if (e.checked) objc.msg(void, mi, "setState:", .{@as(isize, 1)});
+        const view = port_row.create(menu_target, top_menu, .{ .port = e.port, .label = label, .checked = e.checked, .removable = e.removable }, width);
+        if (view) |v| {
+            objc.msg(void, mi, "setView:", .{v});
+            objc.release(v);
+        } else if (e.checked) objc.msg(void, mi, "setState:", .{@as(isize, 1)});
         objc.msg(void, port_menu, "insertItem:atIndex:", .{ mi, @as(isize, @intCast(i)) });
     }
+}
+
+/// A server that was answering is gone: say so unless sushibar stopped it or reaped it just now.
+fn watchTransition(p: u16, fresh: bool, link: logic.Link, now: i64) void {
+    if (!fresh) return;
+    if (prev_port != p) {
+        prev_port = p;
+        prev_answering = false;
+    }
+    const mine = g_stop_port == p and now < g_stop_at_ms + 45_000;
+    if (logic.stoppedUnexpectedly(prev_answering, link, mine, reaped_this_tick)) {
+        var nb: [96]u8 = undefined;
+        setProblem(stoppedAtNote(&nb, p));
+        g_crashed_port = p;
+    }
+    if (link == .offline and mine) g_stop_port = 0;
+    if (logic.answering(link) and g_crashed_port == p) g_crashed_port = 0;
+    prev_answering = logic.answering(link);
+}
+
+/// The orange dot on the menu bar icon, at its lower right: it sits on the colour icon where the sushi does not hide it.
+fn showBadge(button: objc.id, on: bool) void {
+    if (on == shown_badge) return;
+    objc.fadeNext(button, 0.25);
+    shown_badge = on;
+    if (on) {
+        const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{objc.msg(objc.NSRect, button, "bounds", .{})});
+        const flipped = objc.msg(bool, button, "isFlipped", .{});
+        objc.msg(void, badge_view, "setFrameOrigin:", .{objc.NSPoint{ .x = r.x + r.w - badge_size + 1, .y = if (flipped) r.y + r.h - badge_size + 2 else r.y - 2 }});
+    }
+    objc.msg(void, badge_view, "setHidden:", .{!on});
+}
+
+const badge_size: f64 = 7;
+
+fn makeBadge(button: objc.id) void {
+    badge_view = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{objc.NSRect{ .x = 0, .y = 0, .w = badge_size, .h = badge_size }});
+    objc.msg(void, badge_view, "setWantsLayer:", .{true});
+    const layer = objc.msg(objc.id, badge_view, "layer", .{});
+    objc.msg(void, layer, "setBackgroundColor:", .{objc.msg(objc.id, objc.color("systemOrangeColor"), "CGColor", .{})});
+    objc.msg(void, layer, "setCornerRadius:", .{badge_size / 2});
+    objc.msg(void, badge_view, "setHidden:", .{true});
+    objc.msg(void, button, "addSubview:", .{badge_view});
+}
+
+var why_mi: objc.id = null;
+var shown_why: []const u8 = "";
+/// What the Load/Unload button does at the next click, from the last refresh.
+var model_action: logic.ModelAction = .none;
+
+/// The inert line under the two buttons that says why Load is off; hidden when nothing needs saying.
+fn showWhy(why: []const u8) void {
+    if (std.mem.eql(u8, why, shown_why)) return;
+    shown_why = why;
+    objc.msg(void, why_mi, "setHidden:", .{why.len == 0});
+    if (why.len > 0) setText(why_mi, "setTitle:", why);
+}
+
+/// The note item: grey and inert for news, orange and a click to the Log window for a problem. The menu keeps its
+/// width by drawing `title`; the tooltip has the whole `full` text.
+fn showNote(title: []const u8, full: []const u8, problem: bool) void {
+    objc.msg(void, note_mi, "setHidden:", .{title.len == 0});
+    var sig: [600]u8 = undefined;
+    const key = std.fmt.bufPrint(&sig, "{s}\x00{s}\x00{d}", .{ title, full, @intFromBool(problem) }) catch return;
+    if (key.len == shown_note_sig_len and std.mem.eql(u8, key, shown_note_sig[0..key.len])) return;
+    shown_note_sig_len = key.len;
+    @memcpy(shown_note_sig[0..key.len], key);
+    if (title.len == 0) return;
+    setText(note_mi, "setTitle:", title);
+    setText(note_mi, "setToolTip:", full);
+    objc.msg(void, note_mi, "setEnabled:", .{problem});
+    objc.msg(void, note_mi, "setAction:", .{if (problem) objc.sel("showLog:") else null});
+    if (!problem) return objc.msg(void, note_mi, "setAttributedTitle:", .{@as(objc.id, null)});
+    var z: [256:0]u8 = undefined;
+    const n = @min(title.len, z.len - 1);
+    @memcpy(z[0..n], title[0..n]);
+    z[n] = 0;
+    const attrs = header_view.noteAttributes();
+    const text = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsString(&z), attrs });
+    defer objc.release(text);
+    objc.msg(void, note_mi, "setAttributedTitle:", .{text});
 }
 
 fn runAction(act: Action) void {
     switch (act.kind) {
         .start => startServer(),
         .stop => stopServer(),
+        .load => if (model_action == .load) startModelOp(false),
+        .unload => if (model_action == .unload) startModelOp(true),
         .confirm => {},
         .models => refreshModels(@intCast(act.value)),
         .check => {
             lock();
-            shared.req_check = true;
+            shared.manual_result = .none;
             unlock();
+            startWorker(.check);
         },
-        .update => {
-            lock();
-            shared.req_update = true;
-            unlock();
-        },
+        .update => startWorker(.update),
         .port => setPort(@intCast(act.value)),
+        .remove => removePort(@intCast(act.value)),
         .typed => {
             var z: [16:0]u8 = undefined;
             const t = std.fmt.bufPrintSentinel(&z, "{d}", .{act.value}, 0) catch return;
@@ -946,7 +1382,7 @@ fn runAction(act: Action) void {
     }
 }
 
-/// Return in the field or Watch: a valid port switches what is watched and closes the menu; anything else turns
+/// Return in the field or Switch: a valid port switches what is watched and closes the menu; anything else turns
 /// the text red with a hint and keeps the menu open.
 fn applyPortText() void {
     if (logic.parsePortText(port_field.text())) |p| {
@@ -965,7 +1401,12 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     tick_count += 1;
     for (test_actions[0..test_action_n]) |act| if (act.at == tick_count) runAction(act);
     reapStarted();
+    refresh();
+    reaped_this_tick = false;
+}
 
+/// Renders the published snapshot into the menu, from the timer and straight after a click that changes it.
+fn refresh() void {
     const p = port();
     const now = io_util.nowMs(g_io);
     var model_b: [96]u8 = undefined;
@@ -1017,7 +1458,6 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     const last_prefill = if (fresh) shared.last_prefill else null;
     const hist_n = if (fresh) shared.hist_n else 0;
     @memcpy(hist[0..hist_n], shared.hist[0..hist_n]);
-    const up_to_date = shared.up_to_date;
     const bar_version = take(&bar_b, &shared.bar_version);
     const server_version = if (fresh) take(&srv_b, &shared.server_version) else "";
     const server_command = shared.props_command.len > 0;
@@ -1031,15 +1471,36 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         .command = if (g_sibling_brew and cmd_len == 0) "brew upgrade sushi" else cmd_b[0..cmd_len],
         .note = take(&note_b, &shared.note),
         .busy = shared.busy,
+        .checked = shared.manual_result,
     };
     const relaunch = shared.relaunch;
+    const note_problem = shared.note_problem;
     unlock();
 
     if (view.link == .up or view.link == .metrics_off) markAnswered(p);
+    if (fresh and model.len > 0 and !std.mem.eql(u8, model, g_last_model.get())) {
+        g_last_model.set(model);
+        writeSaved(p);
+    }
+    watchTransition(p, fresh, view.link, now);
     const own = ownServer();
     const ours_alive = own != null;
     if (view.link == .offline or stopping_until_ms <= now) stopping_until_ms = 0;
     const stopping = stopping_until_ms > now;
+    var serving_pid: i32 = if (own) |e| e.pid else 0;
+    if (own == null) for (listings[0..ln]) |l| if (l.port == p) {
+        serving_pid = l.pid;
+    };
+    if (g_stop_sent.port != p or serving_pid == 0) g_stop_sent = .{};
+    g_stop_stuck = logic.stopStuck(g_stop_sent, p, now, serving_pid);
+    if (g_stop_stuck and !g_stuck_noted) {
+        var sb: [96]u8 = undefined;
+        setProblem(logic.stuckNote(&sb, p));
+    }
+    g_stuck_noted = g_stop_stuck;
+    var started_b: [started.len + 1]u16 = undefined;
+    g_started_count = startedPorts(&started_b).len;
+    applyQuitLook();
     const state: logic.Server = .{
         .link = view.link,
         .model = if (model.len > 0) model else null,
@@ -1048,29 +1509,43 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         .port = p,
         .sushi_listening = sushi_listening,
         .port_taken = port_taken,
+        .connecting = !fresh,
+        .stop_stuck = g_stop_stuck,
     };
     const on = logic.enabled(state);
     const tg = logic.toggle(state, stopping);
     var uv = uv_base;
     uv.path = logic.updatePath(.{ .available = uv.available, .link = view.link, .server_command = server_command, .sibling_brew = g_sibling_brew });
+    uv.model = model;
+    uv.copied = copied_what == .upgrade and logic.copiedNow(copied_at_ms, now);
+    button_command.set(uv.command);
+    confirm_needed = logic.updateNeedsConfirm(uv);
+    confirm_model.set(model);
+    confirm_latest.set(uv.latest);
 
     // The header card, then everything else it owns the numbers of.
     var arena_buf: [8192]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&arena_buf);
+    // Between Start and the model's row turning to loading, the model Start asked for is already the one loading.
+    const asked = g_load_port.load(.acquire) == p and view.link == .up and model.len == 0 and loading_id.len == 0;
+    const loading_name = if (loading_id.len > 0) loading_id else if (asked) g_last_model.get() else "";
     const header = logic.buildHeader(fba.allocator(), .{
         .link = view.link,
         .port = p,
-        .loading = loading_id.len > 0 and model.len == 0,
+        .loading = loading_name.len > 0 and model.len == 0,
         .updating = uv.busy == .updating,
         .starting = ours_alive and view.link == .offline,
-        .model = if (model.len > 0) model else if (loading_id.len > 0) loading_id else null,
+        .connecting = !fresh,
+        .port_taken = port_taken,
+        .sushi_found = g_sushi_found,
+        .last_model = g_last_model.get(),
+        .model = if (model.len > 0) model else if (loading_name.len > 0) loading_name else null,
         .pack_update = pack_update,
         .mem_mb = mem_mb,
         .bar_version = bar_version,
         .server_version = server_version,
         .update_available = uv.available,
         .latest = uv.latest,
-        .up_to_date = up_to_date,
         .decoding = view.decoding,
         .live = view.live,
         .last = view.last,
@@ -1086,47 +1561,48 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     const title = logic.title(&last_title, tv);
     const button = objc.msg(objc.id, status_item, "button", .{});
     showIcon(button, logic.iconFor(view.link));
-    setButtonTitle(button, title, logic.titleDim(view));
+    showBadge(button, logic.badge(view.link, port_taken, g_crashed_port == p and !ours_alive));
+    setButtonTitle(button, title);
     var status_buf: [200]u8 = undefined;
     const status = logic.statusLine(&status_buf, state);
     setText(button, "setToolTip:", status);
 
-    setText(toggle_mi, "setTitle:", tg.label);
-    objc.msg(void, toggle_mi, "setEnabled:", .{tg.enabled});
-    if (shown_symbol != tg.symbol.ptr) {
-        shown_symbol = tg.symbol.ptr;
-        objc.msg(void, toggle_mi, "setImage:", .{symbol(tg.symbol)});
-    }
+    button_row.setStart(.{ .label = tg.label, .symbol = tg.symbol, .tip = tg.tip, .enabled = tg.enabled, .closes_menu = tg.action != .start });
+    var model_tip: [160]u8 = undefined;
+    const mb = logic.modelButton(&model_tip, .{
+        .link = view.link,
+        .connecting = !fresh,
+        .starting = ours_alive and view.link == .offline,
+        .model = if (model.len > 0) model else null,
+        .last_model = g_last_model.get(),
+        .loading = g_load_port.load(.acquire) == p or (loading_id.len > 0 and model.len == 0),
+        .unloading = g_unload_port.load(.acquire) == p,
+    });
+    model_action = mb.action;
+    button_row.setLoad(.{ .label = mb.label, .symbol = mb.symbol, .tip = mb.tip, .enabled = mb.enabled, .closes_menu = false, .spinner = mb.spinner });
+    showWhy(mb.why);
     var lab: [96]u8 = undefined;
     setText(port_mi, "setTitle:", std.fmt.bufPrint(&lab, "Port {d}", .{p}) catch "Port");
     for (open_mis) |mi| objc.msg(void, mi, "setEnabled:", .{logic.openEnabled(view.link)});
 
-    var entries: [max_listings + 1]logic.PortEntry = undefined;
-    const port_entries = logic.portEntries(&entries, p, listings[0..ln]);
+    var entries: [max_listings + logic.max_saved + 2]logic.PortEntry = undefined;
+    const port_entries = logic.portEntries(&entries, p, g_default_port, g_saved.items(), listings[0..ln]);
     syncPortMenu(port_entries);
 
-    var cb: [128]u8 = undefined;
-    const check = logic.checkLabel(&cb, uv);
-    setText(check_mi, "setTitle:", check);
-    objc.msg(void, check_mi, "setEnabled:", .{uv.busy == .none});
-    objc.msg(void, check_mi, "setHidden:", .{uv.available});
-    var fit_b: [note_show_max + 4]u8 = undefined;
-    const note_shown = if (uv.busy == .none and uv.note.len > 0) logic.fitNote(&fit_b, uv.note, note_show_max) else "";
-    setText(note_mi, "setTitle:", note_shown);
-    objc.msg(void, note_mi, "setHidden:", .{note_shown.len == 0});
-    var ub: [200]u8 = undefined;
-    const update_label = if (uv.busy == .updating) check else logic.updateLabel(&ub, uv) orelse "";
-    objc.msg(void, update_mi, "setHidden:", .{!(uv.available and uv.path != .brew)});
-    setText(update_mi, "setTitle:", update_label);
-    objc.msg(void, update_mi, "setEnabled:", .{logic.updateEnabled(uv)});
-    var pb: [128]u8 = undefined;
-    const copy_label = logic.copyLabel(&pb, uv.command);
-    objc.msg(void, copy_mi, "setHidden:", .{!(uv.available and uv.path == .brew)});
-    setText(copy_mi, "setTitle:", copy_label);
+    var fit_b: [logic.note_title_max + 4]u8 = undefined;
+    const note_shown = if (uv.busy == .none and uv.note.len > 0) logic.fitNote(&fit_b, uv.note, logic.note_title_max) else "";
+    showNote(note_shown, uv.note, note_problem);
+    var tip_b: [160]u8 = undefined;
+    const update_button = logic.updateButton(&tip_b, uv);
+    button_action = update_button.action;
+    button_row.setUpdate(buttonLook(update_button));
+    button_row.dropStaleHover();
     var pcb: [128]u8 = undefined;
-    const pack_copy = if (pack_update) |u| logic.copyLabel(&pcb, u.command) else "";
+    const pack_tip = if (pack_update) |u| logic.copyLabel(&pcb, u.command) else "";
+    const pack_copied = copied_what == .pack and logic.copiedNow(copied_at_ms, now);
     objc.msg(void, pack_mi, "setHidden:", .{pack_update == null});
-    setText(pack_mi, "setTitle:", pack_copy);
+    setText(pack_mi, "setTitle:", if (pack_copied) "Copied Pull Command" else "Copy Pull Command");
+    setText(pack_mi, "setToolTip:", pack_tip);
 
     if (relaunch) relaunchSelf(p);
 
@@ -1137,14 +1613,20 @@ fn tick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
             const piece = std.fmt.bufPrint(ports_buf[pn..], "{s}{s};", .{ logic.portLabel(&lab, e), if (e.checked) "*" else "" }) catch break;
             pn += piece.len;
         }
-        const shown_update = if (uv.available and uv.path == .brew) copy_label else if (uv.available) update_label else "";
-        const shown_check = if (uv.available) "" else check;
-        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" check=\"{s}\" update=\"{s}\" note=\"{s}\" pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\"\n", .{
+        var removable_buf: [128]u8 = undefined;
+        var rn: usize = 0;
+        for (port_entries) |e| if (e.removable) {
+            const piece = std.fmt.bufPrint(removable_buf[rn..], "{d},", .{e.port}) catch break;
+            rn += piece.len;
+        };
+        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" note=\"{s}\" problem={d} pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\" tip=\"{s}\" removable=\"{s}\" badge={d} models_link={d} last_model=\"{s}\" load=\"{s}\" load_on={d} why=\"{s}\"\n", .{
             tick_count,                 title,                 status,                 @intFromBool(on.start),
             @intFromBool(on.stop),      if (own) |e| e.pid else 0,
-            @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         shown_check,
-            shown_update,               note_shown,            header.pill.label,     header.line1,           header.line2,
-            tg.label,                   @intFromBool(port_field.isInvalid()), header.pack_line, pack_copy,
+            @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         note_shown,
+            @intFromBool(note_problem and note_shown.len > 0), header.pill.label, header.line1, header.line2,
+            tg.label,                   @intFromBool(port_field.isInvalid()), header.pack_line, pack_tip,
+            update_button.label,        update_button.tip,     removable_buf[0..rn],   @intFromBool(shown_badge),
+            @intFromBool(header.line1_models), g_last_model.get(), mb.label, @intFromBool(mb.enabled), mb.why,
         });
         if (tick_count >= test_polls) quit();
     }
@@ -1161,17 +1643,37 @@ fn relaunchSelf(p: u16) void {
     // The path sushibar was started by, so a Homebrew link lands on the new keg; brew's opt link if that is gone.
     const exe = if (reachable(g_self_exe)) g_self_exe else siblingNow(&sb, bar_exe) orelse g_self_exe;
     proc.execReplace(&.{ exe.ptr, "--port", pz.ptr });
-    setNote("Updated, but sushibar could not restart itself: quit and run it again");
+    setProblem("Updated, but sushibar could not restart itself: quit and run it again");
+}
+
+fn openUrl(url: []const u8) void {
+    var z: [256:0]u8 = undefined;
+    const n = @min(url.len, z.len - 1);
+    @memcpy(z[0..n], url[0..n]);
+    z[n] = 0;
+    const ns_url = objc.msg(objc.id, objc.class("NSURL"), "URLWithString:", .{objc.nsString(&z)});
+    _ = objc.msg(bool, objc.msg(objc.id, objc.class("NSWorkspace"), "sharedWorkspace", .{}), "openURL:", .{ns_url});
+}
+
+fn openWebPage(page: logic.Page) void {
+    var url_buf: [96]u8 = undefined;
+    openUrl(logic.pageUrl(&url_buf, port(), page));
 }
 
 fn openPage(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
-    const tag = objc.msg(isize, sender, "tag", .{});
-    var url_buf: [96:0]u8 = undefined;
-    const page: logic.Page = @enumFromInt(@as(u2, @intCast(tag)));
-    const url = logic.pageUrl(&url_buf, port(), page);
-    url_buf[url.len] = 0;
-    const ns_url = objc.msg(objc.id, objc.class("NSURL"), "URLWithString:", .{objc.nsString(&url_buf)});
-    _ = objc.msg(bool, objc.msg(objc.id, objc.class("NSWorkspace"), "sharedWorkspace", .{}), "openURL:", .{ns_url});
+    openWebPage(@enumFromInt(@as(u2, @intCast(objc.msg(isize, sender, "tag", .{})))));
+}
+
+fn openModelsAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    openWebPage(.models);
+}
+
+fn openReleaseNotes(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    lock();
+    var b: [160]u8 = undefined;
+    const url = take(&b, &shared.props_url);
+    unlock();
+    openUrl(logic.releaseNotesUrl(url));
 }
 
 /// Start or Stop, whichever the item reads.
@@ -1185,16 +1687,51 @@ fn toggleAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
         .port = port(),
         .sushi_listening = shared.sushi_listening,
         .port_taken = shared.port_taken,
+        .stop_stuck = g_stop_stuck,
     };
     unlock();
     switch (logic.toggle(state, stopping_until_ms > io_util.nowMs(g_io)).action) {
         .start => startServer(),
         .stop => stopServer(),
+        .force_stop => forceStop(),
         .none => {},
     }
 }
+fn loadModelAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    switch (model_action) {
+        .load => startModelOp(false),
+        .unload => startModelOp(true),
+        .none => {},
+    }
+    refresh();
+}
 fn quitAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     quit();
+}
+fn quitStopAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    quitStop();
+}
+
+var g_stop_stuck = false;
+var g_started_count: usize = 0;
+var g_option = false;
+var g_flags_timer: objc.id = null;
+const option_key_mask: usize = 1 << 19;
+
+/// Quit, or Quit & Stop while Option is held and sushibar runs a server it started.
+fn applyQuitLook() void {
+    var tb: [128]u8 = undefined;
+    const q = logic.quitButton(&tb, g_option, g_started_count);
+    // "Quit & Stop" fills the button on its own; a symbol beside it would touch the edges.
+    button_row.setQuit(.{ .label = q.label, .symbol = if (q.stops) "" else "power", .tip = q.tip, .selector = if (q.stops) "quitStop:" else null });
+}
+
+/// Watches the Option key while the menu is open, so Quit turns into Quit & Stop as it is pressed.
+fn flagsTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    const opt = objc.msg(usize, objc.class("NSEvent"), "modifierFlags", .{}) & option_key_mask != 0;
+    if (opt == g_option) return;
+    g_option = opt;
+    applyQuitLook();
 }
 fn pickPortAction(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
     setPort(@intCast(objc.msg(isize, sender, "tag", .{})));
@@ -1205,15 +1742,29 @@ fn applyPortAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
 fn textChangedAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     port_field.clearInvalid();
 }
-fn checkAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    runAction(.{ .kind = .check, .at = 0 });
+fn buttonLook(b: logic.UpdateButton) button_row.Look {
+    return .{ .label = b.label, .symbol = b.symbol, .tip = b.tip, .accent = b.accent, .enabled = b.enabled, .closes_menu = b.closes_menu, .spinner = b.spinner };
 }
-fn updateAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    runAction(.{ .kind = .update, .at = 0 });
+fn updateButtonAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    switch (button_action) {
+        .check => runAction(.{ .kind = .check, .at = 0 }),
+        .update => if (!confirm_needed or confirmUpdate()) runAction(.{ .kind = .update, .at = 0 }),
+        .copy_command => copyUpgrade(),
+        .none => {},
+    }
+    refresh();
 }
-fn copyAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    objc.copyText("brew upgrade sushi");
+
+fn copyUpgrade() void {
+    var z: [81]u8 = undefined;
+    const c = button_command.get();
+    @memcpy(z[0..c.len], c);
+    z[c.len] = 0;
+    objc.copyText(@ptrCast(&z));
+    copied_what = .upgrade;
+    copied_at_ms = io_util.nowMs(g_io);
 }
+
 fn copyPackAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     var cmd: [97]u8 = undefined;
     lock();
@@ -1221,19 +1772,68 @@ fn copyPackAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     @memcpy(cmd[0..n], shared.pack_command.get());
     unlock();
     cmd[n] = 0;
-    if (n > 0) objc.copyText(@ptrCast(&cmd));
+    if (n == 0) return;
+    objc.copyText(@ptrCast(&cmd));
+    copied_what = .pack;
+    copied_at_ms = io_util.nowMs(g_io);
 }
 
-fn menuWillOpen(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    refreshModels(null);
+fn pickRowAction(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
+    if (port_row.portOf(sender)) |p| setPort(p);
+}
+fn removeRowAction(_: objc.id, _: objc.SEL, sender: objc.id) callconv(.c) void {
+    if (port_row.portOf(sender)) |p| removePort(p);
 }
 
-/// A symbol in the accent colour (not a template, so the menu does not tint it grey).
-fn accentSymbol(name: []const u8) objc.id {
-    const accent = objc.msg(objc.id, objc.class("NSColor"), "controlAccentColor", .{});
-    const colors = objc.msg(objc.id, objc.class("NSArray"), "arrayWithObject:", .{accent});
-    const cfg = objc.msg(objc.id, objc.class("NSImageSymbolConfiguration"), "configurationWithPaletteColors:", .{colors});
-    return objc.msg(objc.id, symbol(name), "imageWithSymbolConfiguration:", .{cfg});
+/// The top menu re-reads the default port and polls at once; the Port submenu asks its listeners for their models.
+fn menuWillOpen(_: objc.id, _: objc.SEL, opening: objc.id) callconv(.c) void {
+    if (opening != top_menu) return refreshModels(null);
+    g_menu_open.store(true, .release);
+    g_wake.set(g_io);
+    g_default_port = readDefaultPort();
+    const now = io_util.nowMs(g_io);
+    lock();
+    shared.manual_result = logic.shownResult(shared.manual_result, shared.manual_at_ms, now);
+    if (!logic.noteKept(shared.note_problem, shared.note_at_ms, now)) shared.note.set("");
+    unlock();
+    g_option = false;
+    flagsTick(null, null, null);
+    if (g_flags_timer == null) g_flags_timer = objc.addTimer(0.1, menu_target, "flagsTick:");
+    refresh();
+}
+
+fn menuDidClose(_: objc.id, _: objc.SEL, closing: objc.id) callconv(.c) void {
+    if (closing != top_menu) return;
+    g_menu_open.store(false, .release);
+    if (g_flags_timer != null) objc.msg(void, g_flags_timer, "invalidate", .{});
+    g_flags_timer = null;
+}
+
+fn refreshNow(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    refresh();
+}
+
+/// The watched port's log: what its server's argv said, or the default file while that is not known yet.
+fn watchedLog(buf: *[1024]u8) logic.LogSource {
+    const p = port();
+    lock();
+    defer unlock();
+    if (shared.port != p) return logic.logSource(buf, g_home, p, null);
+    const path = shared.log_path.get();
+    @memcpy(buf[0..path.len], path);
+    return .{ .kind = shared.log_kind, .path = buf[0..path.len] };
+}
+
+fn showLogAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    var buf: [1024]u8 = undefined;
+    log_view.open(port(), watchedLog(&buf));
+}
+
+/// Follows the log while its window is open, and the watched port when it changes.
+fn logTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    if (!log_view.isVisible()) return;
+    var buf: [1024]u8 = undefined;
+    log_view.sync(port(), watchedLog(&buf));
 }
 
 const icon_w = 22;
@@ -1242,6 +1842,40 @@ const icon_h = 18;
 fn loadIcons() void {
     icons[@intFromEnum(logic.Icon.outline)] = objc.loadSvg(@embedFile("sushibar/icon-offline.svg"), true, icon_w, icon_h);
     icons[@intFromEnum(logic.Icon.color)] = objc.loadSvg(@embedFile("sushibar/icon-online.svg"), false, icon_w, icon_h);
+}
+
+const find_show_interface: isize = 1;
+
+fn addMainItem(menu: objc.id, title: [*:0]const u8, action: [*:0]const u8, key: [*:0]const u8) objc.id {
+    return objc.msg(objc.id, menu, "addItemWithTitle:action:keyEquivalent:", .{ objc.nsString(title), objc.sel(action), objc.nsString(key) });
+}
+
+fn addSubmenu(bar: objc.id, title: [*:0]const u8) objc.id {
+    const item = objc.new(objc.class("NSMenuItem"));
+    objc.msg(void, bar, "addItem:", .{item});
+    const menu = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSMenu"), "alloc", .{}), "initWithTitle:", .{objc.nsString(title)});
+    objc.msg(void, item, "setSubmenu:", .{menu});
+    return menu;
+}
+
+/// An accessory app shows no menu bar, but its main menu still carries the key equivalents: without it ⌘C, ⌘A, ⌘F
+/// and ⌘W do nothing in the log window and ⌘V does nothing in the Port field.
+fn setMainMenu(app: objc.id) void {
+    const bar = objc.new(objc.class("NSMenu"));
+    const sushibar_menu = addSubmenu(bar, "sushibar");
+    const quit_item = addMainItem(sushibar_menu, "Quit sushibar", "quit:", "q");
+    objc.msg(void, quit_item, "setTarget:", .{menu_target});
+    const edit = addSubmenu(bar, "Edit");
+    _ = addMainItem(edit, "Cut", "cut:", "x");
+    _ = addMainItem(edit, "Copy", "copy:", "c");
+    _ = addMainItem(edit, "Paste", "paste:", "v");
+    _ = addMainItem(edit, "Select All", "selectAll:", "a");
+    const find = addMainItem(edit, "Find…", "performTextFinderAction:", "f");
+    objc.msg(void, find, "setTag:", .{find_show_interface});
+    const window = addSubmenu(bar, "Window");
+    _ = addMainItem(window, "Close Window", "performClose:", "w");
+    _ = addMainItem(window, "Minimize", "performMiniaturize:", "m");
+    objc.msg(void, app, "setMainMenu:", .{bar});
 }
 
 fn runMenuBar() noreturn {
@@ -1253,35 +1887,55 @@ fn runMenuBar() noreturn {
     loadIcons();
     objc.msg(void, button, "setImagePosition:", .{@as(isize, 2)});
     showIcon(button, .outline);
+    makeBadge(button);
 
     const cls = objc.defineClass("SushiBarTarget", &.{
         .{ .selector = "tick:", .imp = @ptrCast(&tick), .types = "v@:@" },
         .{ .selector = "open:", .imp = @ptrCast(&openPage), .types = "v@:@" },
         .{ .selector = "toggle:", .imp = @ptrCast(&toggleAction), .types = "v@:@" },
+        .{ .selector = "loadModel:", .imp = @ptrCast(&loadModelAction), .types = "v@:@" },
         .{ .selector = "quit:", .imp = @ptrCast(&quitAction), .types = "v@:@" },
+        .{ .selector = "quitStop:", .imp = @ptrCast(&quitStopAction), .types = "v@:@" },
+        .{ .selector = "flagsTick:", .imp = @ptrCast(&flagsTick), .types = "v@:@" },
         .{ .selector = "pickPort:", .imp = @ptrCast(&pickPortAction), .types = "v@:@" },
+        .{ .selector = "pickRow:", .imp = @ptrCast(&pickRowAction), .types = "v@:@" },
+        .{ .selector = "removeRow:", .imp = @ptrCast(&removeRowAction), .types = "v@:@" },
         .{ .selector = "applyPort:", .imp = @ptrCast(&applyPortAction), .types = "v@:@" },
         .{ .selector = "controlTextDidChange:", .imp = @ptrCast(&textChangedAction), .types = "v@:@" },
-        .{ .selector = "check:", .imp = @ptrCast(&checkAction), .types = "v@:@" },
-        .{ .selector = "update:", .imp = @ptrCast(&updateAction), .types = "v@:@" },
-        .{ .selector = "copy:", .imp = @ptrCast(&copyAction), .types = "v@:@" },
+        .{ .selector = "updateButton:", .imp = @ptrCast(&updateButtonAction), .types = "v@:@" },
+        .{ .selector = "showLog:", .imp = @ptrCast(&showLogAction), .types = "v@:@" },
+        .{ .selector = "logTick:", .imp = @ptrCast(&logTick), .types = "v@:@" },
+        .{ .selector = "openModels:", .imp = @ptrCast(&openModelsAction), .types = "v@:@" },
+        .{ .selector = "openRelease:", .imp = @ptrCast(&openReleaseNotes), .types = "v@:@" },
         .{ .selector = "copyPack:", .imp = @ptrCast(&copyPackAction), .types = "v@:@" },
         .{ .selector = "menuWillOpen:", .imp = @ptrCast(&menuWillOpen), .types = "v@:@" },
+        .{ .selector = "menuDidClose:", .imp = @ptrCast(&menuDidClose), .types = "v@:@" },
+        .{ .selector = "refreshNow:", .imp = @ptrCast(&refreshNow), .types = "v@:@" },
     });
     menu_target = objc.new(cls);
+    setMainMenu(app);
     const menu = objc.new(objc.class("NSMenu"));
     top_menu = menu;
+    objc.msg(void, menu, "setDelegate:", .{menu_target});
     objc.msg(void, menu, "setAutoenablesItems:", .{false});
 
     header_mi = objc.new(objc.class("NSMenuItem"));
     objc.msg(void, header_mi, "setView:", .{header_view.create(
         objc.loadSvg(@embedFile("sushibar/icon-online.svg"), false, 34, 28),
         objc.loadSvg(@embedFile("sushibar/icon-offline.svg"), true, 34, 28),
+        menu_target,
+        menu,
     )});
     objc.msg(void, menu, "addItem:", .{header_mi});
     addSeparator(menu);
 
-    toggle_mi = addItem(menu, "Start Server", "toggle:", 0, "", "play.fill");
+    button_row.init(menu_target, menu);
+    const server_mi = objc.new(objc.class("NSMenuItem"));
+    objc.msg(void, server_mi, "setView:", .{button_row.createServerRow()});
+    objc.msg(void, menu, "addItem:", .{server_mi});
+    why_mi = addItem(menu, "", null, 0, "", null);
+    objc.msg(void, why_mi, "setEnabled:", .{false});
+    objc.msg(void, why_mi, "setHidden:", .{true});
     port_mi = addItem(menu, "Port", null, 0, "", "network");
     objc.msg(void, port_mi, "setEnabled:", .{true});
     port_menu = objc.new(objc.class("NSMenu"));
@@ -1301,26 +1955,21 @@ fn runMenuBar() noreturn {
     for (open_mis) |mi| objc.msg(void, mi, "setEnabled:", .{false});
     addSeparator(menu);
 
-    check_mi = addItem(menu, "Check for Updates…", "check:", 0, "", "arrow.triangle.2.circlepath");
-    update_mi = addItem(menu, "Update", "update:", 0, "", null);
-    objc.msg(void, update_mi, "setImage:", .{accentSymbol("arrow.down.circle.fill")});
-    const badge_class = objc.class("NSMenuItemBadge");
-    if (badge_class != null) {
-        const badge = objc.msg(objc.id, objc.msg(objc.id, badge_class, "alloc", .{}), "initWithString:", .{objc.nsString("New")});
-        objc.msg(void, update_mi, "setBadge:", .{badge});
-    }
-    objc.msg(void, update_mi, "setHidden:", .{true});
-    copy_mi = addItem(menu, "Copy", "copy:", 0, "", "doc.on.doc");
-    objc.msg(void, copy_mi, "setHidden:", .{true});
-    pack_mi = addItem(menu, "Copy", "copyPack:", 0, "", "doc.on.doc");
+    pack_mi = addItem(menu, "Copy Pull Command", "copyPack:", 0, "", "doc.on.doc");
     objc.msg(void, pack_mi, "setHidden:", .{true});
     note_mi = addItem(menu, "", null, 0, "", null);
     objc.msg(void, note_mi, "setHidden:", .{true});
     addSeparator(menu);
 
-    _ = addItem(menu, "Quit sushibar", "quit:", 0, "q", "power");
+    const buttons_mi = objc.new(objc.class("NSMenuItem"));
+    objc.msg(void, buttons_mi, "setView:", .{button_row.createFooter()});
+    objc.msg(void, menu, "addItem:", .{buttons_mi});
+    // The Quit button is the visible row; this item only keeps ⌘Q.
+    const quit_mi = addItem(menu, "Quit sushibar", "quit:", 0, "q", null);
+    objc.msg(void, quit_mi, "setHidden:", .{true});
     objc.msg(void, status_item, "setMenu:", .{menu});
-    objc.addTimer(@as(f64, poll_ms) / 1000.0, menu_target, "tick:");
+    _ = objc.addTimer(@as(f64, tick_ms) / 1000.0, menu_target, "tick:");
+    _ = objc.addTimer(0.5, menu_target, "logTick:");
 
     _ = std.Thread.spawn(.{}, pollLoop, .{}) catch fail("cannot start the poll thread", .{});
     objc.msg(void, app, "run", .{});
@@ -1334,6 +1983,8 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
     _ = header_view.create(
         objc.loadSvg(@embedFile("sushibar/icon-online.svg"), false, 34, 28),
         objc.loadSvg(@embedFile("sushibar/icon-offline.svg"), true, 34, 28),
+        null,
+        null,
     );
     std.Io.Dir.cwd().createDirPath(g_io, dir) catch {};
     const t0: i64 = 1_700_000_000_000;
@@ -1358,9 +2009,17 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
     const deep = "Example-Flash-1017-Sushi-STQ-1.75bpw";
     const states = [_]States{
         .{ .name = "stopped", .in = .{ .link = .offline, .port = 12345, .bar_version = "1.5.0-dev1" } },
-        .{ .name = "no-model", .in = .{ .link = .up, .port = 12345, .bar_version = "1.5.0-dev1", .up_to_date = true, .gpu_mhz = 0 } },
+        .{ .name = "stopped-last-model", .in = .{ .link = .offline, .port = 12345, .bar_version = "1.5.0-dev1", .last_model = deep } },
+        .{ .name = "port-taken", .in = .{ .link = .offline, .port = 8080, .bar_version = "1.5.0-dev1", .port_taken = true } },
+        .{ .name = "no-sushi", .in = .{ .link = .offline, .port = 12345, .bar_version = "1.5.0-dev1", .sushi_found = false } },
+        .{ .name = "starting", .in = .{ .link = .offline, .port = 12345, .bar_version = "1.5.0-dev1", .starting = true, .last_model = deep } },
+        .{ .name = "connecting", .in = .{ .link = .offline, .port = 18803, .bar_version = "1.5.0-dev1", .connecting = true } },
+        .{ .name = "silent", .in = .{ .link = .silent, .port = 12345, .bar_version = "1.5.0-dev1" } },
+        .{ .name = "ready-to-load", .in = .{ .link = .up, .port = 12345, .bar_version = "1.5.0-dev1", .last_model = deep, .gpu_mhz = 0 } },
+        .{ .name = "loading", .in = .{ .link = .up, .port = 12345, .bar_version = "1.5.0-dev1", .loading = true, .model = deep, .mem_mb = 12000 } },
+        .{ .name = "no-model", .in = .{ .link = .up, .port = 12345, .bar_version = "1.5.0-dev1", .gpu_mhz = 0 } },
         .{ .name = "generating", .sparkline = true, .outage = true, .in = .{
-            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0-dev1", .up_to_date = true,
+            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0-dev1",
             .decoding = true, .live = 105.27, .last = 90, .last_prefill = 5843.6, .gpu_mhz = 1195, .gpu_pct = 62,
         } },
         .{ .name = "key-needed", .in = .{ .link = .unauthorized, .port = 12345, .bar_version = "1.5.0-dev1" } },
@@ -1369,7 +2028,7 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
             .update_available = true, .latest = "1.5.1", .last = 142.6, .last_prefill = 3120, .gpu_mhz = 1380, .gpu_pct = 8,
         } },
         .{ .name = "pack-update", .sparkline = true, .in = .{
-            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0", .up_to_date = true,
+            .link = .up, .port = 12345, .model = deep, .mem_mb = 49971, .bar_version = "1.5.0",
             .pack_update = .{ .current = "1.0", .latest = "2.0", .command = "sushi pull example-pack" },
             .last = 90, .last_prefill = 5843.6, .gpu_mhz = 1195, .gpu_pct = 62,
         } },
@@ -1399,7 +2058,192 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
             if (!port_field.renderPng(field, pz.ptr, dark)) std.debug.print("sushibar: could not render {s}\n", .{pz});
         }
     }
+    renderButtonsAndLog(dir);
+    renderBadge(dir);
     std.process.exit(0);
+}
+
+/// The menu bar item in its states, on a plain button of the status button's shape over a menu-bar-like fill.
+fn renderBadge(dir: []const u8) void {
+    loadIcons();
+    const Case = struct { name: []const u8, icon: logic.Icon, title: []const u8 = "", badge: bool = false };
+    const cases = [_]Case{
+        .{ .name = "live", .icon = .color, .title = "105 tok/s" },
+        .{ .name = "last", .icon = .color, .title = "88.0 tok/s" },
+        .{ .name = "badge", .icon = .color, .badge = true },
+        .{ .name = "offline", .icon = .outline },
+    };
+    for (cases) |c| for ([_]bool{ false, true }) |dark| {
+        const box = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSBox"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 0, .y = 0, .w = 104, .h = 24 }});
+        objc.msg(void, box, "setBoxType:", .{@as(isize, 4)});
+        objc.msg(void, box, "setBorderWidth:", .{@as(f64, 0)});
+        objc.msg(void, box, "setContentViewMargins:", .{objc.NSSize{ .width = 0, .height = 0 }});
+        objc.msg(void, box, "setFillColor:", .{objc.msg(objc.id, objc.class("NSColor"), "colorWithWhite:alpha:", .{ @as(f64, if (dark) 0.16 else 0.92), @as(f64, 1) })});
+        const button = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSButton"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 4, .y = 0, .w = 96, .h = 24 }});
+        objc.msg(void, button, "setBordered:", .{false});
+        objc.msg(void, button, "setImagePosition:", .{@as(isize, 2)});
+        objc.msg(void, button, "setImage:", .{icons[@intFromEnum(c.icon)]});
+        // The status bar draws a template image in the bar's text colour; a plain button would draw it dimmed.
+        objc.msg(void, button, "setContentTintColor:", .{objc.color("labelColor")});
+        shown_title_len = std.math.maxInt(usize);
+        setButtonTitle(button, c.title);
+        makeBadge(button);
+        shown_badge = !c.badge;
+        showBadge(button, c.badge);
+        objc.msg(void, box, "addSubview:", .{button});
+        const name = if (dark) "NSAppearanceNameDarkAqua" else "NSAppearanceNameAqua";
+        objc.msg(void, box, "setAppearance:", .{objc.msg(objc.id, objc.class("NSAppearance"), "appearanceNamed:", .{objc.nsString(name)})});
+        const bounds = objc.msg(NSRect, box, "bounds", .{});
+        const rep = objc.msg(objc.id, box, "bitmapImageRepForCachingDisplayInRect:", .{bounds});
+        if (rep == null) return;
+        objc.msg(void, box, "cacheDisplayInRect:toBitmapImageRep:", .{ bounds, rep });
+        const data = objc.msg(objc.id, rep, "representationUsingType:properties:", .{ @as(isize, 4), @as(objc.id, null) });
+        var path: [std.fs.max_path_bytes:0]u8 = undefined;
+        const pz = std.fmt.bufPrintSentinel(&path, "{s}/menubar-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch return;
+        _ = objc.msg(bool, data, "writeToFile:atomically:", .{ objc.nsString(pz.ptr), true });
+    };
+}
+
+fn renderButtonsAndLog(dir: []const u8) void {
+    const row = button_row.createFooter();
+    const Case = struct { name: []const u8, uv: logic.UpdateView = .{}, hover: ?usize = null, pressed: ?usize = null };
+    const cases = [_]Case{
+        .{ .name = "normal" },
+        .{ .name = "hover-log", .hover = 0 },
+        .{ .name = "pressed-quit", .hover = 2, .pressed = 2 },
+        .{ .name = "update", .uv = .{ .available = true, .latest = "1.5.1", .path = .server } },
+        .{ .name = "update-hover", .uv = .{ .available = true, .latest = "1.5.1", .path = .server }, .hover = 1 },
+        .{ .name = "update-pressed", .uv = .{ .available = true, .latest = "1.5.1", .path = .server }, .pressed = 1 },
+        .{ .name = "brew", .uv = .{ .available = true, .latest = "1.5.1", .path = .brew, .command = "brew upgrade sushi" } },
+        .{ .name = "brew-copied", .uv = .{ .available = true, .latest = "1.5.1", .path = .brew, .command = "brew upgrade sushi", .copied = true } },
+        .{ .name = "checking", .uv = .{ .busy = .checking } },
+        .{ .name = "up-to-date", .uv = .{ .checked = .up_to_date } },
+        .{ .name = "failed", .uv = .{ .checked = .failed } },
+        .{ .name = "failed-hover", .uv = .{ .checked = .failed }, .hover = 1 },
+    };
+    var tip_b: [160]u8 = undefined;
+    for (cases) |c| {
+        var tip: [160]u8 = undefined;
+        const b = logic.updateButton(&tip, c.uv);
+        button_row.setUpdate(buttonLook(b));
+        for ([_]bool{ false, true }) |dark| {
+            var path: [std.fs.max_path_bytes:0]u8 = undefined;
+            const pz = std.fmt.bufPrintSentinel(&path, "{s}/buttons-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch continue;
+            if (!button_row.renderPng(row, pz.ptr, dark, c.hover, c.pressed, "")) std.debug.print("sushibar: could not render {s}\n", .{pz});
+        }
+    }
+    button_row.setUpdate(buttonLook(logic.updateButton(&tip_b, .{})));
+    g_option = true;
+    g_started_count = 1;
+    applyQuitLook();
+    for ([_]bool{ false, true }) |dark| {
+        var path: [std.fs.max_path_bytes:0]u8 = undefined;
+        const pz = std.fmt.bufPrintSentinel(&path, "{s}/buttons-quit-stop-{s}.png", .{ dir, if (dark) "dark" else "light" }, 0) catch continue;
+        if (!button_row.renderPng(row, pz.ptr, dark, 2, null, "")) std.debug.print("sushibar: could not render {s}\n", .{pz});
+    }
+    renderServerRow(dir);
+    renderPortRows(dir);
+    const sample =
+        \\2026-11-04 09:12:01 [info] Logging to /Users/me/.sushi/logs/sushi-11250.log (rotates at 100 MB)
+        \\2026-11-04 09:12:02 [info] sushi 1.5.0 serving on http://127.0.0.1:11250
+        \\2026-11-04 09:12:04 [info] [kv-cache] affine8 KV, context 262144
+        \\2026-11-04 09:12:09 [info] Loaded Example-Flash-Next-Sushi-STQ-2.75bpw in 4.8 s
+        \\2026-11-04 09:13:20 [info] <- 412+0 tokens (chat, stream)
+        \\2026-11-04 09:13:20 [warn] [admission] prefill chunk lowered to 2048 for the free memory
+        \\2026-11-04 09:13:31 [info] [spec-stats] accepted 2.31 of 3 drafted
+        \\2026-11-04 09:13:34 [info] -> 288 tokens, 142.6 tok/s decode
+        \\2026-11-04 09:14:02 [error] jinja error: unknown filter 'tojson_pretty'
+        \\2026-11-04 09:14:40 [info] [hot-cache] kept 3 entries, 1.2 GB
+        \\
+    ;
+    const std_path = "/Users/me/.sushi/logs/sushi-11250.log";
+    for ([_]bool{ false, true }) |dark| {
+        var path: [std.fs.max_path_bytes:0]u8 = undefined;
+        const pz = std.fmt.bufPrintSentinel(&path, "{s}/log-window-{s}.png", .{ dir, if (dark) "dark" else "light" }, 0) catch continue;
+        if (!log_view.renderPng(pz.ptr, dark, .{ .port = 11250, .src = .{ .kind = .standard, .path = std_path }, .sample = sample })) std.debug.print("sushibar: could not render {s}\n", .{pz});
+    }
+    var nb: [600]u8 = undefined;
+    const notice = logic.logNotice(&nb, 11250, .{ .kind = .standard, .path = std_path });
+    var path: [std.fs.max_path_bytes:0]u8 = undefined;
+    if (std.fmt.bufPrintSentinel(&path, "{s}/log-window-missing-light.png", .{dir}, 0)) |pz| {
+        if (!log_view.renderPng(pz.ptr, false, .{ .port = 11250, .src = .{ .kind = .standard, .path = std_path }, .sample = notice, .has_file = false })) std.debug.print("sushibar: could not render {s}\n", .{pz});
+    } else |_| {}
+    renderFollowedLog(dir);
+}
+
+/// Start/Stop beside Load/Unload for each state the pair can be in, with the line under them.
+fn renderServerRow(dir: []const u8) void {
+    const row = button_row.createServerRow();
+    const m = "Example-Flash-1017-Sushi-STQ-1.75bpw";
+    const Case = struct { name: []const u8, s: logic.Server, m: logic.ModelIn, stopping: bool = false, hover: ?usize = null, pressed: ?usize = null };
+    const cases = [_]Case{
+        .{ .name = "stopped", .s = .{ .link = .offline }, .m = .{ .link = .offline, .last_model = m } },
+        .{ .name = "stopped-no-last", .s = .{ .link = .offline }, .m = .{ .link = .offline } },
+        .{ .name = "starting", .s = .{ .link = .offline, .ours_alive = true }, .m = .{ .link = .offline, .starting = true, .last_model = m } },
+        .{ .name = "ready-to-load", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .last_model = m } },
+        .{ .name = "ready-hover-load", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .last_model = m }, .hover = 4 },
+        .{ .name = "no-last-model", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up } },
+        .{ .name = "loading", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .last_model = m, .loading = true } },
+        .{ .name = "loaded", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .model = m, .last_model = m } },
+        .{ .name = "loaded-hover-unload", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .model = m, .last_model = m }, .hover = 4 },
+        .{ .name = "loaded-pressed-stop", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .model = m, .last_model = m }, .hover = 3, .pressed = 3 },
+        .{ .name = "unloading", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .model = m, .last_model = m, .unloading = true } },
+        .{ .name = "stopping", .s = .{ .link = .up, .ours_alive = true }, .m = .{ .link = .up, .model = m, .last_model = m }, .stopping = true },
+    };
+    for (cases) |c| {
+        const tg = logic.toggle(c.s, c.stopping);
+        var tip: [160]u8 = undefined;
+        const mb = logic.modelButton(&tip, c.m);
+        button_row.setStart(.{ .label = tg.label, .symbol = tg.symbol, .tip = tg.tip, .enabled = tg.enabled, .closes_menu = false });
+        button_row.setLoad(.{ .label = mb.label, .symbol = mb.symbol, .tip = mb.tip, .enabled = mb.enabled, .closes_menu = false, .spinner = mb.spinner });
+        for ([_]bool{ false, true }) |dark| {
+            var path: [std.fs.max_path_bytes:0]u8 = undefined;
+            const pz = std.fmt.bufPrintSentinel(&path, "{s}/serverrow-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch continue;
+            if (!button_row.renderPng(row, pz.ptr, dark, c.hover, c.pressed, mb.why)) std.debug.print("sushibar: could not render {s}\n", .{pz});
+        }
+    }
+}
+
+/// The Port submenu's rows: the default (not removable), then added ports.
+fn renderPortRows(dir: []const u8) void {
+    const rows = [_]port_row.Row{
+        .{ .port = 12345, .label = "12345 — Example-Flash-Next-Sushi-STQ-2.75bpw", .checked = true, .removable = false },
+        .{ .port = 18803, .label = "18803 — not running", .checked = false, .removable = true },
+        .{ .port = 18802, .label = "18802 — Example-Flash-1017", .checked = false, .removable = true },
+        .{ .port = 7000, .label = "7000 — no model", .checked = false, .removable = true },
+    };
+    const Case = struct { name: []const u8, hover: ?usize = null, x_hover: bool = false };
+    for ([_]Case{ .{ .name = "normal" }, .{ .name = "hover-default", .hover = 0 }, .{ .name = "hover-added", .hover = 1 }, .{ .name = "hover-remove", .hover = 2, .x_hover = true } }) |c| {
+        for ([_]bool{ false, true }) |dark| {
+            var path: [std.fs.max_path_bytes:0]u8 = undefined;
+            const pz = std.fmt.bufPrintSentinel(&path, "{s}/portrows-{s}-{s}.png", .{ dir, c.name, if (dark) "dark" else "light" }, 0) catch continue;
+            if (!port_row.renderPng(&rows, pz.ptr, dark, c.hover, c.x_hover)) std.debug.print("sushibar: could not render {s}\n", .{pz});
+        }
+    }
+}
+
+/// The window reading a real file: its last lines on open, then what the file grew by while the reader was scrolled
+/// up, which the New lines pill announces.
+fn renderFollowedLog(dir: []const u8) void {
+    var path: [std.fs.max_path_bytes:0]u8 = undefined;
+    const file = std.fmt.bufPrint(&path, "{s}/followed.log", .{dir}) catch return;
+    var text: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer text.deinit();
+    const w = &text.writer;
+    for (1..3001) |i| w.print("line {d} of the first read\n", .{i}) catch return;
+    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = file, .data = text.written() }) catch return;
+    const src: logic.LogSource = .{ .kind = .given, .path = file };
+    log_view.sync(11250, src);
+    log_view.scrollToTop();
+    for (3001..3006) |i| w.print("line {d} appended later\n", .{i}) catch return;
+    w.writeAll("a line still being writ") catch return;
+    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = file, .data = text.written() }) catch return;
+    log_view.sync(11250, src);
+    for ([_]bool{ false, true }) |dark| {
+        var png: [std.fs.max_path_bytes:0]u8 = undefined;
+        const pz = std.fmt.bufPrintSentinel(&png, "{s}/log-window-new-lines-{s}.png", .{ dir, if (dark) "dark" else "light" }, 0) catch return;
+        if (!log_view.renderPng(pz.ptr, dark, null)) std.debug.print("sushibar: could not render {s}\n", .{pz});
+    }
 }
 
 // ── Launch ──
@@ -1487,8 +2331,12 @@ pub fn main(init: std.process.Init) !void {
     g_saved_path = try gpa.dupe(u8, proc.pidFilePath(&p3, g_home, saved_name) orelse fail("HOME is too long", .{}));
     readTestSeams();
 
+    g_default_port = readDefaultPort();
     const saved_text = std.Io.Dir.cwd().readFileAlloc(g_io, g_saved_path, gpa, .limited(4096)) catch "";
-    g_port.store(logic.choosePort(explicit, logic.parseSaved(saved_text)), .release);
+    const saved = logic.parseSaved(saved_text);
+    g_saved = saved.ports;
+    g_last_model.set(saved.model());
+    g_port.store(logic.choosePort(explicit, saved.port, g_default_port), .release);
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const self_exe = selfPath(&exe_buf) orelse fail("cannot resolve its own path", .{});

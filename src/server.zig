@@ -71,6 +71,7 @@ const request_media = @import("request_media.zig");
 const request_policy = @import("request_policy.zig");
 const models_api = @import("models_api.zig");
 const prefix_cache_admin = @import("prefix_cache_admin.zig");
+const downloads = @import("downloads.zig");
 const metrics_history = @import("metrics_history.zig");
 const gpu_clock_live = @import("gpu_clock_live.zig");
 const json_text = @import("json_text.zig");
@@ -129,10 +130,11 @@ pub const BindConfig = struct {
     port: u16,
 };
 
-pub fn resolveBind(host_flag: ?[]const u8, port_flag: ?u16) BindConfig {
+/// `settings_port` is the settings file's `server.port` or the built-in default: `--port` wins over both.
+pub fn resolveBind(host_flag: ?[]const u8, port_flag: ?u16, settings_port: u16) BindConfig {
     return .{
         .host = host_flag orelse default_host,
-        .port = port_flag orelse default_port,
+        .port = port_flag orelse settings_port,
     };
 }
 
@@ -537,7 +539,7 @@ fn sendWebToolFolders(allocator: std.mem.Allocator, stream: *http_conn.Conn, roo
 
 fn isChatPagePath(path: []const u8) bool {
     return std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/chat") or std.mem.eql(u8, path, "/dashboard") or
-        std.mem.eql(u8, path, "/models") or std.mem.eql(u8, path, "/settings");
+        std.mem.eql(u8, path, "/models") or std.mem.eql(u8, path, "/settings") or std.mem.eql(u8, path, "/downloads");
 }
 
 /// The chat page URL printed at startup. A wildcard bind is shown as loopback,
@@ -1583,6 +1585,7 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.S
 /// Idempotent; also the cleanup of a boot whose load failed with the listener up.
 fn stopServing(accept_thread: *?std.Thread) void {
     shutdown_requested.store(true, .release);
+    downloads.stop();
     if (accept_thread.*) |t| {
         t.join();
         accept_thread.* = null;
@@ -1844,6 +1847,36 @@ pub fn handleConnection(
             return;
         }
         try prefix_cache_admin.handleClear(allocator, stream, request_body);
+        return;
+    }
+    if (std.mem.eql(u8, path, "/v1/downloads")) {
+        if (std.mem.eql(u8, method, "GET")) {
+            try downloads.handleGet(allocator, stream, raw_path);
+        } else if (std.mem.eql(u8, method, "POST")) {
+            if (@import("download_progress.zig").startRefused(peerIsLoopback(stream), g_api_key != null)) {
+                try sendErrorResponse(allocator, stream, "403 Forbidden", "invalid_request_error", "A download from another machine needs the server started with --api-key", 403);
+                return;
+            }
+            try downloads.handleStart(allocator, stream, request_body);
+        } else {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use GET for the packs and downloads and POST to start one", 405);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, path, "/v1/downloads/cancel")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use POST to cancel a download", 405);
+            return;
+        }
+        try downloads.handleCancel(allocator, stream, request_body);
+        return;
+    }
+    if (std.mem.eql(u8, path, "/v1/slots/cancel")) {
+        if (!std.mem.eql(u8, method, "POST")) {
+            try sendErrorResponse(allocator, stream, "405 Method Not Allowed", "invalid_request_error", "Use POST to cancel an in-flight slot", 405);
+            return;
+        }
+        try handleSlotCancel(allocator, stream, request_body);
         return;
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
@@ -4014,7 +4047,7 @@ test "bf16 expert cache admission bills cache workspace bounce and resident trun
     try std.testing.expect(!expertStreamingLoadFits(needed - 1, 10 * gb, 16 * gb, 60 * gb, 536_870_912, fill_peak, serving));
 }
 
-test "DeepSeek's streamed request bill brackets the prefill peaks measured on the M5 Max" {
+test "DeepSeek: the streamed request bill brackets the prefill peaks measured on the M5 Max" {
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
     config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
     config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
@@ -4035,6 +4068,9 @@ test "DeepSeek's streamed request bill brackets the prefill peaks measured on th
         // Transient peaks of MLX's own bytes, state included, binary 26a28040, budget 108.
         .{ .seq = 2048, .chunk = 2048, .peak_mb = 4_907 },
         .{ .seq = 225_000, .chunk = 2048, .peak_mb = 5_124 },
+        // The two-layer prefill pipeline holds 0.25 GB more of a 2048-row chunk's transient.
+        .{ .seq = 2048, .chunk = 2048, .peak_mb = 4_907 + 250 },
+        .{ .seq = 225_000, .chunk = 2048, .peak_mb = 5_124 + 250 },
     };
     for (measured) |m| {
         const bill = prefillNeededAtChunk(&config, m.seq, 16, 16, m.chunk, .{});
@@ -7380,6 +7416,37 @@ fn handleMetricsEnable(stream: *http_conn.Conn) !void {
     try sendResponse(stream, "200 OK", "application/json", if (changed) "{\"metrics\":true,\"already_enabled\":false}" else "{\"metrics\":true,\"already_enabled\":true}");
 }
 
+fn parseCancelRequestId(allocator: std.mem.Allocator, body: []const u8) ?u64 {
+    if (body.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const obj = parsed.value.object;
+    const v = obj.get("id") orelse obj.get("request_id") orelse return null;
+    return switch (v) {
+        .integer => |i| if (i >= 0) @intCast(i) else null,
+        .string => |s| std.fmt.parseInt(u64, s, 10) catch null,
+        else => null,
+    };
+}
+
+fn handleSlotCancel(allocator: std.mem.Allocator, stream: *http_conn.Conn, request_body: []const u8) !void {
+    const target_id = parseCancelRequestId(allocator, request_body) orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Send {\"id\": <request_id>}", 400);
+        return;
+    };
+    const scheduler = global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server is not ready to process requests", 503);
+        return;
+    };
+    if (!scheduler.cancelSlotById(target_id)) {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "No in-flight request matches that id", 404);
+        return;
+    }
+    log.info("[cancel] slot request_id={d} cancelled via API\n", .{target_id});
+    try sendResponse(stream, "200 OK", "application/json", "{\"ok\":true}");
+}
+
 fn handleUpdate(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: []const u8, raw_path: []const u8) !void {
     var ebuf: [std.fs.max_path_bytes]u8 = undefined;
     var rbuf: [512]u8 = undefined;
@@ -7714,9 +7781,9 @@ pub fn handleChatCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = request_policy.resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
-    const top_p = request_policy.resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
-    const top_k = request_policy.resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature", 0.0, 2.0));
+    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p", 0.0, 1.0));
+    const top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k"));
 
     const repeat_penalty = request_policy.parseRepeatPenalty(root);
 
@@ -8209,7 +8276,7 @@ pub fn sendResponse(stream: *http_conn.Conn, status: []const u8, content_type: [
 /// only a one-line status summary. For high-frequency, self-describing bodies
 /// where the full dump is pure noise: the Prometheus scrape (`/metrics`, hit
 /// every couple seconds) and the panel's JSON feed (`/metrics.json`, ~1 Hz).
-fn sendResponseQuiet(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
+pub fn sendResponseQuiet(stream: *http_conn.Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
     if (log.isDebug()) log.debug("[http] <- {s} {s} body={d}b (scrape; body not logged)\n", .{ status, content_type, body.len });
     try sendResponseFramed(stream, status, content_type, body);
 }
@@ -8344,9 +8411,6 @@ const GaugeSamplerCtx = struct {
 
 /// Sample instantaneous system/queue state into the gauges. Non-blocking
 /// syscalls plus a brief scheduler-counter lock. Called by the sampler thread.
-/// The live-token gauge reads the scheduler's `inflight_generated_tokens`
-/// aggregate (published once per decode tick) — it NEVER touches per-slot
-/// fields off-thread, so the inference path stays lock-free per token.
 fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // System gauges (non-blocking syscalls).
     ctx.metrics.gpu_utilization_pct.set(@as(u64, metrics.getGpuPct()));
@@ -8370,13 +8434,6 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     ctx.scheduler.queue_mu.unlock(ctx.scheduler.io);
     ctx.metrics.requests_running.set(running);
     ctx.metrics.requests_waiting.set(waiting);
-
-    // Real-time throughput source: completed generation tokens plus the tokens
-    // generated so far by still-decoding slots (the scheduler publishes that
-    // aggregate atomically once per decode tick — race-free, no per-token
-    // write). Non-zero even mid-request, unlike the completion-only counter.
-    const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic);
-    ctx.metrics.generation_tokens_live.set(instr.liveGenerationTokens(ctx.metrics, inflight));
 
     // The other phase. Prompt-token counters and the prefill-time histogram
     // only advance at request COMPLETION, so a long prefill was invisible: GPU
@@ -13166,17 +13223,23 @@ test "generated think tags require an unambiguous literal template opener" {
     try std.testing.expect(templateThinkOpener("assistant") == null);
 }
 
+test "resolveBind: the port is the flag's, else the settings file's, else 12345" {
+    try std.testing.expectEqual(@as(u16, 8080), resolveBind(null, null, 8080).port);
+    try std.testing.expectEqual(@as(u16, 23817), resolveBind(null, 23817, 8080).port);
+    try std.testing.expectEqual(default_port, resolveBind(null, null, default_port).port);
+}
+
 test "resolveBind: no flags bind 127.0.0.1:12345" {
-    const d = resolveBind(null, null);
+    const d = resolveBind(null, null, default_port);
     try std.testing.expectEqualStrings("127.0.0.1", d.host);
     try std.testing.expectEqual(@as(u16, 12345), d.port);
-    const e = resolveBind("0.0.0.0", 23817);
+    const e = resolveBind("0.0.0.0", 23817, default_port);
     try std.testing.expectEqualStrings("0.0.0.0", e.host);
     try std.testing.expectEqual(@as(u16, 23817), e.port);
-    const p = resolveBind(null, 23817);
+    const p = resolveBind(null, 23817, default_port);
     try std.testing.expectEqualStrings("127.0.0.1", p.host);
     try std.testing.expectEqual(@as(u16, 23817), p.port);
-    const h = resolveBind("192.168.7.9", null);
+    const h = resolveBind("192.168.7.9", null, default_port);
     try std.testing.expectEqualStrings("192.168.7.9", h.host);
     try std.testing.expectEqual(@as(u16, 12345), h.port);
 }

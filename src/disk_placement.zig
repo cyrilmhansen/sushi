@@ -150,6 +150,12 @@ pub fn cacheVolume(allocator: std.mem.Allocator) !CacheVolume {
     const base = try defaultBaseDir(allocator);
     defer allocator.free(base);
     const explicit = if (std.c.getenv("SUSHI_PREFIX_CACHE_DIR")) |p| std.mem.span(p).len > 0 else false;
+    return cacheVolumeAt(allocator, base, explicit);
+}
+
+/// An explicit `base` that does not exist is unavailable (no space, no name) rather than the volume of its nearest
+/// existing parent; the default root, created on first write, reports the volume it will land on.
+pub fn cacheVolumeAt(allocator: std.mem.Allocator, base: []const u8, explicit: bool) !CacheVolume {
     var candidate: []const u8 = base;
     var resolved: [std.fs.max_path_bytes]u8 = undefined;
     var real: ?[]const u8 = null;
@@ -935,6 +941,33 @@ test "cache volume: statfs names the filesystem mounted at root" {
     var st: DarwinStatfs = undefined;
     try testing.expectEqual(@as(c_int, 0), statfs("/", &st));
     try testing.expectEqualStrings("/", std.mem.sliceTo(&st.f_mntonname, 0));
+}
+
+test "cache volume: an existing root names its volume; a missing explicit root is unavailable, a missing default is not" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+
+    const here = try cacheVolumeAt(a, root, true);
+    defer here.deinit(a);
+    try testing.expectEqualStrings(root, here.path);
+    try testing.expect(here.name != null and here.space != null);
+
+    const missing = try std.fmt.allocPrint(a, "{s}/not/yet", .{root});
+    defer a.free(missing);
+    const gone = try cacheVolumeAt(a, missing, true);
+    defer gone.deinit(a);
+    try testing.expectEqualStrings(missing, gone.path);
+    try testing.expect(gone.name == null and gone.space == null);
+
+    const later = try cacheVolumeAt(a, missing, false);
+    defer later.deinit(a);
+    try testing.expectEqualStrings(missing, later.path);
+    try testing.expectEqualStrings(here.name.?, later.name.?);
+    try testing.expect(later.space != null);
 }
 
 test "volumeSpace: free is what the OS grants, never statfs' f_bavail" {

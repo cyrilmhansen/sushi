@@ -654,6 +654,8 @@ test "prefix cache admin: renderList: a loaded model's namespace carries its tie
     const root = parsed.value.object;
     try testing.expectEqual(@as(i64, 30), root.get("total_bytes").?.integer);
     try testing.expectEqual(@as(i64, 9), root.get("volume").?.object.get("free_bytes").?.integer);
+    try testing.expectEqualStrings("test-volume", root.get("volume").?.object.get("name").?.string);
+    try testing.expectEqualStrings("/cache", root.get("volume").?.object.get("path").?.string);
     const rows = root.get("namespaces").?.array.items;
     try testing.expectEqualStrings("m", rows[0].object.get("model").?.string);
     try testing.expectEqual(@as(i64, 77), rows[0].object.get("tier").?.object.get("written_bytes").?.integer);

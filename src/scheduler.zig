@@ -1170,15 +1170,9 @@ pub const Scheduler = struct {
     /// Metrics sink. Null while metrics are off. Populated from LoadParams, and adopted by the inference thread
     /// (its only writer) once `POST /metrics/enable` publishes one. Read once per REQUEST in `finishSlot`.
     metrics: ?*metrics_mod.Metrics,
-    /// In-flight generated-token aggregate: the sum of `completion_tokens`
-    /// over the slots still decoding, republished by the inference thread once
-    /// per decode tick (O(1) at the tick boundary, NOT per token). The gauge
-    /// sampler reads this race-free to derive a live tok/s — it never touches
-    /// per-slot fields off-thread. Zero when nothing is decoding.
-    inflight_generated_tokens: std.atomic.Value(u64),
     /// Tokens forwarded so far by the prefill currently running on the
-    /// inference thread; 0 when no prefill is in flight. Mirror of
-    /// `inflight_generated_tokens` for the OTHER phase — without it the metrics
+    /// inference thread; 0 when no prefill is in flight. The counterpart of the
+    /// live-token gauge for the OTHER phase — without it the metrics
     /// panel shows nothing while a multi-minute prefill pins the GPU, because
     /// prompt-token counters and prefill-time histograms only advance when the
     /// request finishes. Written per prefill CHUNK, read by the gauge sampler.
@@ -1292,7 +1286,6 @@ pub const Scheduler = struct {
             .orphan_vision_n = 0,
             .prefilling = std.ArrayList(*Slot).empty,
             .metrics = params.metrics,
-            .inflight_generated_tokens = std.atomic.Value(u64).init(0),
             .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
             .inflight_prefill_expected = std.atomic.Value(u64).init(0),
             .requests_prefilling = std.atomic.Value(u64).init(0),
@@ -1606,6 +1599,32 @@ pub const Scheduler = struct {
         for (self.pending.items) |slot| slot.cancelForShutdown();
         for (self.prefilling.items) |slot| slot.cancelForShutdown();
         for (self.decoding.items) |slot| slot.cancelForShutdown();
+    }
+
+    /// Cancel a single in-flight slot by its request_id (user/dashboard cancellation).
+    /// Returns true if a matching slot was found and cancelled, false otherwise.
+    pub fn cancelSlotById(self: *Scheduler, request_id: u64) bool {
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        for (self.pending.items) |slot| {
+            if (slot.request_id == request_id) {
+                slot.cancel();
+                return true;
+            }
+        }
+        for (self.prefilling.items) |slot| {
+            if (slot.request_id == request_id) {
+                slot.cancel();
+                return true;
+            }
+        }
+        for (self.decoding.items) |slot| {
+            if (slot.request_id == request_id) {
+                slot.cancel();
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Plan 05 Phase D: resolve `id_or_empty` ("" / "sushi" → default)
@@ -2703,6 +2722,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
 
         // 5. Cull finished / errored / cancelled from `decoding`.
         cullDecoding(sch);
+        // A request that ended outside the tick (during prefill, or cancelled) moved the total too.
+        publishLiveTokens(sch.metrics, active.items);
     }
     flushLiveStates(sch, "shutdown");
     flushImatrixCaptures(sch);
@@ -4195,15 +4216,20 @@ fn sumInflightGeneratedTokens(active: anytype) u64 {
     return inflight;
 }
 
+/// Sets the live-token gauge on the thread that finishes slots. The sampler only reads it, so it never sees a
+/// finished slot's tokens in both the total and the in-flight sum.
+fn publishLiveTokens(metrics: ?*metrics_mod.Metrics, active: anytype) void {
+    const m = metrics orelse return;
+    m.generation_tokens_live.set(metrics_mod.liveGenerationTokens(m, sumInflightGeneratedTokens(active)));
+}
+
 pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (active.len == 0) return;
 
-    // Publish the in-flight generated-token aggregate for the gauge sampler.
-    // Runs after the whole tick (all decode work + any finishSlot calls) on
-    // every return path — race-free (inference thread owns these slots' fields)
-    // and O(active), never per token. Finished slots are excluded, so the last
-    // slot's completion drives this to 0 (live == total at rest).
-    defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
+    // Publish the live-token gauge after the whole tick (all decode work + any finishSlot calls) on every
+    // return path: O(active), never per token. Finished slots are excluded, so the last slot's completion
+    // drives the gauge to the total (live == total at rest).
+    defer publishLiveTokens(sch.metrics, active);
 
     // Contention discipline for the spec cost model's kv term: it learns
     // from realized round times, and contention only ever ADDS time. Rather
@@ -5394,6 +5420,28 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
 }
 
+test "the live-token gauge holds a finished slot's tokens once, whenever the sampler reads it" {
+    const StubSlot = struct {
+        completion_tokens: u32,
+        finished: bool = false,
+        error_code: ?[]const u8 = null,
+        cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    };
+    var m = metrics_mod.Metrics.init();
+    var slot = StubSlot{ .completion_tokens = 2576 };
+    var active = [_]*StubSlot{&slot};
+    publishLiveTokens(&m, active[0..]);
+    try testing.expectEqual(@as(u64, 2576), m.generation_tokens_live.load());
+
+    // finishSlot counts the request into the total while the tick is still running.
+    slot.finished = true;
+    m.recordRequest(.success, 0, 0, 0, 10, slot.completion_tokens, 0);
+    try testing.expectEqual(@as(u64, 2576), m.generation_tokens_live.load());
+
+    publishLiveTokens(&m, active[0..]);
+    try testing.expectEqual(@as(u64, 2576), m.generation_tokens_live.load());
+}
+
 pub fn expectOutcomes(m: *const metrics_mod.Metrics, success: u64, cancelled: u64, failed: u64, rejected: u64) !void {
     try testing.expectEqual(success, m.requests_success_total.load());
     try testing.expectEqual(cancelled, m.requests_cancelled_total.load());
@@ -5671,14 +5719,13 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     slot.completion_tokens = 0;
     var sch: Scheduler = undefined;
     sch.force_batched = false;
-    sch.inflight_generated_tokens = std.atomic.Value(u64).init(0);
+    sch.metrics = null;
     var active = [_]*Slot{&slot};
     // The tick's decode checkpoint consumes any MLX error latched before it and errors the slot instead.
     try testing.expect(!mlx.errorPending());
     try testing.expectError(error.SpecDecodeUnsupported, runDecodeTick(&sch, &active));
     try testing.expect(slot.legacy_gen.?.spec_cost_solo);
     try testing.expectEqual(@as(u32, 0), slot.legacy_gen.?.mtp_group_cap);
-    try testing.expectEqual(@as(u64, 0), sch.inflight_generated_tokens.load(.monotonic));
 }
 
 test "planner and batch entry count each pending punctuation token once" {
@@ -6041,6 +6088,39 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
     sch.complete(slot);
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
     try testing.expect(cancelled);
+}
+
+test "cancelSlotById cancels the slot with that id in any queue and no other" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.pending = .empty;
+    sch.prefilling = .empty;
+    sch.decoding = .empty;
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.prefilling.deinit(testing.allocator);
+    defer sch.decoding.deinit(testing.allocator);
+    var slots: [4]Slot = undefined;
+    for (&slots, 1..) |*slot, id| {
+        slot.io = testing.io;
+        slot.request_id = id;
+        slot.cancelled = .init(false);
+        slot.out_mu = .init;
+        slot.out_cond = .init;
+        slot.out_event = .unset;
+    }
+    try sch.pending.append(testing.allocator, &slots[0]);
+    try sch.prefilling.append(testing.allocator, &slots[1]);
+    try sch.decoding.append(testing.allocator, &slots[2]);
+    try sch.decoding.append(testing.allocator, &slots[3]);
+
+    try testing.expect(!sch.cancelSlotById(99));
+    for (&slots) |*slot| try testing.expect(!slot.cancelled.load(.acquire));
+
+    for ([_]u64{ 1, 2, 3 }) |id| {
+        try testing.expect(sch.cancelSlotById(id));
+        for (&slots) |*slot| try testing.expectEqual(slot.request_id <= id, slot.cancelled.load(.acquire));
+    }
 }
 
 test "a shutdown drain ends a queued request with an error, a client disconnect still ends it as done" {

@@ -64,7 +64,7 @@ pub var prefill_chunk_explicit: bool = false;
 
 /// Set once by the serve CLI before request construction. Direct callers may
 /// override it through InitOptions; exact remains the library default.
-pub var mtp_acceptance_default: mtp_acceptance.Mode = .exact;
+pub var mtp_acceptance_default: mtp_acceptance.Mode = model_settings.default_mtp_acceptance;
 /// `--mtp-typical` / `--mtp-tokenv3` chose the default above.
 pub var mtp_acceptance_explicit: bool = false;
 
@@ -2203,7 +2203,7 @@ pub const Generator = struct {
                 pos = end;
                 n_chunks += 1;
                 // Publish progress once per chunk — same cadence discipline as
-                // `inflight_generated_tokens` (once per decode tick), never per token.
+                // the live-token gauge (once per decode tick), never per token.
                 if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
                 // Persist this chunk now: the KV bytes for [0, pos) are final.
                 if (options.write_through_hook) |wt| {
@@ -5382,7 +5382,7 @@ test "terminal-checked MTP serial step never forwards EOS or an uncommitted succ
     // trunk. EOS must be checked before the only forward in that serial tick.
     const eos_token: u32 = 151645;
     const eos_stopped = tokenStops(eos_token, &eos, &pad);
-    if (Generator.mtpSerialForwardAllowed(eos_stopped)) {
+    if (mtpSerialForwardAllowed(eos_stopped)) {
         generated += 1;
         forwarded += 1;
     }
@@ -5393,17 +5393,17 @@ test "terminal-checked MTP serial step never forwards EOS or an uncommitted succ
     // its sampled successor is still outside the trunk until its own check.
     const ordinary: u32 = 42;
     const ordinary_stopped = tokenStops(ordinary, &eos, &pad);
-    if (Generator.mtpSerialForwardAllowed(ordinary_stopped)) {
+    if (mtpSerialForwardAllowed(ordinary_stopped)) {
         generated += 1;
         forwarded += 1;
     }
     try testing.expectEqual(@as(usize, 64149), generated);
     try testing.expectEqual(generated, forwarded);
 
-    try testing.expect(Generator.mtpSerialCheckedEntryClean(false, false));
-    try testing.expect(!Generator.mtpSerialCheckedEntryClean(true, false));
-    try testing.expect(!Generator.mtpSerialCheckedEntryClean(false, true));
-    try testing.expect(!Generator.mtpSerialCheckedEntryClean(true, true));
+    try testing.expect(mtpSerialCheckedEntryClean(false, false));
+    try testing.expect(!mtpSerialCheckedEntryClean(true, false));
+    try testing.expect(!mtpSerialCheckedEntryClean(false, true));
+    try testing.expect(!mtpSerialCheckedEntryClean(true, true));
 
     // The old ordering's two speculative forwards: the sampled EOS itself,
     // then its successor from the resulting logits.

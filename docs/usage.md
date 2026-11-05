@@ -13,12 +13,14 @@ curl -L https://github.com/beamivalice/sushi/releases/latest/download/sushi-bin-
 ```
 
 The release tarball also holds `sushibar`, a menu bar item for the server: run `sushibar [--port N]` and it detaches from
-the terminal. The title is the live decode tok/s (dim for the last request's once idle). Its menu opens on a status
+the terminal. The title is the live decode tok/s while a request generates (the icon alone when idle), beside a menu bar icon
+that is filled while a server answers. Its menu opens on a status
 card (model, memory, decode, prefill and GPU numbers, a five-minute decode graph) and then starts or stops the server
-on the watched port (asking first for one it did not start), switches the port (pick a listening server or type a number in the field; the choice is remembered; `--port`
-wins, then sushi's default 12345), checks for and installs updates (Homebrew installs get a Copy "brew upgrade sushi"
-item; a running sushibar never blocks `sushi update` and restarts itself on the new version), and opens the
-dashboard, chat, Models and Settings pages (⌘1-⌘4).
+on the watched port (asking first for one it did not start; Start loads again the model the server last had, and with none known the card links to the Models page; a Stop that has not taken after 15 s offers Force Stop), switches the port (the default port first, then the ports you added by typing one; hover an added port and click its x to forget it; a server on a port you never added is not listed; the choice is remembered; `--port` wins, then the default port,
+`server.port` in Settings, 12345 unless changed), opens the dashboard, chat, Models and Settings pages (⌘1-⌘4), and ends with a row of
+three buttons: Log (a window that follows the watched server's log live, with Find and a "New lines" button when you scrolled up), Update (Check, which shows Checking… and then
+Up to date, Retry or an orange Update while the menu stays open; with a model loaded it asks before restarting the server; Homebrew installs get an Upgrade button that copies `brew upgrade sushi`; a running sushibar never
+blocks `sushi update` and restarts itself on the new version) and Quit (⌘Q; servers it started keep running, hold ⌥ for Quit & Stop). The card says why a server is stopped, hung, locked or unable to start, an orange dot on the icon marks a server that does not answer, wants a key, lost its port or exited on its own, and a note in the menu opens the log. A server started with `--api-key` or `--api-key-env` is read with its own key. sushibar polls every second while a request runs or the menu is open, and every 5 s (10 s with no server) otherwise.
 
 A browser download is quarantined: clear it with `xattr -dr com.apple.quarantine sushi-macos-arm64`. GPU memory and the
 largest context per Mac: [README, Memory](../README.md#memory).
@@ -35,7 +37,7 @@ A file is kept by content, never by size: a finished pull leaves `.sushi-pull.js
 file's size and checksum: sha256 for a large file, the git blob id for a small one) and the next pull skips a file only
 when the repo lists the same checksum. A folder without the manifest (an older sushi, a copy by hand) is hashed once
 (`checking N files already on disk…`) and only the files that differ download. Each download is checked against its
-checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A file the last manifest
+checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A `.partial` resumes only under its `.partial.oid` key (the checksum and size it was started for); a partial with another key, or none, is deleted and the file starts from zero. A file the last manifest
 listed that the repo no longer has is removed; nothing else in the folder is touched. `sushi run` still uses a present
 local copy without contacting Hugging Face.
 
@@ -61,7 +63,24 @@ publishes a higher revision of a pack you have downloaded, `sushi list` prints, 
 `update available: 2.0 (you have 1.0) — sushi pull deepseek-v4.1-flash`. Nothing is printed when the pack is current,
 when its repo is not known (a folder that is neither a catalog pack nor pulled by `sushi pull`) or when Hugging Face
 cannot be reached or answers 404 (a private repo needs `HF_TOKEN`). The server asks the same once after a model loads and
-then once a day, unless `--no-update-check`.
+then once a day (each answer is kept in `~/.sushi/pack-update-check.json`, so a restart inside a day asks nothing),
+unless `--no-update-check` or the Settings page's pack check is off.
+
+### Downloading from the web page
+
+The web page's **Models** tab (Cmd+3) does the same in the browser: its **Available** list (`/downloads`) shows every
+Sushi pack published on Hugging Face (the ones this build knows, and any newer public `-Sushi-` repo of `beamster`) with
+its size, marks the pack `sushi list` recommends for this Mac's memory, says "Needs N GB" for one above it (still
+downloadable, after a confirm), and shows which are downloaded, partly downloaded or have an update. Download saves into
+the models folder of the Settings tab (`--model-dir` when given, else `server.models_dir`, else `~/.sushi/models`) under
+`beamster/<repo>`, after checking the free space: a pack that would leave less than a twentieth of the disk (at least 4
+GiB) is refused, one that leaves under a tenth free warns. Update replaces a downloaded pack in its own folder, after
+you unload it. A running download shows a progress bar, the file in flight, speed and time left. Stop keeps what is
+downloaded: Resume continues from it, also after the server restarts. A finished pack appears in the Installed list at
+once (Open takes you there), ready to load. A small dot on the Models tab marks a pack (or an update) this browser has
+not listed before; under `--no-update-check` the page asks Hugging Face only while the list is open. From another
+machine a download needs the server's `--api-key`. Downloads use `sushi pull`'s checks; a pack is never deleted from the
+page.
 
 ## Recommended launch
 
@@ -202,12 +221,12 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
 
 ## Coding agents
 
-With the server running, `sushi launch <agent>` starts claude, pi, omp, opencode, codex, grok, hermes or aider against it:
+With the server running, `sushi launch <agent>` starts claude, pi, omp, opencode, dsh (DeepSeek Harness), codex, grok, hermes or aider against it:
 
 ```bash
 sushi launch omp
 ```
 
-pi, omp, codex, grok and hermes run from their own home under `~/.sushi/<agent>/`, so your usual config is untouched;
+pi, omp, codex, grok and hermes run from their own home under `~/.sushi/<agent>/`, so your usual config is untouched; dsh keeps your `~/.dsh` profile as it is and gets sushi's provider as an extra `--patch` layer (`~/.sushi/dsh/patch.yml`);
 claude, opencode and aider reach the server through environment variables. `--print` writes the config and prints the
 launch script instead of running it.

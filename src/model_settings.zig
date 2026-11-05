@@ -6,6 +6,7 @@
 const std = @import("std");
 const kv_quant = @import("kv_quant.zig");
 const log = @import("log.zig");
+const default_port = @import("default_port.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 
 /// Where a load's value for one key came from. A request's own field outranks all of them.
@@ -43,6 +44,13 @@ pub const think_penalty_max: f32 = 20;
 pub fn launchFlag(comptime T: type, value: T, explicit: bool) ?T {
     return if (explicit) value else null;
 }
+
+/// What a load picks for a key with no flag and no file value; the load sites and the settings API read these.
+pub const default_mtp = true;
+pub const default_mtp_acceptance: mtp_acceptance.Mode = .exact;
+pub const default_mtp_greedy_tail = false;
+pub const default_preserve_thinking = true;
+pub const default_think_penalty: f32 = 0;
 
 /// The manual context: `--ctx-size` > `ctx_size` > auto. 0 = auto, i.e. not given, on both sides.
 pub fn contextPick(flag: u32, setting: u32) Pick(u32) {
@@ -179,11 +187,13 @@ pub const Override = struct {
     think_penalty: ?f32 = null,
     logit_bias_file: ?@import("logit_bias.zig").FilePath = null,
     vision: ?bool = null,
+    /// The omitted-`max_tokens` budget. In a defaults row, 0 = the rest of the window.
+    max_tokens: ?u32 = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
             o.mtp_acceptance == null and o.mtp_greedy_tail == null and o.ssd_budget_gb == null and o.ssd_prefetch == null and o.preserve_thinking == null and
-            o.think_penalty == null and o.logit_bias_file == null and o.vision == null;
+            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.max_tokens == null;
     }
 };
 
@@ -260,6 +270,9 @@ fn fromValue(v: std.json.Value) Override {
         .bool => |b| o.vision = b,
         else => {},
     };
+    if (obj.get("max_tokens")) |g| if (accepts("max_tokens", g)) {
+        o.max_tokens = @intCast(g.integer);
+    };
     if (obj.get("logit_bias_file")) |path_value| switch (path_value) {
         .string => |path| o.logit_bias_file = @import("logit_bias.zig").FilePath.from(path),
         else => {},
@@ -291,6 +304,14 @@ pub fn load(alloc: std.mem.Allocator, io: std.Io, path: []const u8) Settings {
     };
 }
 
+/// The port a server binds and a client targets without `--port`: the file's `server.port`, else the built-in one.
+pub fn defaultPort(alloc: std.mem.Allocator, io: std.Io) u16 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var file = load(alloc, io, defaultPath(&buf));
+    defer file.deinit();
+    return server(&file).port orelse default_port.port;
+}
+
 pub fn defaultPath(buf: []u8) []const u8 {
     const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
     return std.fmt.bufPrint(buf, "{s}/.sushi/model-settings.json", .{home}) catch "";
@@ -302,7 +323,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
     const o = s.lookup(model_path);
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} max_tokens={d}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -314,6 +335,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.preserve_thinking) |p| (if (p) "on" else "off") else "default",
         o.think_penalty orelse 0,
         if (o.vision) |v| (if (v) "on" else "off") else "default",
+        o.max_tokens orelse 0,
     });
     return o;
 }
@@ -346,12 +368,16 @@ pub const model_keys = [_]KeySpec{
     .{ .name = "preserve_thinking", .kind = .bool },
     .{ .name = "think_penalty", .kind = .number, .min = 0, .max = think_penalty_max },
     .{ .name = "vision", .kind = .bool },
+    .{ .name = "max_tokens", .kind = .int, .min = 1, .max = std.math.maxInt(u32) },
 };
 
 /// Server-wide keys, under the file's `"server"` object (a model's key is its absolute path, so the two never meet).
 pub const server_keys = [_]KeySpec{
     .{ .name = "models_dir", .kind = .choice },
     .{ .name = "prefix_cache_disk_gb", .kind = .int, .min = 0, .max = 1 << 20 },
+    .{ .name = "update_check", .kind = .bool },
+    .{ .name = "pack_update_check", .kind = .bool },
+    .{ .name = "port", .kind = .int, .min = 1, .max = 65535 },
 };
 
 pub const server_section = "server";
@@ -464,7 +490,7 @@ pub fn limit(key: []const u8, fit: Fit) Limit {
         l.requires_mtp = true;
         if (l.why.len == 0) l.why = "Used only while MTP is on.";
     }
-    if (eql(u8, key, "ctx_size")) l.max = fit.context_cap;
+    if (eql(u8, key, "ctx_size") or eql(u8, key, "max_tokens")) l.max = fit.context_cap;
     return l;
 }
 
@@ -591,7 +617,18 @@ pub fn writeEdits(alloc: std.mem.Allocator, io: std.Io, link_path: []const u8, s
 pub const Server = struct {
     models_dir: ?[]const u8 = null,
     prefix_cache_disk_gb: ?u32 = null,
+    /// The automatic sushi release check; null = the file says nothing.
+    update_check: ?bool = null,
+    /// The automatic pack revision check.
+    pack_update_check: ?bool = null,
+    /// The port a server binds and the clients target without `--port`.
+    port: ?u16 = null,
 };
+
+/// An automatic network look is on unless `--no-update-check` or the file turns it off.
+pub fn autoCheck(no_update_check: bool, file: ?bool) Pick(bool) {
+    return pick(bool, if (no_update_check) false else null, file, true);
+}
 
 /// The file's `"server"` section. `models_dir` borrows from `self`.
 pub fn server(self: *const Settings) Server {
@@ -611,6 +648,13 @@ pub fn server(self: *const Settings) Server {
     if (sec.get("prefix_cache_disk_gb")) |v| if (v == .integer and v.integer >= 0 and v.integer <= server_keys[1].max) {
         out.prefix_cache_disk_gb = @intCast(v.integer);
     };
+    if (sec.get("update_check")) |v| if (v == .bool) {
+        out.update_check = v.bool;
+    };
+    if (sec.get("pack_update_check")) |v| if (v == .bool) {
+        out.pack_update_check = v.bool;
+    };
+    if (sec.get("port")) |v| out.port = default_port.fromValue(v);
     return out;
 }
 
@@ -663,6 +707,9 @@ pub const LaunchLocks = struct {
     models: [model_keys.len]Lock = @splat(.{}),
     models_dir: Lock = .{},
     prefix_cache_disk_gb: Lock = .{},
+    update_check: Lock = .{},
+    pack_update_check: Lock = .{},
+    port: Lock = .{},
 
     pub fn model(self: *const LaunchLocks, name: []const u8) ?*const Lock {
         for (model_keys, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) return &self.models[i];
@@ -978,6 +1025,28 @@ test "model_settings: validate takes the values the loader reads and names the r
     try t.expectError(error.InvalidSetting, validate(findKey(&server_keys, "prefix_cache_disk_gb").?, .{ .integer = -1 }));
 }
 
+test "model_settings: the update-check keys are booleans, read from the file, and a launch flag outranks the file" {
+    const t = std.testing;
+    for ([_][]const u8{ "update_check", "pack_update_check" }) |name| {
+        const spec = findKey(&server_keys, name).?;
+        try validate(spec, .{ .bool = false });
+        try t.expectError(error.InvalidSetting, validate(spec, .{ .string = "off" }));
+        try t.expectError(error.InvalidSetting, validate(spec, .{ .integer = 0 }));
+    }
+    var s = try parse(t.allocator, "{\"server\":{\"update_check\":false,\"pack_update_check\":\"no\"}}");
+    defer s.deinit();
+    try t.expectEqual(@as(?bool, false), server(&s).update_check);
+    try t.expectEqual(@as(?bool, null), server(&s).pack_update_check);
+
+    try t.expect(autoCheck(false, null).value);
+    try t.expectEqual(Source.default, autoCheck(false, null).source);
+    try t.expect(!autoCheck(false, false).value);
+    try t.expectEqual(Source.model_settings, autoCheck(false, false).source);
+    try t.expect(autoCheck(false, true).value);
+    try t.expect(!autoCheck(true, true).value);
+    try t.expectEqual(Source.flag, autoCheck(true, true).source);
+}
+
 test "model_settings: writeEdits keeps what it does not touch, round-trips through lookup, and removes an emptied section" {
     const t = std.testing;
     const io = t.io;
@@ -1086,4 +1155,44 @@ test "model_settings: refuseEdits: a value or pair the model cannot honour is re
     const resident: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false };
     try t.expect(refuseEdits(resident, held, &.{accept}, &buf) != null);
     try t.expect(refuseEdits(resident, null, &.{accept}, &buf) == null);
+}
+
+test "model_settings: max_tokens is a positive integer the model's window bounds" {
+    const t = std.testing;
+    var s = try parse(t.allocator,
+        \\{"/m/a": {"max_tokens": 4096}, "/m/b": {"max_tokens": 0}, "/m/c": {"max_tokens": -5}, "/m/d": {"max_tokens": "9"}, "/m/e": {"max_tokens": 1.5}}
+    );
+    defer s.deinit();
+    try t.expectEqual(@as(?u32, 4096), s.lookup("/m/a").max_tokens);
+    for ([_][]const u8{ "/m/b", "/m/c", "/m/d", "/m/e" }) |m| try t.expectEqual(@as(?u32, null), s.lookup(m).max_tokens);
+    const fit: Fit = .{ .arch = "x", .streams_experts = false, .has_vision = false, .context_cap = 65536 };
+    try t.expect(applies("max_tokens", fit));
+    try t.expectEqual(@as(u32, 65536), limit("max_tokens", fit).max);
+    var buf: [128]u8 = undefined;
+    const over = refuseEdits(fit, null, &.{.{ .key = "max_tokens", .value = .{ .integer = 65537 } }}, &buf).?;
+    try t.expectEqualStrings("max_tokens", over.key);
+    try t.expect(refuseEdits(fit, null, &.{.{ .key = "max_tokens", .value = .{ .integer = 65536 } }}, &buf) == null);
+    try t.expect((Override{ .max_tokens = 1 }).isEmpty() == false);
+}
+
+test "model_settings: server.port is a whole port from 1 to 65535, anything else is ignored" {
+    const t = std.testing;
+    for ([_]struct { body: []const u8, want: ?u16 }{
+        .{ .body = "{\"server\":{\"port\":8080}}", .want = 8080 },
+        .{ .body = "{\"server\":{\"port\":65535}}", .want = 65535 },
+        .{ .body = "{\"server\":{\"port\":1}}", .want = 1 },
+        .{ .body = "{\"server\":{\"port\":0}}", .want = null },
+        .{ .body = "{\"server\":{\"port\":65536}}", .want = null },
+        .{ .body = "{\"server\":{\"port\":\"8080\"}}", .want = null },
+        .{ .body = "{\"server\":{\"port\":80.5}}", .want = null },
+        .{ .body = "{\"server\":{}}", .want = null },
+        .{ .body = "{}", .want = null },
+    }) |c| {
+        var s = try parse(t.allocator, c.body);
+        defer s.deinit();
+        try t.expectEqual(c.want, server(&s).port);
+    }
+    const spec = findKey(&server_keys, "port").?;
+    try t.expectEqual(@as(f64, 1), spec.min);
+    try t.expectEqual(@as(f64, 65535), spec.max);
 }

@@ -286,6 +286,21 @@ Prefill width:
   code windows within 3%), since the routed trellis GEMM is bound per row, not by its weight decode (wider windows lose, [engine-exl3-experts](engine-exl3-experts.md)). Streamed at
   the default budget, 4096 rows peak at 118.8 GB of 128 and the first chunk of a boot took 17-22 s against 1.7 s at 2048.
 
+<a id="prefill-pipeline"></a>
+Prefill pipeline (`Model.pipe_depth`, 2; load line `[dsv41] prefill pipeline: 2 layers in flight`):
+- A wide layer is submitted, not waited on: no evaluation at the routed sum or the layer's end, the host waits only on
+  the oldest of more than 2 layers in flight, and each chunk drains at its end (`finishPass`, `extendState`), so two
+  chunks never overlap. Streamed experts keep the router readback, which orders every slab refill after the layer
+  before it. Same graphs, so the same bytes: `dsv41 prefill pipeline` compares depths 0 to 3.
+- Measured on 59e7a562 + caee00fe against 59e7a562 (pack revision 2.0, `--ssd-budget-gb 108`, debug log,
+  `taskpolicy -a`, GPU lock, AC, fans max and under 50 C before each boot, one boot an arm, six pipelined boots and six
+  unpipelined boots of the same prefill code interleaved in three rounds; a cold 16,020-token code prompt, then
+  17,890 and 31,524 tokens of new code text): new text 1389 against 1347 tok/s at 17.9k and 1429 against 1394 at 31.5k
+  (means; the last A B B A +1.0% and +1.4%). The cold prompt's steady chunks did not move (9.47 against 9.48 s for
+  chunks 2-8). Greedy tokens and top-5 logprobs of all four requests matched every unpipelined boot.
+- Transient: a 2048-row chunk's `peak - active` rose 3.57 to 3.82 GB (`SUSHI_PREFILL_CHUNK_PEAK`), inside the chunk
+  bill (`chunk + 511` rows at `cap_row_bytes_per_dim`).
+
 Other pieces:
 - A wide chunk's Engram rows are read ahead on a host thread over the whole chunk (`prefetchEngram`). They are
   dequantized at their layer, bit-identical to rows read there.
@@ -332,6 +347,43 @@ After CED and the fused gather-attention (budget 96, chunk 1024, synced stage pr
 - A same-layer read-ahead (the layer's router on the stream before attention, its predicted misses read during attention)
   named 85% of the missed bytes but read 2.5x the fill bytes; live 4k-32k code prefill ran 1-7% slower (on 61daded0, pair-major
   STQ, default budget, one boot each; the fill fell 202 -> 158 ms a 2048-row chunk, the GPU tail rose 601 -> 749), so it was not merged.
+- A pool read-ahead (the next layer's router on the stream entering it, riding this layer's evaluation; the experts
+  at least `max(2, rows/256)` rows name read straight into that layer's pool on a thread, capped at the bytes the last
+  attention window reads) cut a request's misses 9% and read 22% more bytes: 17,890 tokens of new text missed 2,878
+  experts against 3,164 with 999 read ahead (7.7 GB); new-text prefill 1,364 against ~1,359 tok/s at 17.9k and 1,392
+  against ~1,404 at 31.5k (two boots against five of 59e7a562, interleaved, 59e7a562 + 14b4dd2d, pack revision 2.0,
+  `--ssd-budget-gb 108`, `taskpolicy -a`, GPU lock, AC, fans max and under 50 C before each boot; a cold 16,020-token
+  code prompt, then 17,890 and 31,524 tokens of new code text). Same bytes, no gain: not merged.
+- What a 16k prompt reads: on pack revision 2.0 at `--ssd-budget-gb 108` (262 slots a layer of 384) a cold
+  16,020-token code prompt misses 3,356 experts (26.2 GB, 3.1 s of fill at ~8.5 GB/s) and 17,890 tokens of new text
+  3,164 (24.5 GB, 2.8 s), against 0.48 ms a row for the rest of a state-only chunk. Of those misses 2,677 and 2,407
+  are distinct (layer, expert) pairs: a chunk re-reads only ~20-25% of them (the rest each enter the pool once), so a
+  layer-major order that reads each layer's experts once per prompt caps at that share. The other ~2.3 s is the
+  pool's first read of experts it does not hold; the lever there is overlap with compute, not fewer reads.
+- Resident experts first (bde81972 + ccccde10, unmerged): a wide route's experts already in the pool ran their gate
+  and up GEMMs as soon as the misses' scales landed, the pending experts as planes and window segments of their own
+  (`rate_groups.HitSplit`, same bytes: greedy tokens and top-5 logprobs of all four requests in six boots). Before it,
+  each rate group's GEMMs started once that group's misses landed, so they already overlapped the reads of the groups
+  after it; the change only adds the first group's read window. Against 49960372 (pack revision 2.0,
+  `--ssd-budget-gb 108`, one boot an arm, A B B A plus a warm-up pair, `taskpolicy -a`, GPU lock, AC, fans max and
+  under 50 C before each boot): 17,890 tokens of new text 1,405 against 1,391 tok/s (means of three), 31,524 tokens
+  1,439 against 1,417; the A B B A alone +0.6% and +1.4%; the cold prompt's chunks 2-8 9.35 against 9.42 s. Inside
+  the run-to-run spread, and each pending pool doubles its gate and up planes (`[n, inter]` each): not merged. During
+  a layer's fill (~12 ms of reads a state-only 2048-row chunk) the GPU has only that layer's routed GEMMs to run, so
+  overlap inside the layer hides little; reads started before the layer's own route (a read-ahead that names the
+  misses) are what is left.
+- First boot of a binary: Metal compiles the custom kernels on a boot whose system shader cache does not hold them
+  (seen as `[dsv41] kernels warmed ... in` 22-43 s against 10.5-10.8 s when cached). On such a boot the first
+  request also pays up to ~1.3 s in chunk 1 and ~0.47 s in the 31-row pass (655-686 ms against 179-212); a cached boot
+  pays neither, so cold-request comparisons need the same cache state in every arm.
+- A prefill-width load warm (`warmPrefill`: a 2048-row chunk state-only and with its tail, then 31 and 64 rows, on
+  16 distinct token ids; 1f0d3987) removed the 31-row pass's share on an uncached boot (686 -> 212 and 670 -> 202
+  ms) but not chunk 1's: 7 kernel builds of the sorted-route path (`sushi_exl3_sorted_inverse_reduce`, `_rg_combine`,
+  `_mid_swiglu`, `_token_pair_prepare`, `_prepare_h128`, `_finish_h128`) still land in the first request
+  (`SUSHI_KERNEL_BUILD_LOG`), likely because 16 distinct ids never route more experts than a pool holds. It added 3.7-4.0 s to a cached
+  boot's load (14.5 against 10.5-10.8 s). Not merged; the spilled-route warm below replaced it.
+- A process-wide `MLX_MAX_MB_PER_BUFFER=500` (decode included) read 1,366 against ~1,359 tok/s at 17.9k and 1,408
+  against ~1,404 at 31.5k (two boots, 59e7a562): inside the noise.
 
 <a id="oracle"></a>
 ## Oracle and what is proven
@@ -442,6 +494,9 @@ kernels), AC, pack `DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw`:
   `MLX_ENABLE_TF32=0`): to-first-EOS 0.18575 (88.51% top-1, 7775 positions) against the recorded 0.1843 (published) and
   0.1853 (same-binary live check); per category code 0.0352, math 0.0593, reasoning 0.1158, design 0.1651, wikitext 0.2815,
   multilingual 0.2736, story 0.4878, stem 0.0963.
+- Pack revision 2.0 (8-category fixture, the settings above, release binary `62184462` at `75996eda`): to-first-EOS 0.15760
+  (89.13% top-1, 7775 positions); code 0.0284, math 0.0480, reasoning 0.0897, design 0.1468, wikitext 0.2545,
+  multilingual 0.2349, story 0.4052, stem 0.0786.
 
 `SUSHI_DSV41_COMPOSED=1` (a diagnostic, read at load) runs the op chains instead and the load logs
 `[dsv41] fused kernels on|off`: the teacher arm of the KLD A/B. The hyper-connection kernels run at 1024 threads a
@@ -854,6 +909,9 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   speed of the two runs is not comparable (a cold page cache slowed the branch's first 7 turns). After a clean shutdown and a boot
   the last prompt restored 176113 of 180308 tokens from SSD on both; after `kill -9` the branch restored the same point (the
   shutdown flush's), main its prompt-end point.
+- **Write cost in daily agent use** (one server's log, default flags, `[dsv41-prefix] ... GB staged` summed per boot): 1.4.x
+  wrote 120.2 GB over 1215 turns (101 MB a turn, prompt median 219k; 150-376 MB a turn in sessions at 230-420k), 1.5.0-dev1
+  (`f7da31aa`) 2.7 GB over 331 turns (9 MB a turn, median 107k). The contexts differ; the A/B above is the matched reading.
 - **The live record reaches SSD only when the state is about to be lost** (`HotPrefixCache.flushLiveDsv41`, inference
   thread): another conversation's lookup that does not roll back, a model unload, an idle queue for 300 s
   (`live_flush_idle_secs`) and a clean shutdown write every point of the record that is not on SSD yet (up to 8: the
@@ -1024,6 +1082,14 @@ The f16 attention arm's KLD run (the kernel is in, `Model.attn_f16` off); the li
   the attention split count were template args, so a context under 512 tokens (the ratio-1 layers' top-k width grows
   every token) or a new prompt length built new libraries. They are read at run time now. Row counts of 1..16 stay
   template args of the row kernels (register tiles), so the load runs every decode width and DSpark verify width once,
-  then a CED chunk of 256 rows and a 42-row chunk, on a throwaway state (`dsv41_model.warmKernels`, logged `[dsv41]
-  kernels warmed ... in N ms`); after it nothing compiles but the streamed index top-k past 32k keys
-  (`dsv41 kernels:` tests, `SUSHI_KERNEL_BUILD_LOG=1`).
+  then a CED chunk of 256 rows, a 42-row chunk and the 31-row held-back span, on a throwaway state
+  (`dsv41_model.warmKernels`, logged `[dsv41] kernels warmed ... in N ms`), then a spilled route's prefill chain at
+  the prefill width over one layer's own pools on rows of zeros (`StqStream.warmSplit`: no read, no cache change); after
+  it nothing compiles but the streamed index top-k past 32k keys (`dsv41 kernels:` tests, `SUSHI_KERNEL_BUILD_LOG=1`).
+- On a boot whose shader cache does not hold the kernels, the first long prompt compiled 11 libraries before the
+  spilled-route warm and the 31-row span (the 7 of the spilled chain in chunk 1, 4 sorted GEMMs in the 31-row pass)
+  and none after it. f000eb90 + this warm against 49960372 (pack revision 2.0, `--ssd-budget-gb 108`, `taskpolicy -a`,
+  GPU lock, AC, fans max and under 50 C before each boot, uncached boots): a cold 16,020-token code prompt 1,357 tok/s
+  against 1,179-1,313 (six boots, mean 1,243), chunk 1 2,026 ms against 2,081-3,382, the 31-row pass 188 ms against
+  646-664; the same greedy tokens and top-5 logprobs on all four requests. The warm adds 0.2-0.5 s on a cached boot
+  (10.9 s against 10.4-10.8 s, one cached boot) and the same on an uncached one (38.9 against 37.6-38.1 s).

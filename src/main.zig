@@ -124,8 +124,8 @@ fn printUsage(io: std.Io) void {
         \\  serve               Start the server over ~/.sushi/models
         \\                      (every pulled model loads on demand by name)
         \\  launch <agent>      Configure + launch a coding agent CLI against the
-        \\                      local server (claude, pi, omp, opencode, codex,
-        \\                      hermes, aider, zcode, grok). `sushi launch <agent> -h`
+        \\                      local server (claude, pi, omp, opencode, dsh,
+        \\                      codex, hermes, aider, zcode, grok). `sushi launch <agent> -h`
         \\                      for options
         \\  kld capture|compare Write a teacher fixture (full-vocab logits at
         \\                      every greedy position), or teacher-force one
@@ -165,7 +165,8 @@ fn printUsage(io: std.Io) void {
         \\  --serve             Start HTTP server mode
         \\  --host <ip>         Bind address (default: 127.0.0.1 — this Mac only;
         \\                      0.0.0.0 opens it to the local network)
-        \\  --port <n>          Bind port (default: 12345)
+        \\  --port <n>          Bind port (default: 12345, or `server.port` in
+        \\                        ~/.sushi/model-settings.json)
         \\  --ctx-size <n>      Maximum context length (default: model max)
         \\  --config-overrides <json>   JSON object deep-merged into EVERY
         \\                      model's config.json this process loads or
@@ -426,18 +427,35 @@ fn printUsage(io: std.Io) void {
     stdout_w.interface.flush() catch {};
 }
 
+/// False for the commands and flags that never touch MLX, so they do not wake Metal.
+fn commandUsesGpu(proc_args: std.process.Args) bool {
+    var it = std.process.Args.Iterator.init(proc_args);
+    _ = it.next();
+    var first = true;
+    while (it.next()) |a| {
+        if (first and (std.mem.eql(u8, a, "pull") or std.mem.eql(u8, a, "list") or std.mem.eql(u8, a, "launch") or
+            std.mem.eql(u8, a, "repack") or std.mem.eql(u8, a, "update"))) return false;
+        first = false;
+        if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "--guest-manifest") or
+            std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return false;
+    }
+    return true;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
     metrics_history.process.markStarted(io, io_util.nowMs(io));
 
     // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
-    // above every subcommand branch — a per-serve-path call is how
+    // above every GPU subcommand branch — a per-serve-path call is how
     // `runHeadlessServe` (the mode the app always launches) silently ate the
     // launch flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
-    server_mod.applyMlxCacheLimit();
-    server_mod.resolveMlxCadence();
+    if (commandUsesGpu(init.minimal.args)) {
+        server_mod.applyMlxCacheLimit();
+        server_mod.resolveMlxCadence();
+    }
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
 
@@ -1024,7 +1042,10 @@ pub fn main(init: std.process.Init) !void {
         log.err("--prompt/-p cannot be combined with serve, --serve, --host, --port, or --tool on; it uses a private local listener and exits after one reply.\n", .{});
         return error.PromptModeConflict;
     }
-    const bind = server_mod.resolveBind(host_flag, if (prompt != null or bench_run != null) @as(u16, 0) else port_flag);
+    const bind = if (prompt != null or bench_run != null)
+        server_mod.resolveBind(host_flag, 0, server_mod.default_port)
+    else
+        server_mod.resolveBind(host_flag, port_flag, model_settings_mod.defaultPort(allocator, io));
     const host = bind.host;
     const port = bind.port;
 
@@ -1052,6 +1073,8 @@ pub fn main(init: std.process.Init) !void {
         .mtp = if (mtp_explicit) enable_mtp else null,
         .vision = if (vision) true else if (no_vision) false else null,
         .models_dir = models_root,
+        .no_update_check = no_update_check,
+        .port = port_flag,
     });
     if (dflash_mod.drafter_min_depth) |lo| if (dflash_mod.drafter_max_depth) |hi| if (lo > hi) {
         log.err("--drafter-min-depth {d} is above --drafter-max-depth {d}\n", .{ lo, hi });
@@ -1154,8 +1177,15 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer log.closeFile();
-    if (serve_mode and prompt == null and bench_run == null) update_mod.startDailyCheck(io, no_update_check);
-    cli_mod.configurePackUpdates(io, serve_mode and prompt == null and bench_run == null and !no_update_check);
+    {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var file = model_settings_mod.load(allocator, io, model_settings_mod.defaultPath(&path_buf));
+        defer file.deinit();
+        const srv = model_settings_mod.server(&file);
+        const serving = serve_mode and prompt == null and bench_run == null;
+        if (serving) update_mod.startDailyCheck(io, no_update_check, srv.update_check);
+        cli_mod.configurePackUpdates(io, serving and !no_update_check, model_settings_mod.autoCheck(no_update_check, srv.pack_update_check).value);
+    }
 
     if (parent_pid) |pid| {
         parent_watch.start(pid) catch |err| {
@@ -1854,7 +1884,7 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
 /// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
-fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8 }) void {
+fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool, port: ?u16 = null }) void {
     const locks = &model_settings_mod.launch_locks;
     if (given.ctx_size > 0) locks.modelMut("ctx_size").pin("{d}", .{given.ctx_size});
     if (given.kv_quant) |q| locks.modelMut("kv_quant").pin("{s}", .{q});
@@ -1865,12 +1895,18 @@ fn pinLaunchFlags(given: struct { mtp_acceptance_flag: ?[]const u8, ctx_size: u3
     if (model_mod.ssd_prefetch) |p| locks.modelMut("ssd_prefetch").pin("{d}", .{p});
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
+    if (serve_default_max_tokens > 0) locks.modelMut("max_tokens").pin("{d}", .{serve_default_max_tokens});
     if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
     if (server_mod.prefix_cache_disk_explicit) {
         var size_buf: [32]u8 = undefined;
         locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_mod.prefix_cache_disk_bytes)});
     }
     if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
+    if (given.port) |p| locks.port.pin("{d}", .{p});
+    if (given.no_update_check) {
+        locks.update_check.pin("--no-update-check", .{});
+        locks.pack_update_check.pin("--no-update-check", .{});
+    }
 }
 
 fn flagInt(comptime T: type, flag: []const u8, text: []const u8, min: T) T {
@@ -1932,4 +1968,26 @@ test "both boot modes build their server defaults from the same launch flags" {
     const none = unset.serverConfig();
     try std.testing.expectEqual(@as(?f32, null), none.default_temperature);
     try std.testing.expectEqual(@as(?u32, null), none.default_top_k);
+}
+
+test "launch flags: --port pins server.port as typed, and no flag leaves it free" {
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    model_settings_mod.launch_locks = .{};
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.port.set);
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false, .port = 8080 });
+    try std.testing.expectEqualStrings("8080", model_settings_mod.launch_locks.port.text());
+}
+
+test "launch flags: --no-update-check pins both automatic update checks, and no flag pins neither" {
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    model_settings_mod.launch_locks = .{};
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.update_check.set);
+    try std.testing.expect(!model_settings_mod.launch_locks.pack_update_check.set);
+    pinLaunchFlags(.{ .mtp_acceptance_flag = null, .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = true });
+    try std.testing.expectEqualStrings("--no-update-check", model_settings_mod.launch_locks.update_check.text());
+    try std.testing.expectEqualStrings("--no-update-check", model_settings_mod.launch_locks.pack_update_check.text());
 }

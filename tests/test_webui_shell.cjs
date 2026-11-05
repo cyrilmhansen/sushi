@@ -26,7 +26,7 @@ function makeServer({ metrics = 200, loaded = true, down = false, apiKey = null 
   const json = (body, status = 200) => ({ status, contentType: 'application/json', body: JSON.stringify(body) });
   async function handle(route) {
     const request = route.request(), url = new URL(request.url()), p = url.pathname;
-    if (/^\/(chat|dashboard|models|settings)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
+    if (/^\/(chat|dashboard|models|settings|downloads)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
     calls.push({ path: p, method: request.method() });
     if (apiKey && request.headers().authorization !== `Bearer ${apiKey}`) return route.fulfill(json({ error: { message: 'bad key' } }, 401));
     if (down) return route.abort();
@@ -37,6 +37,7 @@ function makeServer({ metrics = 200, loaded = true, down = false, apiKey = null 
       case '/v1/tools': return route.fulfill(json({ edit_default: false }));
       case '/v1/settings': return route.fulfill(json({ file: '/h/f.json', model_keys: [], applies: 'x', server: { models_dir: { default: '/d', boot_roots: ['/m'], file: null, flag: '', locked: false }, prefix_cache_disk_gb: { file: null, locked: false, effective_bytes: 2 ** 30 } }, models: [] }));
       case '/v1/prefix-cache': return route.fulfill(json({ root: '/c', volume: null, total_bytes: 0, namespaces: [] }));
+      case '/v1/downloads': return route.fulfill(json({ ram_bytes: 64 * 2 ** 30, ram_gb: 64, dest: { path: '/m', source: 'default', locked: false, volume: 'Disk', free_bytes: 2 ** 40, total_bytes: 2 ** 41 }, catalog: 'ready', refreshing: false, packs: [{ repo: 'beamster/A-Sushi-2bpw', name: 'a', tag: '2bpw', size_bytes: 2 ** 34, tier_gb: 48, fits: true, recommended: true, installed: false, path: null, partial_bytes: null, update: null, launch: null }], jobs: [] }));
       case '/metrics.json': return metrics === 200 ? route.fulfill(json({ counters: {}, gauges: {}, histograms: {}, sessions: [] })) : route.fulfill(json({ error: { message: 'off' } }, metrics));
       case '/metrics/enable': return route.fulfill(json({ metrics: true }));
       default: return route.fulfill(json({}, 404));
@@ -73,7 +74,7 @@ async function main() {
     {
       // The phone: nothing scrolls sideways on any tab, and the More menu holds the view and theme switches.
       const server = makeServer();
-      for (const view of ['/chat', '/dashboard', '/models', '/settings']) {
+      for (const view of ['/chat', '/dashboard', '/models', '/settings', '/downloads']) {
         const { page, context } = await open(browser, server, view, { viewport: PHONE, mode: 'advanced' });
         await page.waitForTimeout(500);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), 390, `${view} fits 390 px`);
@@ -111,9 +112,9 @@ async function main() {
     for (const viewport of [{ width: 1440, height: 900 }, { width: 2000, height: 1050 }]) {
       // Heading and content share one left edge on the tabs that use the page frame.
       const server = makeServer();
-      for (const view of ['/dashboard', '/models', '/settings']) {
+      for (const view of ['/dashboard', '/models', '/settings', '/downloads']) {
         const { page, context } = await open(browser, server, view, { viewport });
-        await page.waitForSelector(`${view === '/dashboard' ? '#dashPanel' : view === '/models' ? '#modelsPanel' : '#settingsPanel'} .page-head h1`);
+        await page.waitForSelector(`#${{ '/dashboard': 'dashPanel', '/models': 'modelsPanel', '/settings': 'settingsPanel', '/downloads': 'modelsPanel' }[view]} .page-head h1`);
         await page.waitForTimeout(400);
         const edges = await page.evaluate(() => {
           const panel = [...document.querySelectorAll('.panel')].find((p) => !p.hidden);
@@ -130,7 +131,7 @@ async function main() {
       // The type scale: the sizes on screen are the seven of the design system (plus chat markdown headings).
       const allowed = new Set([11, 12, 13, 15, 17, 22, 28]);
       const server = makeServer();
-      for (const [view, mode] of [['/chat', 'advanced'], ['/dashboard', 'advanced'], ['/dashboard', 'compact'], ['/models', 'advanced'], ['/settings', 'advanced']]) {
+      for (const [view, mode] of [['/chat', 'advanced'], ['/dashboard', 'advanced'], ['/dashboard', 'compact'], ['/models', 'advanced'], ['/settings', 'advanced'], ['/downloads', 'advanced']]) {
         const { page, context } = await open(browser, server, view, { mode });
         await page.waitForTimeout(700);
         const sizes = await page.evaluate(() => {
@@ -216,19 +217,21 @@ async function main() {
     }
 
     {
-      // The landing view is the Dashboard, and the top bar lists Dashboard, Chat, Models, Settings.
+      // The landing view is the Dashboard, and the top bar lists Dashboard, Chat, Models, Settings, each with its icon.
       const { page, context } = await open(browser, makeServer(), '/');
       await page.waitForSelector('#dashPanel:not([hidden])');
       assert.equal(await page.getAttribute('#navDashboard', 'aria-current'), 'page', 'the root shows the Dashboard');
       assert.equal(await page.evaluate(() => document.getElementById('chatPanel').inert), true);
       assert.deepEqual(await page.$$eval('#viewNav a', (links) => links.map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings']);
+      const shown = (p) => p.$$eval('#viewNav a', (links) => links.map((a) => [a.getAttribute('aria-label'), !!a.querySelector('.nav-i')?.getBoundingClientRect().width, !!a.querySelector('.nav-l')?.getBoundingClientRect().width]));
+      assert.deepEqual(await shown(page), [['Dashboard', true, true], ['Chat', true, true], ['Models', true, true], ['Settings', true, true]], 'icon and label on a wide screen');
       await page.click('#navChat');
       assert.equal(new URL(page.url()).pathname, '/chat');
       await page.goBack();
       assert.equal(await page.getAttribute('#navDashboard', 'aria-current'), 'page', 'Back from the chat returns to the Dashboard');
       await context.close();
       const phone = await open(browser, makeServer(), '/', { viewport: PHONE });
-      assert.deepEqual(await phone.page.$$eval('#viewNav a', (links) => links.filter((a) => a.offsetParent).map((a) => a.textContent)), ['Dashboard', 'Chat', 'Models', 'Settings'], 'same order on a phone');
+      assert.deepEqual(await shown(phone.page), [['Dashboard', true, false], ['Chat', true, false], ['Models', true, false], ['Settings', true, false]], 'same order on a phone, as icons named by their labels');
       await phone.context.close();
     }
 
@@ -245,6 +248,8 @@ async function main() {
       assert.equal(at(), '/models', 'Cmd+3 works while typing in the prompt');
       await page.keyboard.press('Control+4');
       assert.equal(at(), '/settings', 'Ctrl+4 works too');
+      await page.keyboard.press('Meta+5');
+      assert.equal(at(), '/settings', 'Cmd+5 is no tab');
       await page.keyboard.press('Meta+1');
       assert.equal(at(), '/dashboard', 'Cmd+1 returns to the Dashboard');
       await page.keyboard.press('Meta+Shift+2');
@@ -330,12 +335,17 @@ async function main() {
     }
 
     {
-      // The top bar fits a 320 px phone.
+      // The top bar fits a 320 px phone, and so does the Models head with its Installed | Available switch.
       const { page, context } = await open(browser, makeServer(), '/chat', { viewport: { width: 320, height: 640 } });
       await page.waitForSelector('#modelSelect option', { state: 'attached' });
       await page.waitForTimeout(300);
-      const fit = await page.evaluate(() => ({ doc: document.documentElement.scrollWidth, more: document.getElementById('moreButton').getBoundingClientRect().right }));
-      assert.ok(fit.doc <= 320 && fit.more <= 320, `top bar fits 320 px (${JSON.stringify(fit)})`);
+      const fit = await page.evaluate(() => ({ doc: document.documentElement.scrollWidth, more: document.getElementById('moreButton').getBoundingClientRect().right, nav: [...document.querySelectorAll('#viewNav a')].map((a) => a.getBoundingClientRect().right <= 320) }));
+      assert.ok(fit.doc <= 320 && fit.more <= 320 && fit.nav.every(Boolean), `top bar fits 320 px (${JSON.stringify(fit)})`);
+      await page.click('#navModels');
+      await page.click('#modelsTabAvailable');
+      await page.waitForSelector('.dl-row');
+      const head = await page.evaluate(() => ({ doc: document.documentElement.scrollWidth, tabs: document.getElementById('modelsTabs').getBoundingClientRect().right, spill: [...document.querySelectorAll('#modelsPanel .page-head *')].filter((n) => n.offsetParent && n.getBoundingClientRect().right > 320.5).map((n) => n.id || n.className) }));
+      assert.ok(head.doc <= 320 && head.tabs <= 320 && head.spill.length === 0, `Models head fits 320 px (${JSON.stringify(head)})`);
       await context.close();
     }
 

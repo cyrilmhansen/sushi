@@ -28,6 +28,8 @@ const repl_input = @import("repl_input.zig");
 const update = @import("update.zig");
 const hf_pull = @import("hf_pull.zig");
 const pack_update = @import("pack_update.zig");
+const download_progress = @import("download_progress.zig");
+const model_settings = @import("model_settings.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 
@@ -116,6 +118,10 @@ pub const Alias = struct {
     /// Installed RAM, in GB, from which `sushi list` recommends the pack (the largest such pack of a
     /// family at or under the machine's RAM); 0 = never recommended.
     recommend_gb: u32 = 0,
+    /// Its experts always stream from the SSD (DeepSeek): `tier_gb` is the memory it streams from, not "in memory".
+    streams_experts: bool = false,
+    /// The flags of the pack's recommended `sushi serve --model <pack>` in docs/usage.md.
+    serve_flags: []const u8 = "",
 };
 
 /// The Hugging Face org every `pull` and `run` download comes from.
@@ -126,25 +132,25 @@ pub const HF_ORG = "beamster";
 /// GLM's default 2.4bpw need 128 GB, GLM's 2bpw 96 GB. Qwen 2bpw also streams on a 32 GB Mac (README, "Streaming on a 32 GB Mac").
 /// A new pack lands here, in docs/usage.md and, once its repo is live, in the README.
 pub const aliases = [_]Alias{
-    .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw", .tier_gb = 48, .recommend_gb = 32 },
-    .{ .name = "qwen3.8-flash-next", .tag = "2.75bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", .is_default = true, .tier_gb = 64, .recommend_gb = 64 },
-    .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw", .tier_gb = 96, .recommend_gb = 96 },
-    .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
+    .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw", .tier_gb = 48, .recommend_gb = 32, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 131072 --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
+    .{ .name = "qwen3.8-flash-next", .tag = "2.75bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", .is_default = true, .tier_gb = 64, .recommend_gb = 64, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 250000 --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
+    .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw", .tier_gb = 96, .recommend_gb = 96, .serve_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 500000 --prefill-chunk 2048 --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1" },
+    .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128, .serve_flags = "--ctx-size 1048576" },
     .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .tier_gb = 96, .recommend_gb = 96 },
     .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
-    .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96 },
+    .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96, .streams_experts = true },
 };
 
 /// The published packs as the update check sees them.
-const known_packs = blk: {
+pub const known_packs = blk: {
     var k: [aliases.len]pack_update.Known = undefined;
     for (aliases, 0..) |a, i| k[i] = .{ .name = a.name, .tag = a.tag, .repo = a.repo, .is_default = a.is_default };
     break :blk k;
 };
 
-/// Server start: the daily pack-revision look, off under `--no-update-check`.
-pub fn configurePackUpdates(io: std.Io, on: bool) void {
-    pack_update.configure(io, on, &known_packs);
+/// Server start: the daily pack-revision look, off under `--no-update-check`; `auto` is the settings file's choice.
+pub fn configurePackUpdates(io: std.Io, on: bool, auto: bool) void {
+    pack_update.configure(io, on, auto, &known_packs);
 }
 
 pub const Resolved = struct {
@@ -364,13 +370,37 @@ pub const Reporter = struct {
     impl: *anyopaque,
     /// One human-readable status line per call (no trailing newline).
     reportFn: *const fn (impl: *anyopaque, line: []const u8) void,
+    /// Progress for a caller that draws it (the web page's Available list); false stops the pull with `PullCancelled`.
+    eventFn: ?*const fn (impl: *anyopaque, ev: PullEvent) bool = null,
+    /// Set by that caller to stop the pull; the hash of the files on disk checks it between files.
+    stop: ?*const std.atomic.Value(bool) = null,
 
     pub fn say(self: Reporter, comptime fmt: []const u8, args: anytype) void {
         var buf: [512]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
         self.reportFn(self.impl, line);
     }
+
+    pub fn event(self: Reporter, ev: PullEvent) bool {
+        const f = self.eventFn orelse return true;
+        return f(self.impl, ev);
+    }
 };
+
+pub const PullEvent = hf_pull.PullEvent;
+
+extern "c" fn waitid(idtype: c_int, id: c_uint, info: *anyopaque, options: c_int) c_int;
+
+/// Blocks until `pid` exits without reaping it, so the pid a caller holds cannot be reused until `wait` reaps it.
+fn waitExitedUnreaped(pid: std.posix.pid_t) void {
+    const P_PID = 1;
+    const WEXITED = 0x04;
+    const WNOWAIT = 0x20;
+    var info: [256]u8 align(8) = undefined;
+    while (waitid(P_PID, @intCast(pid), &info, WEXITED | WNOWAIT) != 0) {
+        if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return;
+    }
+}
 
 const HfEnv = pack_update.HfEnv;
 const resolveHfToken = pack_update.resolveHfToken;
@@ -474,7 +504,7 @@ fn curlFetch(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
 /// the terminal gets curl's progress bar; the server-side pull passes false.
 /// With `expect`, the partial's content id must match before it is renamed into place, else it is deleted
 /// and the error is `DownloadCorrupt`.
-fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: []const u8, show_progress: bool, expect: ?hf_pull.RepoFile) !void {
+fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: []const u8, show_progress: bool, expect: ?hf_pull.RepoFile, reporter: Reporter) !void {
     const partial = try std.fmt.allocPrint(allocator, "{s}.partial", .{dest_path});
     defer allocator.free(partial);
 
@@ -483,6 +513,7 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
     var auth = HfAuth.initProcess(allocator, io) catch return error.DownloadFailed;
     defer auth.deinit(allocator, io);
     try curlBaseArgs(&argv, allocator, auth);
+    if (expect) |e| hf_pull.claimPartial(io, partial, e) catch {};
     try argv.appendSlice(allocator, &.{ "--create-dirs", "-C", "-", "-o", partial });
     if (show_progress) {
         try argv.append(allocator, "--progress-bar");
@@ -497,16 +528,26 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
         .stdout = .ignore,
         .stderr = if (show_progress) .inherit else .ignore,
     }) catch return error.DownloadFailed;
+    if (!reporter.event(.{ .child = child.id })) {
+        child.kill(io);
+        _ = reporter.event(.{ .child = null });
+        return error.PullCancelled;
+    }
+    waitExitedUnreaped(child.id.?);
+    _ = reporter.event(.{ .child = null });
     const term = child.wait(io) catch return error.DownloadFailed;
     switch (term) {
         .exited => |code| if (code != 0) return error.DownloadFailed,
         else => return error.DownloadFailed,
     }
+    // A stop asked for now waits for the verify: a complete partial is checked and kept, never left unverified.
+    _ = reporter.event(.verifying);
     if (expect) |e| if (e.oid.len > 0 and !hf_pull.digestMatches(io, partial, e)) {
-        std.Io.Dir.cwd().deleteFile(io, partial) catch {};
+        hf_pull.dropPartial(io, partial);
         return error.DownloadCorrupt;
     };
     std.Io.Dir.renameAbsolute(partial, dest_path, io) catch return error.DownloadFailed;
+    hf_pull.dropPartial(io, partial);
 }
 
 fn fileSizeAt(io: std.Io, dir_path: []const u8, rel: []const u8) ?u64 {
@@ -612,6 +653,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         return error.PullFailed;
     }
     reporter.say("{d} files, {d} MB total", .{ wanted, total_bytes / (1024 * 1024) });
+    if (!reporter.event(.{ .listed = .{ .files = wanted, .bytes = total_bytes, .present = hf_pull.bytesPresent(io, dest_dir, wanted_files.items) } })) return error.PullCancelled;
     setPullMarker(io, dest_dir, true) catch {
         reporter.say("error: cannot write to {s}", .{dest_dir});
         return error.PullFailed;
@@ -636,15 +678,18 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     }
     if (to_hash.items.len > 0) {
         reporter.say("checking {d} files already on disk…", .{to_hash.items.len});
+        if (!reporter.event(.checking)) return error.PullCancelled;
         const match = try allocator.alloc(bool, to_hash.items.len);
         defer allocator.free(match);
-        hf_pull.hashMatches(io, dest_dir, to_hash.items, match);
+        hf_pull.hashMatches(io, dest_dir, to_hash.items, match, reporter.stop);
+        if (reporter.stop) |st| if (st.load(.monotonic)) return error.PullCancelled;
         for (match, hash_slot.items) |ok, i| actions[i] = if (ok) .skip else .download;
     }
     // Files are replaced from here on: a manifest left behind would vouch for bytes that are about to change.
     hf_pull.removeManifest(io, dest_dir);
 
     for (wanted_files.items, actions, 1..) |f, act, idx| {
+        if (!reporter.event(.{ .file = .{ .index = idx, .path = f.path, .size = f.size, .skip = act == .skip } })) return error.PullCancelled;
         if (act == .skip) {
             reporter.say("[{d}/{d}] {s} — already complete", .{ idx, wanted, f.path });
             continue;
@@ -654,12 +699,8 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
         const url = try hf_pull.hfUrl(allocator, base, "/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
         defer allocator.free(url);
-        const had_partial = fileSizeAt(io, dest_dir, try std.fmt.allocPrint(arena_state.allocator(), "{s}.partial", .{f.path})) != null;
-        curlDownload(allocator, io, url, dest_path, show_progress, f) catch |err| {
-            // A resumed partial may belong to an older revision of the file: once more, from the start.
-            if (err == error.DownloadCorrupt and had_partial) {
-                if (curlDownload(allocator, io, url, dest_path, show_progress, f)) |_| continue else |_| {}
-            }
+        curlDownload(allocator, io, url, dest_path, show_progress, f, reporter) catch |err| {
+            if (err == error.PullCancelled) return err;
             if (err == error.DownloadCorrupt) {
                 reporter.say("error: {s} does not match its Hugging Face checksum (partial deleted — rerun to download it again)", .{f.path});
             } else {
@@ -700,8 +741,9 @@ fn repoCommit(allocator: std.mem.Allocator, io: std.Io, base: []const u8, repo: 
     return allocator.dupe(u8, sha.string) catch null;
 }
 
+/// A listed path is written under the pack folder, so one that could leave it is never taken.
 fn wantedFile(path: []const u8) bool {
-    return shouldDownload(path);
+    return hf_pull.safeRelative(path) and shouldDownload(path);
 }
 
 // ── Commands ────────────────────────────────────────────────────────────
@@ -864,7 +906,35 @@ fn fetchSizeViaCurl(ctx: *anyopaque, repo: []const u8) FetchOutcome {
     };
 }
 
+/// `sushi list` asks about pack updates unless the settings file's `pack_update_check` is off.
+fn packChecksFor(file: *const model_settings.Settings) bool {
+    return model_settings.server(file).pack_update_check orelse true;
+}
+
+fn packChecksOn(allocator: std.mem.Allocator, io: std.Io) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var file = model_settings.load(allocator, io, model_settings.defaultPath(&buf));
+    defer file.deinit();
+    return packChecksFor(&file);
+}
+
 const ListEnv = struct { allocator: std.mem.Allocator, io: std.Io };
+
+/// `sushi list`'s size look for one repo, for the server's Downloads catalog.
+pub fn fetchRepoSize(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) FetchOutcome {
+    var env = ListEnv{ .allocator = allocator, .io = io };
+    return fetchSizeViaCurl(&env, repo);
+}
+
+/// The org's public Sushi repos, or null when Hugging Face gave no usable answer.
+pub fn fetchOrgPacks(allocator: std.mem.Allocator, io: std.Io) ?[][]u8 {
+    const url = hf_pull.hfUrl(allocator, hf_pull.endpoint(), "/api/models?author={s}&limit=500", .{HF_ORG}) catch return null;
+    defer allocator.free(url);
+    const got = curlGet(allocator, io, url, true) catch return null;
+    defer allocator.free(got.body);
+    if (statusKind(got.status) != .ok) return null;
+    return download_progress.parseOrgPacks(allocator, got.body, HF_ORG) catch null;
+}
 
 /// A catalog row from what the API said about the repo: a pack it does not return is listed as not yet
 /// published, without a size.
@@ -876,7 +946,7 @@ pub fn catalogRow(a: Alias, outcome: FetchOutcome, downloaded: bool) CatalogRow 
 }
 
 /// Where a catalog pack sits on disk, or null when it is not downloaded. Caller frees.
-fn catalogPackPath(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) ?[]u8 {
+pub fn catalogPackPath(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) ?[]u8 {
     const org_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo }) catch return null;
     if (modelPresent(io, org_path)) return org_path;
     allocator.free(org_path);
@@ -925,6 +995,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     var env = ListEnv{ .allocator = allocator, .io = io };
     var outcomes: [aliases.len]FetchOutcome = undefined;
     const online = fetchCatalogSizes(&env, &fetchSizeViaCurl, &outcomes);
+    const check_packs = online and packChecksOn(allocator, io);
     if (online) {
         var rows: [aliases.len]CatalogRow = undefined;
         var jobs: [aliases.len]?UpdateJob = @splat(null);
@@ -940,6 +1011,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         }
         // Each downloaded pack asks Hugging Face for its revision at the same time, so a slow answer costs one wait.
         for (&jobs, &threads, paths) |*j, *t, p| {
+            if (!check_packs) break;
             const path = p orelse continue;
             j.* = .{ .io = io, .path = path };
             t.* = std.Thread.spawn(.{}, UpdateJob.run, .{&j.*.?}) catch null;
@@ -971,7 +1043,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         if (isModelDir(io, &sub)) {
             if (online and isCatalogName(entry.name)) continue;
             try printLocalHeader(w, count);
-            try printModelRow(io, allocator, w, &sub, entry.name, root, online);
+            try printModelRow(io, allocator, w, &sub, entry.name, root, check_packs);
             count += 1;
             continue;
         }
@@ -986,7 +1058,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
             const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ entry.name, sub_entry.name }) catch continue;
             if (online and isCatalogName(full)) continue;
             try printLocalHeader(w, count);
-            try printModelRow(io, allocator, w, &leaf, full, root, online);
+            try printModelRow(io, allocator, w, &leaf, full, root, check_packs);
             count += 1;
         }
     }
@@ -2098,6 +2170,11 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     try testing.expect(resolveShortName("doesnotexist") == null);
     try testing.expect(resolveShortName("qwen3.8-flash-next:nosuchtag") == null);
     try testing.expect(resolveShortName("unlisted-pack") == null);
+}
+
+test "pull: a listed path that leaves the pack folder is never downloaded" {
+    for ([_][]const u8{ "mtp/../x", "mtp/../../../x", "../x", "/etc/x", "mtp//x" }) |p| try testing.expect(!wantedFile(p));
+    for ([_][]const u8{ "config.json", "mtp/weights.safetensors", "model-00001.safetensors" }) |p| try testing.expect(wantedFile(p));
 }
 
 test "pull: only the beamster org, an alias or beamster/<repo>, before anything downloads" {
@@ -3299,4 +3376,16 @@ test "resolveRelativeDir: a relative directory becomes its absolute real path, a
     try std.testing.expect(resolveRelativeDir(a, io, want) == null);
     try std.testing.expect(resolveRelativeDir(a, io, "qwen3.8-flash-next") == null);
     try std.testing.expect(resolveRelativeDir(a, io, "") == null);
+}
+
+test "list: pack update lookups run unless the settings file turns pack_update_check off" {
+    var on = try model_settings.parse(std.testing.allocator, "{}");
+    defer on.deinit();
+    try std.testing.expect(packChecksFor(&on));
+    var off = try model_settings.parse(std.testing.allocator, "{\"server\":{\"pack_update_check\":false}}");
+    defer off.deinit();
+    try std.testing.expect(!packChecksFor(&off));
+    var other = try model_settings.parse(std.testing.allocator, "{\"server\":{\"update_check\":false}}");
+    defer other.deinit();
+    try std.testing.expect(packChecksFor(&other));
 }

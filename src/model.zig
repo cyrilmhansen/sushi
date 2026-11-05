@@ -347,6 +347,7 @@ pub const ModelConfig = struct {
     think_penalty_override: ?f32 = null,
     logit_bias_file_override: ?@import("logit_bias.zig").FilePath = null,
     vision_override: ?bool = null,
+    max_tokens_override: ?u32 = null,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -826,9 +827,10 @@ pub const ModelConfig = struct {
         return if (want > 0 and cap > 0) @min(want, cap) else want;
     }
 
-    /// The budget of a request that omits `max_tokens`, when `--max-tokens` is not given; 0 = the rest of the window.
+    /// The budget of a request that omits `max_tokens`, when `--max-tokens` is not given: the model's `max_tokens` setting,
+    /// else the architecture's own; 0 = the rest of the window.
     pub fn defaultMaxTokens(self: *const ModelConfig) u32 {
-        return self.serve_defaults.max_tokens;
+        return self.max_tokens_override orelse self.serve_defaults.max_tokens;
     }
 
     /// Does this load keep deepseek_v41's DSpark stages resident? They are its MTP head: `--mtp` under streaming.
@@ -2304,6 +2306,8 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
 pub fn narrowsLoadedF16(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) bool {
     if (dtype != .float16) return false;
     if (std.mem.endsWith(u8, key, ".scales") or std.mem.endsWith(u8, key, ".biases")) return true;
+    // Trellis bank scales are read as F16 by `trunk_stq.load`; the kernels take no bf16.
+    if (std.mem.endsWith(u8, key, ".suh") or std.mem.endsWith(u8, key, ".svh")) return false;
     return ndim == 1;
 }
 
@@ -3395,6 +3399,8 @@ test "narrowsLoadedF16 catches per-channel tables, not matmul operands" {
     // not this rule's business — it stays per-site.
     try testing.expect(!narrowsLoadedF16("vision_tower.blocks.0.attn.qkv.weight", 2, .float16));
     try testing.expect(!narrowsLoadedF16("language_model.model.layers.0.linear_attn.conv1d.weight", 3, .float16));
+    try testing.expect(!narrowsLoadedF16("language_model.model.layers.0.self_attn.q_proj.suh", 1, .float16));
+    try testing.expect(!narrowsLoadedF16("language_model.lm_head.svh", 1, .float16));
 
     // Everything already in the engine's dtype, and packed weights, are left
     // alone.
@@ -4345,6 +4351,14 @@ test "only an architecture with serve defaults carries its own default context a
     const dsv41 = ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 1_048_576, .serve_defaults = defaults };
     try testing.expectEqual(@as(u32, 1_000_000), dsv41.defaultContext());
     try testing.expectEqual(@as(u32, 256_000), dsv41.defaultMaxTokens());
+
+    // The model's own `max_tokens` setting outranks the architecture's default, on any architecture.
+    var stamped = dsv41;
+    stamped.max_tokens_override = 32_000;
+    try testing.expectEqual(@as(u32, 32_000), stamped.defaultMaxTokens());
+    var qwen = ModelConfig{ .model_type = "qwen4_exp" };
+    qwen.max_tokens_override = 8_000;
+    try testing.expectEqual(@as(u32, 8_000), qwen.defaultMaxTokens());
     // A checkpoint whose window is shorter caps the default.
     const short = ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 262_144, .serve_defaults = defaults };
     try testing.expectEqual(@as(u32, 262_144), short.defaultContext());

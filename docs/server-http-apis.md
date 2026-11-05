@@ -75,7 +75,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - A prompt that tokenizes to zero tokens is a 400 `invalid_request_error` and never reaches generate: completions
   refuse it after tokenizing, `Scheduler.submit` refuses it for every surface (`error.EmptyPrompt`), and
   `Generator.initWithOptions` returns that error rather than index the prompt's last token.
-- `/v1/models` `meta.pack_update` (`{"current":"1.0","latest":"2.0","command":"sushi pull deepseek-v4.1-flash"}`) is present on a loaded model's row only while Hugging Face publishes a higher `pack_revision` of its pack ([usage](usage.md#sushi-pull-and-sushi-list)); absent otherwise, offline, or under `--no-update-check`. The check (`pack_update.zig`) runs on its own thread after the load and then daily, never on the inference thread; `sushibar` and the Models tab show it.
+- `/v1/models` `meta.default_max_tokens`, `default_temperature`, `default_top_p` and `default_top_k` on a loaded model's row are what a request that omits the field gets (`--max-tokens` / the `max_tokens` setting / the architecture's own, 0 = the rest of the window; then a launch flag > `generation_config.json` > the hardcoded value, `request_policy.sampling*`); the chat page's placeholders read them.
+- `/v1/models` `meta.pack_update` (`{"current":"1.0","latest":"2.0","command":"sushi pull deepseek-v4.1-flash","repo":"beamster/..."}`) is present on a loaded model's row only while Hugging Face publishes a higher `pack_revision` of its pack ([usage](usage.md#sushi-pull-and-sushi-list)); absent otherwise, offline, or under `--no-update-check`. The check (`pack_update.zig`) runs on its own thread after the load and then daily, never on the inference thread; `sushibar` and the Models tab show it. The tab never offers `sushi pull` for an update (it writes a second copy): its callout opens the Models tab's Available list at the row of `repo`, which updates in place.
 - `/v1/models` `meta.quantization` reports EXL3’s configured expert rate and dense width (e.g. `EXL3 3bpw experts, 8-bit dense`) for loaded and unloaded packs; affine labels remain `{bits}-bit`, and `/props` numeric quantization fields retain their dense-trunk meaning.
 - Endpoint EXISTENCE never depends on model state and the 404 is answered BEFORE the model resolves (`ROUTE_PATHS`);
   a status route never reaches `ensureLoaded` (`handlePropsNoModel`). Removed upstream routes answer named 404s.
@@ -256,11 +257,13 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - Code: `src/json_schema.zig` / `src/json_grammar.zig` / `src/token_mask.zig` / `src/regex.zig` (schema IR →
   streaming grammar → per-token mask), `src/reasoning_protocol.zig`.
 
-- `/props.settings.prefix_cache` = `{ram_enabled, mem_bytes, disk_bytes, disk_used_bytes, disk_entries}`: `disk_bytes` is
+- `/props.settings.prefix_cache` = `{ram_enabled, mem_bytes, disk_bytes, disk_used_bytes, disk_entries, volume}`: `disk_bytes` is
   the SSD budget the model was given at load (0 = tier off), `disk_used_bytes` and `disk_entries` what the tier holds,
   published by the inference thread after each commit (the web page's meter reads them; the same numbers log as
   `[disk-cache] usage <used> / <budget> GB, <n> entries` once per finished turn). They are the REQUESTED model's own
   tier (`/props?model=X`), the four numbers from one publish. `GB` is binary (1 GB = 1 GiB), as the flags read it.
+  `volume` = `{name, path, free_bytes, total_bytes}` of the cache root, read per request; `name`, `free_bytes` and
+  `total_bytes` are null when it is unavailable ([engine-prefix-cache](engine-prefix-cache.md#listing-and-clearing-from-the-admin-api)).
 - `/props.settings.prefill_decode_share` reports the effective process-wide share, including zero under the interleave kill switch.
 
 ## Security and observability
@@ -269,7 +272,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 - A JSON request nests at most `chat.max_json_nesting` (256) levels, checked on the raw body before any route parses it (HTTP and each WebSocket message); an assistant history `tool_calls[].arguments` nested deeper is sent to the template as a string. A schema nests at most `json_schema.max_schema_depth` (64).
 - A request reader waits at most `REQUEST_READ_LIMIT_MS` (30 s) between bytes and for its whole head, then drops the connection without a reply, so a silent or dripping client never holds its thread; a `Content-Length` sums into the size check with saturating arithmetic, so a wrapping value is a 413 instead of a small allocation.
 - A schema `pattern` repeat count is at most 1000 and its NFA at most 32768 states (`regex.zig`); past either, `compile` fails with `InvalidPattern`.
-- Metrics are ON by default (`--no-metrics` is the opt-out; `--metrics` is accepted and does nothing); TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics(.json)`. Cost with metrics on: per request a handful of relaxed atomic adds at `finishSlot`; per decode tick one atomic store (`inflight_generated_tokens`) and the live-session rows (`publishLiveKvResidency`: one clock read and a ~200 B row copy per decoding slot, under the `queue_mu` hold the cull already takes); per prefill chunk one atomic store and the same row publish; every 2 s the sampler thread (two MLX allocator counter reads, two syscalls, one brief `queue_mu` hold, one ring push). Nothing runs per token. With `--no-metrics` none of it runs.
+- Metrics are ON by default (`--no-metrics` is the opt-out; `--metrics` is accepted and does nothing); TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics(.json)`. Cost with metrics on: per request a handful of relaxed atomic adds at `finishSlot`; per decode tick one atomic store (`generation_tokens_live`, set by the inference thread, never the sampler, so a finished slot is not in both the total and the in-flight sum) and the live-session rows (`publishLiveKvResidency`: one clock read and a ~200 B row copy per decoding slot, under the `queue_mu` hold the cull already takes); per prefill chunk one atomic store and the same row publish; every 2 s the sampler thread (two MLX allocator counter reads, two syscalls, one brief `queue_mu` hold, one ring push). Nothing runs per token. With `--no-metrics` none of it runs.
 - **History ring**: the sampler also pushes one sample per 2 s tick (the token gauges only move once per tick) into `metrics_history.process`, a fixed ring of 1800 samples (one hour, 64 B each, about 100 KB static, no allocation). `GET /metrics.json?since=<unix ms>` adds `"history":{interval_ms,capacity,started_ms,fields,samples:[[t_ms,gen_tokens,prefill_tokens,running,waiting,prefilling,batched,gpu_pct,memory_mb,mlx_active,mlx_cache,gpu_mhz],...]}` with the samples newer than `since` (`since=0` is everything kept); `started_ms` is the PROCESS start (stamped at `main` entry, so it stays right after a `POST /metrics/enable` on a `--no-metrics` boot; a host that never stamps it falls back to the first sample's time), which the page reads as the server's start for its uptime; without `since` the feed is unchanged. A client reads the columns by `fields` name, new ones are only ever appended. The dashboard backfills from it when it was in the background and plots by `t_ms`, so a hidden tab leaves no gap and a real gap (server down) is drawn as one.
 - <a id="gpu-clock"></a>**GPU clock** (`gpu_clock_live.zig`, no sudo): the gauge sampler reads IOReport's `GPU Stats / GPU Performance States` residency and weights each P-state's frequency by it (OFF excluded, so a fully idle window is 0). The frequencies are the `voltage-states9` pairs of the `pmgr` registry entry (Hz or kHz, normalised to MHz; P14 and up clamp to the top row). `/metrics.json` gauges `gpu_clock_mhz` (the window since the previous sample) and `gpu_clock_max_mhz` (the table's top, constant per boot; 0 when the clock cannot be read), Prometheus `sushi:gpu_clock_mhz` and `sushi:gpu_clock_max_mhz`. `sushi bench` opens its own reader of the same source for the throttle verdict.
 - **Finished-request log** (`request_log.zig`): `finishSlot` and the cleanup drain push one row per request into `Metrics.finished`, a fixed ring of 128 rows (about 30 KB static, no allocation) behind one mutex: a few field copies per finished request, nothing per token, and nothing at all on a `--no-metrics` boot (the ring lives in the metrics core, so a runtime enable starts it empty). It rides the same `?since=` as the history: `GET /metrics.json?since=<unix ms>` ends with `"requests":[...]` after `"history"`, the rows finished after `since`, oldest first; without `since` the key is absent. A full array (128 rows) may have dropped older rows. Each row: `{"request_id":42,"model":"<id>","t_ms":1762100000123,"prompt_tokens":70,"cached_tokens":30,"prefill_seconds":0.25,"generated_tokens":7,"decode_seconds":1.5,"outcome":"ok"}`.
@@ -329,7 +332,7 @@ uncapped effort words fall back to `--reasoning-budget` (unlimited by default). 
 All four routes sit behind `--api-key` like the other admin routes, and a request carrying a foreign `Origin` is a 403
 (`crossOriginRefused`). Code: `src/prefix_cache_admin.zig`, `src/settings_api.zig`.
 
-- `GET /v1/prefix-cache`: `{root, volume:{free_bytes,total_bytes}|null, total_bytes, namespaces:[{id, bytes, entries,
+- `GET /v1/prefix-cache`: `{root, volume:{name,path,free_bytes,total_bytes}|null, total_bytes, namespaces:[{id, bytes, entries,
   newest_mtime (unix s), model|null, stale, held_by_other_process, tier:{used_bytes,cap_bytes,entries,written_bytes}|null}]}`.
   A namespace is a `<16 hex>` directory of the cache root (`SUSHI_PREFIX_CACHE_DIR`, else `~/.sushi/kv-cache`) holding
   `e<id>` entry directories (a private `p<pid>-<n>` root inside it counts too). `bytes` is the apparent size (the sum of the
@@ -349,7 +352,12 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   namespace another server holds is skipped (`skipped_live_namespaces: 1`, nothing removed) and a symlink is refused;
   it answers the `stale_*` fields of the namespace it removed, 400 for an id that is not a namespace name, 404 for
   one not in the cache and 409 `namespace_in_use` for one a loaded model owns (use `model`).
-- `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.models_dir` and
+- `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.models_dir`,
+  `server.update_check` and `server.pack_update_check` (booleans, `default: true`, `file`, `flag`, `source`, `locked`;
+  `--no-update-check` pins both and reports `flag: "--no-update-check"`; a change reaches the check loops at once, no
+  restart), `server.port` (an integer 1-65535: `file`, `flag` as typed when `--port` pins it, `default: 12345`, `source`,
+  `locked`, `applies` "the next start; a running server keeps its port"; the port a server binds without `--port`, and what
+  sushibar and `sushi launch` target) and
   `server.prefix_cache_disk_gb` (`file`, `flag` when a launch flag pins it, as typed: `models_dir` whole, the size in the
   flag's own syntax such as `512MB`, `source` `flag|file|default`, `locked`; the size also carries `effective_bytes`, the
   largest running tier's cap or, with none running, the ask; `ask_bytes`, the number the next load starts from; `default_bytes`, the size an unset key asks for (a load may
@@ -362,6 +370,11 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `kv_quant`, `mtp_acceptance` and `mtp_greedy_tail` are not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,
   null while the model is not loaded and otherwise `{key: value|null}` for every key: the file value the load stamped
   (null: the file had none then), in the shape of `settings.<key>.file`, so a page tells "saved differs from loaded".
+  A ready model's row also carries `defaults`, `{key: value}` for the keys whose unset value the server can state (null while the model
+  is not loaded): `settings_api.resolvedDefaults` reads it from the loader's own resolvers on the config with the file's values and the
+  launch flags cleared, so it is never a flag's value. `ctx_size` and `ssd_budget_gb` are absent (measured at load); `max_tokens` is
+  0 when the model has no output budget of its own and an omitted `max_tokens` takes the rest of the window. A page writes "Default (value)"
+  from it and a bare "Default" when a key is absent.
   Each row also carries `limits`, an object holding an entry only for a key the model constrains (`model_settings.limit`, read
   from the same `Fit` the loader's gates use): `disabled: true` (the loader ignores the key; every key missing from `keys` has
   one), `choices` (the subset a choice key takes: GLM's `kv_quant` is `off|6|8`, the widths its MLA latent stores), `max`
@@ -393,18 +406,80 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `off|4|6|8`, `server.*.flag` as the flag's own text, `server.prefix_cache_disk_gb.ask_bytes`, and `POST
   /v1/prefix-cache/clear {"scope":"namespace","id":...}`. A `flag` is printed as the server sends it: a text starting with `--`
   (`--mtp-tokenv3 0.5`) is the flag's whole spelling, anything else is the value the page puts after the flag's name; a locked
-  choice shows the choice the spelling names, else "Launch flag". The page names "Use default (N GiB)" from
-  `server.prefix_cache_disk_gb.default_bytes`. The Settings write rate is the difference of two `tier.written_bytes` polls per namespace (no
+  choice shows the choice the spelling names, else "Launch flag". The Settings page's "Automatic update checks" card is a Default (On) / On / Off group per check.
+  Each server setting's badge is `Now`, `Next load` or `Next start`, read from its `applies` sentence; a setting row has no
+  Default badge. A Settings box shows Save only while it differs from the file, and an emptied box says "Use default" and sends
+  `null`. A refusal shows on the setting's row (labels, never keys), not as a toast; while the server cannot be reached the dimmed
+  Models and Settings areas are `inert`. A load toast names the models the server unloaded to fit it. The Settings write rate is the difference of two `tier.written_bytes` polls per namespace (no
   `/metrics.json` read, which is 503 while metrics are off). Guards: `tests/test_prefix_cache_admin.sh`,
   `node tests/test_webui_admin.cjs` (pure functions), `node tests/test_webui_admin_ui.cjs` (the tabs against a stub).
 
-## Chat page (`GET /`, `GET /chat`, `GET /dashboard`, `GET /models`, `GET /settings`)
+## Downloads (`/v1/downloads`)
+
+Behind `--api-key` like the other admin routes, a foreign `Origin` is a 403 (`crossOriginRefused`), and every method is
+answered before any model resolves, so a headless server with no model serves them. `POST /v1/downloads` from another
+machine is a 403 unless the server has `--api-key` (`download_progress.startRefused`). Code: `src/downloads.zig` (routes,
+catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte accounting, speed).
+
+- `GET /v1/downloads[?refresh=1|?background=1]`: `{ram_bytes, ram_gb, update_check, dest:{path, source:
+  flag|file|default, locked, volume, free_bytes, total_bytes}, catalog: loading|ready|offline, refreshing,
+  packs:[{repo, name, tag, size_bytes|null, tier_gb|null, fits|null, streams_experts, recommended, installed,
+  path|null, partial_bytes|null, update:{current,latest}|null, launch|null}], jobs:[{repo, dest, phase, stopping, files,
+  file_index, total_bytes, done_bytes, file:{path,size,done}|null, speed_bps|null, eta_s|null, message|null}]}`.
+- The catalog is the `cli.aliases` table, then the org's public repos named `-Sushi-` from `/api/models?author=beamster`
+  whose name is plain `[A-Za-z0-9._-]` (a pack published after the build: no tier, so `fits` null). Sizes are `sushi
+  list`'s (`?blobs=true`); a repo the API answers 401/403/404 for is left out; with no answer at all the known packs stand
+  with null sizes and `catalog` `offline`. It is built on a background thread, at most every 10 minutes (1 minute while
+  offline, at once with `refresh=1`), so the answer never waits on Hugging Face; a finished download clears its own
+  row's `update` without asking again. `fits`, `tier_gb` and `recommended` are `sushi list`'s rules (`verdictFor`,
+  `recommendedAlias`) on `hw.memsize`; `streams_experts` marks a pack whose tier is for streamed experts (DeepSeek).
+  `update` is `pack_update.checkPack` for a downloaded pack. Under `--no-update-check` (`update_check` false) there is
+  no update check and a `background=1` GET (the page on another tab) starts no catalog refresh.
+- `installed` looks in the destination and the boot roots (`catalogPackPath`, both layouts); `partial_bytes` is a
+  destination folder that is there but not complete, null while that pack downloads. `launch` is `sushi serve --model
+  '<path>'` plus the flags of the pack's recommended launch in [usage](usage.md#recommended-launch)
+  (`Alias.serve_flags`), only for a downloaded pack in the table; the page does not show it.
+- `dest` is the Settings tab's models folder: the first `--model-dir` (locked), else `server.models_dir`, else
+  `~/.sushi/models`; a new pack lands in `<dest>/beamster/<repo>`, an update in the folder it is installed in.
+- `POST /v1/downloads {"repo":"beamster/<repo>"}` takes only a pack the catalog lists, under the catalog's spelling
+  (404 otherwise, 400 for another org or a name outside `[A-Za-z0-9._-]`, `.` or `..`), and answers 202 `{ok, queued,
+  repo, dest, warning}` (`queued` false when that pack is already queued or running). An update of a loaded pack is a
+  409 `model_loaded` naming the model to unload. A new pack whose size, less what its folder holds, would leave less
+  than a twentieth of the volume (at least 4 GiB, the SSD cache's reserve) is a 507 `insufficient_storage`; under a
+  tenth free it carries a `warning`. The download checks again before it writes, against the listing: the listed bytes
+  less the files already at their size and the partials of the others (`hf_pull.bytesPresent`).
+- One download runs at a time on a thread `downloads.zig` owns (never the inference thread or a connection thread),
+  through `cli.pullRepo`: same manifest, content-id skip, `curl -C -` partials and verify-before-rename as `sushi pull`.
+  `phase` is `queued|listing|checking|downloading|verifying|done|failed|cancelled`; `done_bytes` counts finished files and
+  the partial in flight; `speed_bps` is the average over the last 5 s of the samples each GET takes (a resumed partial is
+  not speed); `message` is the pull's error line (a checksum mismatch names the file). A finished pack rescans the registry.
+- `POST /v1/downloads/cancel {"repo":...}` drops a queued pack or stops a running one: `stopping` is true until it
+  reports. The curl in flight gets SIGTERM (its pid is held unreaped until the job clears it, so the signal never reaches
+  another process), the hash of the files on disk stops between files, and a file already being verified finishes its
+  verify. The partials and `.pull-incomplete` stay, so a later start resumes, after a restart too (the queue is in
+  memory; the folder is the state). Server shutdown stops the curl the same way and refuses new starts (503).
+- The page's **Models** tab draws it as its **Available** list (an Installed | Available switch in the tab's head;
+  `/downloads` is the list's own URL): per pack the size, Recommended for this Mac, Needs N GB (with
+  `sushi list`'s words: "may stream (--ssd-budget-gb)", or the streamed tier for DeepSeek; a click asks first), Downloaded
+  with Open (the pack selected in Installed, where it loads), Update, Resume for a partial folder, and for a running
+  download a bar, bytes, speed, time left and the file in flight; Stop shows "Stopping…" until the job reports. It polls
+  every second while a download runs or the catalog loads, every 5 s otherwise, and writes no node on an unchanged
+  answer; on Installed a running download polls every 2 s and shows its percent on the switch. From another tab it asks
+  (`background=1`) 3 s after the page opens and then every 30 minutes (every 5 s while the catalog loads); a pack (or a
+  pack's update) missing from `localStorage` `sushi-seen-packs` puts a dot on the Models tab (its name reads "Models,
+  new packs") and on Available until the list is shown. Only a ready catalog seeds or marks the list, the first one
+  silently; under `--no-update-check` there is no dot and no background ask after the first. Removing a pack is not
+  offered. Guards: `tests/test_downloads.sh`, `node
+  tests/test_webui_downloads.cjs`, the `downloads:` tests (download_progress.zig, downloads.zig, http_conn.zig).
+
+## Chat page (`GET /`, `GET /chat`, `GET /dashboard`, `GET /models`, `GET /settings`, `GET /downloads`)
 
 - One self-contained file, `src/webui/index.html` (CSS, JS and the logo inline, no external fetch), embedded with
   `@embedFile` and served as `text/html; charset=utf-8`. Any other method on those three paths is a 405 answered BEFORE
   model resolution, so it can never cold-load a model. `GET /dashboard` serves the same page and is open under
   `--api-key` like the other two. Guards: `tests/test_webui.sh`, the `chat page:` and `dashboard page:` tests.
-- The root `/` lands on the Dashboard (`viewOf` maps it there), `/chat` is the chat. A **Dashboard | Chat | Models | Settings** navigator in the top bar switches the views of that one page in place (`history.pushState`,
+- The root `/` lands on the Dashboard (`viewOf` maps it there), `/chat` is the chat. A **Dashboard | Chat | Models | Settings** navigator in the top bar, each tab a small icon beside its label (the icon
+  alone on a phone, 640 px and under), switches the views of that one page in place (`history.pushState`,
   `popstate` for Back/Forward). The chat panel is hidden with `inert` and `visibility`, never detached, so the open
   conversation, a streaming answer, the composer, the scroll position and the API key overlay survive a switch.
   Cmd+1..4 (Ctrl+1..4 off a Mac) click the four tabs in that order, so unsaved Models/Settings edits still ask; they do
@@ -464,6 +539,10 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   button), `/v1/chat/completions` streamed with `include_usage` (the
   readout is the final chunk's `usage` + `timings`), `reasoning_content` shown collapsed. Stop aborts the fetch; the
   server cancels on disconnect.
+- `POST /v1/slots/cancel {"id": <request_id>}` stops an in-flight slot (pending, prefilling or decoding) by its request id:
+  the slot is marked cancelled, its prefill or decode loop breaks at the next chunk/token boundary, and its allocated memory
+  is returned to the pool. Answers `{"ok":true}` (200), `400` on invalid payload, or `404` when no in-flight slot matches the id.
+  The dashboard's **Sessions** table provides a **Cancel** button on active prefill and decode rows, invoking this endpoint.
 - The effort menu lists exactly the row's `reasoning_efforts`, with no default entry; it shows the stored choice where
   the model takes it, else the row's `default_reasoning_effort`, and every request sends the shown word.
 - The thinking-budget box beside it takes the word's `reasoning_effort_budgets` value whenever the model or the word
@@ -506,7 +585,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
 
 ## Agent launcher (`sushi launch <agent>`)
 
-- `src/launch.zig` (claude/pi/omp/opencode/codex/hermes/aider/zcode/grok): reads `/v1/models`, writes agent configs into
+- `src/launch.zig` (claude/pi/omp/opencode/dsh/codex/hermes/aider/zcode/grok): reads `/v1/models`, writes agent configs into
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
 - Every model id and URL in the zsh script is one single-quoted word (`appendQuoted`) and every config writer escapes
   them for its format (JSON/TOML/YAML `Esc`): ids come from folder names or a `--url` server, so never interpolate bare.
@@ -538,6 +617,19 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   untouched): one `[model."<id>"]` per chat row on `api_backend = "chat_completions"`, dummy `api_key`, advertised
   `context_window`, `max_completion_tokens` from `budgetForContext`, the row's efforts as `reasoning_efforts`, and
   `[session] auto_compact_threshold_percent` = share of the window that leaves `compactionReserve` free (min 50).
+- `sushi launch dsh` (DeepSeek Harness) writes ONE patch layer, `~/.sushi/dsh/patch.yml`, and starts `dsh --profile web
+  --patch "$HOME/.sushi/dsh/patch.yml"` (`dsh` on PATH, else `npx --yes @deepseek-ai/dsh`; `web` is the README's
+  interactive profile). The user's `~/.dsh/profiles/<profile>/cordis.patch.yml` is never read or written: dsh applies
+  `--patch` after the profile layer, so the generated entries (`agent-default-model`, `llm-pi-ai` with `providers.sushi`)
+  win only for their own ids and the user's other entries stay. That is the opencode/omp contract (the agent's own config
+  untouched, sushi's in a sushi-owned place). The provider is `openai-completions` at `<base>/v1` with `compat`
+  (`supportsDeveloperRole: false`, `supportsReasoningEffort: true`, `maxTokensField: max_tokens`), a `Bearer sushi`
+  header (pi-ai refuses to send without a key; like every launch target the key is the dummy, the server exempts
+  loopback), every chat row as a model with its own `contextWindow`, `input` and `reasoningEfforts` (each advertised
+  word to itself; `on` as `high`), the default model's `default_reasoning_effort` as `reasoning`, and the loaded row (else
+  the first) as the default model. `maxTokens` is `launch.dshMaxTokens`: half the window up to 256000, DeepSeek's
+  own omitted-`max_tokens` default (`/v1/models` carries no output limit). Test: `python3 tests/test_dsh_launch.py --bin
+  zig-out/bin/sushi`.
 - `sushi launch zcode [--url U] --model ID [--print] [-- zcode args]` writes schema-1
   `~/.sushi/zcode/provider_config.json` and points `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, `ZCODE_DATA_BASE_DIR` and
   `ZCODE_STORAGE_DIR` into `~/.sushi/zcode`; ZCode's own source and project config stay untouched. `--model` must be

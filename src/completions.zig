@@ -29,7 +29,6 @@ const http_conn = @import("http_conn.zig");
 const Conn = http_conn.Conn;
 const sendSseHeaders = http_conn.sendSseHeaders;
 const request_policy = @import("request_policy.zig");
-const resolveSamplingDefault = request_policy.resolveSamplingDefault;
 const resolveThinkPenalty = request_policy.resolveThinkPenalty;
 const armThinkPenalty = request_policy.armThinkPenalty;
 const omittedMaxTokensDefault = request_policy.omittedMaxTokensDefault;
@@ -104,6 +103,8 @@ pub fn completionText(allocator: std.mem.Allocator, tok: *const Tokenizer, ids: 
 
 fn withTextPromptBos(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, body: []const u32) ![]u32 {
     const bos = config.text_prompt_bos orelse return allocator.dupe(u32, body);
+    // An empty prompt stays empty so it is refused as one, not answered from BOS alone.
+    if (body.len == 0) return allocator.dupe(u32, body);
     const ids = try allocator.alloc(u32, body.len + 1);
     ids[0] = bos;
     @memcpy(ids[1..], body);
@@ -334,9 +335,9 @@ pub fn handleCompletions(
 /// then the model's generation config.
 fn requestSampling(config: *const model_mod.ModelConfig, root: std.json.ObjectMap) sampler.SamplingParams {
     return .{
-        .temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_mod.server_config.default_temperature, config.gen_temperature, 1.0),
-        .top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_mod.server_config.default_top_p, config.gen_top_p, 1.0),
-        .top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_mod.server_config.default_top_k, config.gen_top_k, 0),
+        .temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature", 0.0, 2.0)),
+        .top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p", 0.0, 1.0)),
+        .top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k")),
         .repeat_penalty = parseRepeatPenalty(root),
         .presence_penalty = parseAdditivePenalty(root, "presence_penalty"),
         .frequency_penalty = parseAdditivePenalty(root, "frequency_penalty"),
@@ -712,6 +713,9 @@ test "a text prompt opens with BOS only where the model's template opens with it
     const with = try withTextPromptBos(a, &ds, &.{ 671, 6102 });
     defer a.free(with);
     try testing.expectEqualSlices(u32, &.{ 0, 671, 6102 }, with);
+    const empty = try withTextPromptBos(a, &ds, &.{});
+    defer a.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
 
     var qwen = model_mod.ModelConfig{};
     qwen.bos_token_id = 248044;

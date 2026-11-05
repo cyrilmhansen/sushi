@@ -64,6 +64,8 @@ names it; absent is the pack order.
   and every `trellis_pm` starts on a 16 KiB page of the file. Where the previous tensor does not end on a page, a
   zero-filled `__pad__.<shard stem>.<i>` tensor (`U8`, 1-D, under 16384 bytes) fills the gap and is listed in the index
   (safetensors readers reject gaps). The engine skips every `__pad__.` key: it is not loaded, billed or validated.
+  The published DeepSeek revision 2.0 starts 43 of its `trellis_pm` tensors on a 4 KiB block rather than a 16 KiB
+  page; the loader accepts any start, and only the direct-read share depends on it.
 - Only `deepseek_v41` reads `pair_major`. Its streaming engine lands the bytes in the slot pools unchanged: no CPU
   reshuffle, and a read whose file offset, length and destination lie on pages goes straight into the slab. A
   pair-major pack's rate-group pools always start on pages (the layer's bill grows by under one page per pool, per
@@ -267,6 +269,7 @@ A pack without `trunk_quant` is read exactly as before.
 | `language_model.lm_head`; the MTP head's layer as `language_model.mtp.layers.0.<same bases>` | yes |
 | `linear_attn.in_proj_{a,b}` (48 rows), hyper-connection `input_mix_weight_*` and `block_inject_weight`, `mlp.gate`, `mlp.shared_expert_gate`, PLE `key_proj`/`value_proj`, `mtp.fc_*`, `embed_tokens`, norms | no, stays as stored |
 
+- The 1-D F16 `.suh`/`.svh` stay F16 at load; the loader's 1-D F16 to bf16 narrowing skips them.
 - A bank without `trunk_quant` is `TrunkQuantMissing`; a bank that is not U16 with F16 scales, is off the 128 grid, has a
   scale missing or a rate no tile carries is `TrunkStqLayout`. Shard stamps of a trunk shard are not checked.
 - The decode widths (up to eight rows) stack the projections that share an input into one launch (q/k/v, GDN qkv/z, shared
